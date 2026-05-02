@@ -4,6 +4,7 @@ import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtSide, fmtElapsed, marketLink, midOf, spreadOf } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
+import { alertKeyboard } from './commands.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[monitor]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[monitor]', ...args);
@@ -55,7 +56,7 @@ function ensureSlot(state, marketId, cur, now) {
 
 async function alert(kind, slot, marketId, message, extra = {}) {
   try {
-    await sendTelegramMessage(message);
+    await sendTelegramMessage(message, { replyMarkup: alertKeyboard(marketId) });
   } catch (err) {
     warn(`[${marketId}] telegram send (${kind}) failed:`, err.message);
     return false;

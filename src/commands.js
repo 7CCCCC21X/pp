@@ -1,5 +1,11 @@
 import { config, isAllowedChat } from './config.js';
-import { sendTelegramMessage, htmlEscape, getUpdates } from './telegram.js';
+import {
+  sendTelegramMessage,
+  htmlEscape,
+  getUpdates,
+  setMyCommands,
+  answerCallbackQuery,
+} from './telegram.js';
 import { activeMarketIds } from './state.js';
 import { fmtElapsed } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
@@ -7,8 +13,60 @@ import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './f
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
 
+// Commands shown in Telegram's blue "/" menu next to the input box.
+const COMMAND_MENU = [
+  { command: 'menu', description: '快捷菜单' },
+  { command: 'status', description: '所有监控市场概览' },
+  { command: 'list', description: '简要列出活跃市场' },
+  { command: 'add', description: '加入监控 (用法: /add <id>)' },
+  { command: 'remove', description: '永久移除' },
+  { command: 'pause', description: '静音指定市场' },
+  { command: 'resume', description: '恢复监控' },
+  { command: 'discover', description: '立即触发自动发现' },
+  { command: 'digest', description: '发送 24 小时摘要' },
+  { command: 'filter', description: '查看当前过滤器' },
+  { command: 'setfilter', description: '设置过滤器 (用法: /setfilter name value)' },
+  { command: 'clearfilter', description: '清除过滤器' },
+  { command: 'help', description: '显示帮助' },
+];
+
+// Inline keyboard for /menu — quick-tap buttons that issue commands via
+// callback_data. Each button label is short to fit on mobile.
+function menuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '状态', callback_data: '/status' },
+        { text: '列表', callback_data: '/list' },
+      ],
+      [
+        { text: '立即发现', callback_data: '/discover' },
+        { text: '24h 摘要', callback_data: '/digest' },
+      ],
+      [
+        { text: '过滤器', callback_data: '/filter' },
+        { text: '帮助', callback_data: '/help' },
+      ],
+    ],
+  };
+}
+
+// Inline keyboard attached to alert messages so the user can act
+// straight from the alert push without typing.
+export function alertKeyboard(marketId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '静音此市场', callback_data: `/pause ${marketId}` },
+        { text: '查看状态', callback_data: '/status' },
+      ],
+    ],
+  };
+}
+
 const HELP = [
   '<b>命令列表</b>',
+  '/menu — 快捷按钮菜单',
   '/status — 概览所有监控市场',
   '/list — 简要列出活跃市场',
   '/add &lt;id&gt; — 加入监控',
@@ -51,6 +109,9 @@ async function handle(text, state, ctx) {
 
   switch (cmd) {
     case '/start':
+    case '/menu':
+      return { text: '<b>快捷菜单</b> — 点按钮或直接输入命令', replyMarkup: menuKeyboard() };
+
     case '/help':
       return HELP;
 
@@ -152,6 +213,28 @@ async function handle(text, state, ctx) {
   }
 }
 
+function normalizeReply(reply) {
+  if (reply == null) return null;
+  if (typeof reply === 'string') return { text: reply };
+  return reply;
+}
+
+async function dispatchCommand(text, state, ctx, { chatId }) {
+  let reply;
+  try {
+    reply = await handle(text, state, ctx);
+  } catch (err) {
+    warn('handler error:', err.message);
+    await sendTelegramMessage(`错误: ${htmlEscape(err.message)}`, { chatId }).catch(() => {});
+    return;
+  }
+  const norm = normalizeReply(reply);
+  if (!norm) return;
+  await sendTelegramMessage(norm.text, { chatId, replyMarkup: norm.replyMarkup }).catch((err) => {
+    warn('send reply failed:', err.message);
+  });
+}
+
 export function startCommandLoop({ getState, persist, ctx }) {
   if (!config.telegramCommandsEnabled) {
     log('disabled');
@@ -160,6 +243,11 @@ export function startCommandLoop({ getState, persist, ctx }) {
   let stopped = false;
   const ctrl = new AbortController();
   const fullCtx = { ...ctx, persist };
+
+  // Register commands with Telegram (best-effort; ignore failure).
+  setMyCommands(COMMAND_MENU).catch((err) =>
+    warn('setMyCommands failed:', err.message),
+  );
 
   (async () => {
     log('listening for commands');
@@ -172,19 +260,25 @@ export function startCommandLoop({ getState, persist, ctx }) {
         let maxId = state.telegramOffset ?? 0;
         for (const u of updates) {
           if (u.update_id > maxId) maxId = u.update_id;
-          const msg = u.message;
-          if (!msg || !msg.text) continue;
-          const chatId = msg.chat?.id;
-          if (!isAllowedChat(chatId)) {
-            warn(`ignoring message from chat ${chatId}`);
-            continue;
-          }
-          try {
-            const reply = await handle(msg.text, state, fullCtx);
-            if (reply) await sendTelegramMessage(reply, { chatId });
-          } catch (err) {
-            warn('handler error:', err.message);
-            await sendTelegramMessage(`错误: ${htmlEscape(err.message)}`, { chatId }).catch(() => {});
+          if (u.message?.text) {
+            const chatId = u.message.chat?.id;
+            if (!isAllowedChat(chatId)) {
+              warn(`ignoring message from chat ${chatId}`);
+              continue;
+            }
+            await dispatchCommand(u.message.text, state, fullCtx, { chatId });
+          } else if (u.callback_query) {
+            const cq = u.callback_query;
+            const chatId = cq.message?.chat?.id;
+            // Always answer the callback so Telegram dismisses the loading
+            // spinner, even if the chat is not allowed.
+            await answerCallbackQuery(cq.id).catch(() => {});
+            if (!isAllowedChat(chatId)) {
+              warn(`ignoring callback from chat ${chatId}`);
+              continue;
+            }
+            const data = String(cq.data ?? '').trim();
+            if (data) await dispatchCommand(data, state, fullCtx, { chatId });
           }
         }
         state.telegramOffset = maxId;
