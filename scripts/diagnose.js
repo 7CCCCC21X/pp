@@ -188,6 +188,64 @@ async function lookupViaMarketsFilter(value, fields, shape) {
   return null;
 }
 
+async function lookupBySlugREST(slug) {
+  // 1. Try direct REST paths
+  const directPaths = [
+    `/markets/${encodeURIComponent(slug)}`,
+    `/markets/by-slug/${encodeURIComponent(slug)}`,
+    `/markets?slug=${encodeURIComponent(slug)}`,
+  ];
+  for (const p of directPaths) {
+    const url = `${config.restUrl}${p}`;
+    try {
+      const res = await fetch(url, { headers: restHeaders() });
+      console.log(`  [${res.status === 200 ? 'OK ' : '   '}] ${res.status}  ${url}`);
+      if (!res.ok) continue;
+      const json = await res.json();
+      const data = json?.data ?? json;
+      if (data?.id && (!slug || data.slug === slug || !data.slug)) return data;
+      const arr = data?.markets ?? data?.items ?? (Array.isArray(data) ? data : null);
+      if (Array.isArray(arr)) {
+        const m = arr.find((x) => x?.slug === slug || String(x?.id) === slug);
+        if (m) return m;
+      }
+    } catch (err) {
+      console.log(`  ERR  ${url}: ${err.message}`);
+    }
+  }
+
+  // 2. Paginated scan fallback
+  console.log('  scanning paginated /markets ...');
+  let cursor = null;
+  for (let page = 0; page < 40; page++) {
+    const params = new URLSearchParams({ first: '50' });
+    if (cursor) params.set('after', cursor);
+    const url = `${config.restUrl}/markets?${params}`;
+    const res = await fetch(url, { headers: restHeaders() });
+    if (!res.ok) {
+      console.log(`  ${res.status}  ${url}`);
+      break;
+    }
+    const json = await res.json();
+    const data = json?.data ?? json;
+    const arr =
+      data?.markets ??
+      data?.items ??
+      data?.edges?.map((e) => e?.node).filter(Boolean) ??
+      (Array.isArray(data) ? data : []);
+    for (const m of arr) {
+      if (m?.slug === slug) {
+        console.log(`  found on page ${page} (${arr.length} markets/page)`);
+        return m;
+      }
+    }
+    const pageInfo = data?.pageInfo;
+    cursor = pageInfo?.endCursor ?? data?.nextCursor ?? null;
+    if (!cursor || pageInfo?.hasNextPage === false) break;
+  }
+  return null;
+}
+
 (async () => {
   console.log(`> input parsed as ${kind}: ${value}`);
   console.log(`> graphql=${config.graphqlUrl}`);
@@ -209,22 +267,28 @@ async function lookupViaMarketsFilter(value, fields, shape) {
   let result = null;
   if (kind === 'id') {
     const m = await lookupByMarketId(value, fields);
-    if (m) result = { lookup: 'market(id: $v)', market: m };
+    if (m) result = { lookup: 'GraphQL market(id: $v)', market: m };
   }
   if (!result) {
     const r = await lookupViaMarketsFilter(value, fields, shape);
     if (r) result = r;
   }
+  if (!result && kind === 'slug') {
+    console.log('  GraphQL filter has no slug key -> falling back to REST');
+    const m = await lookupBySlugREST(value);
+    if (m) result = { lookup: 'REST /markets (slug match)', market: m };
+  }
 
   if (!result) {
-    console.error('No GraphQL lookup returned a market.');
-    console.error('If you pasted a slug, the GraphQL filter input may use a different key name.');
-    console.error('Try a different market or paste a numeric id.');
+    console.error('Could not locate the market.');
+    console.error('  - Confirm the slug/id from the predict.fun URL.');
+    console.error('  - Check PREDICT_API_KEY is set in .env (REST needs it).');
     process.exit(2);
   }
   console.log(`  using: ${result.lookup}`);
   for (const [k, v] of Object.entries(result.market)) {
-    if (v == null) continue;
+    if (v == null || v === '') continue;
+    if (typeof v === 'object') continue; // skip nested objects in the dump
     const display = typeof v === 'string' && v.length > 70 ? v.slice(0, 70) + '...' : v;
     console.log(`  ${k} = ${display}`);
   }
