@@ -29,6 +29,45 @@ test('extractHourlyRate handles null/empty', () => {
   assert.equal(extractHourlyRate({ rewards: null }), 0);
 });
 
+test('extractHourlyRate skips expired rewardTimings (endsAt in past)', () => {
+  const past = new Date(Date.now() - 3600 * 1000).toISOString();
+  const future = new Date(Date.now() + 3600 * 1000).toISOString();
+  assert.equal(extractHourlyRate({
+    rewardTimings: [
+      { hourlyRate: 1500, endsAt: past },     // ended an hour ago — drop
+      { hourlyRate: 200, endsAt: future },    // still active — count
+    ],
+  }), 200);
+});
+
+test('extractHourlyRate skips not-yet-started rewardTimings', () => {
+  const future = new Date(Date.now() + 3600 * 1000).toISOString();
+  assert.equal(extractHourlyRate({
+    rewardTimings: [
+      { hourlyRate: 500, startsAt: future },  // starts in 1h — drop
+      { hourlyRate: 100 },                    // no time bounds — count
+    ],
+  }), 100);
+});
+
+test('extractHourlyRate respects isActive=false', () => {
+  assert.equal(extractHourlyRate({
+    rewardTimings: [
+      { hourlyRate: 999, isActive: false },
+      { hourlyRate: 50, isActive: true },
+    ],
+  }), 50);
+});
+
+test('extractHourlyRate: all expired -> 0 (resolved market case)', () => {
+  const past = new Date(Date.now() - 86400 * 1000).toISOString();
+  assert.equal(extractHourlyRate({
+    rewardTimings: [
+      { hourlyRate: 1700, endsAt: past },
+    ],
+  }), 0);
+});
+
 test('marketEndMs accepts ISO string', () => {
   const iso = '2030-01-01T00:00:00.000Z';
   const ts = Date.parse(iso);

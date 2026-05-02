@@ -33,11 +33,37 @@ function sumHourlyRateRecursive(value) {
   return 0;
 }
 
+// A rewardTiming entry is "active" if now is within its [startsAt, endsAt]
+// window. Predict.fun keeps historical timings in the array — once an
+// event has ended the past window's hourlyRate is still listed but no
+// longer pays out, so summing all entries blindly overcounts.
+function isTimingActive(t, now) {
+  if (!t || typeof t !== 'object') return false;
+  const tsOf = (v) => {
+    if (v == null || v === '') return null;
+    if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+    const p = Date.parse(v);
+    return Number.isFinite(p) ? p : null;
+  };
+  for (const k of ['startsAt', 'startTime', 'startAt']) {
+    const ts = tsOf(t[k]);
+    if (ts != null && ts > now) return false; // future
+  }
+  for (const k of ['endsAt', 'endTime', 'endAt']) {
+    const ts = tsOf(t[k]);
+    if (ts != null && ts <= now) return false; // ended
+  }
+  if (t.isActive === false) return false;
+  return true;
+}
+
 export function extractHourlyRate(marketOrRewards) {
   if (marketOrRewards == null) return 0;
   // If passed a market object, prefer the GraphQL `rewardTimings` array.
   if (Array.isArray(marketOrRewards?.rewardTimings)) {
+    const now = Date.now();
     return marketOrRewards.rewardTimings
+      .filter((r) => isTimingActive(r, now))
       .map((r) => Number(r?.hourlyRate))
       .filter(Number.isFinite)
       .reduce((a, b) => a + b, 0);
@@ -99,12 +125,17 @@ let _marketsQueryCache = null;
 let _selectionCache = null;
 let _filterFieldsCache = null;
 
+// Extra fields we'd like on each rewardTimings entry, gated by whether
+// the RewardTiming GraphQL type actually exposes them.
+const REWARD_TIMING_OPTIONAL = ['startsAt', 'endsAt', 'startTime', 'endTime', 'isActive'];
+
 async function getMarketSelection() {
   if (_selectionCache != null) {
     return { selection: _selectionCache, filterFields: _filterFieldsCache };
   }
   let scalarMarketFields = new Set();
   let filterFields = new Set();
+  let rewardTimingFields = new Set();
   try {
     const intro = await postGraphQL(
       `query Introspect {
@@ -118,6 +149,7 @@ async function getMarketSelection() {
           }
         }
         filter: __type(name: "MarketFilterInput") { inputFields { name } }
+        rewardTiming: __type(name: "RewardTiming") { fields { name } }
       }`,
       {},
       'Introspect',
@@ -131,6 +163,7 @@ async function getMarketSelection() {
       }
     }
     filterFields = new Set((intro?.filter?.inputFields ?? []).map((f) => f.name));
+    rewardTimingFields = new Set((intro?.rewardTiming?.fields ?? []).map((f) => f.name));
   } catch {
     // Fall back to the minimal known-good query.
   }
@@ -138,7 +171,14 @@ async function getMarketSelection() {
   for (const f of REQUIRED_FIELDS) {
     if (!scalarMarketFields.size || scalarMarketFields.has(f)) fields.push(f);
   }
-  fields.push('rewardTimings { hourlyRate }');
+  // rewardTimings: always pull hourlyRate; pull start/end fields when the
+  // RewardTiming type exposes them so isTimingActive() can drop expired
+  // entries (a market whose only timing already ended pays 0 PP/h now).
+  const timingSelected = ['hourlyRate'];
+  for (const f of REWARD_TIMING_OPTIONAL) {
+    if (rewardTimingFields.has(f)) timingSelected.push(f);
+  }
+  fields.push(`rewardTimings { ${timingSelected.join(' ')} }`);
   for (const f of OPTIONAL_STATUS_FIELDS) {
     if (scalarMarketFields.has(f)) fields.push(f);
   }
