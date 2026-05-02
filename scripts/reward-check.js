@@ -94,12 +94,38 @@ async function postGraphQL(query, variables) {
     console.log(`  failed: ${err.message}`);
   }
 
-  // 4. Apply our extractHourlyRate to see what bot computes
+  // 4. What does the bot actually compute? Three views: REST-only,
+  //    GraphQL-only (if it returned), and the full merged path the
+  //    monitor loop uses (getMarketRewardSummary).
   console.log(`\n> bot's extractHourlyRate calculation`);
-  const { extractHourlyRate, isMarketTradeable } = await import('../src/predict.js');
+  const { extractHourlyRate, isMarketTradeable, getMarketRewardSummary } = await import('../src/predict.js');
+
+  // REST-only computation
+  try {
+    const json = await fetchJson(`${config.restUrl}/markets/${encodeURIComponent(arg)}`, {
+      headers: restHeaders(), timeoutMs: 10_000, retries: 0,
+    });
+    const rest = json?.data ?? json;
+    console.log(`  REST only      → ${extractHourlyRate(rest).toFixed(2)} PP/h`);
+    console.log(`  REST tradeable → ${isMarketTradeable(rest)}`);
+  } catch (err) {
+    console.log(`  REST only      → failed: ${err.message}`);
+  }
+
+  // GraphQL-only computation (if the market was returned)
   if (market) {
-    console.log(`  GraphQL data → ${extractHourlyRate(market).toFixed(2)} PP/h`);
-    console.log(`  isMarketTradeable: ${isMarketTradeable(market)}`);
+    console.log(`  GraphQL only   → ${extractHourlyRate(market).toFixed(2)} PP/h`);
+    console.log(`  GraphQL tradeable → ${isMarketTradeable(market)}`);
+  }
+
+  // What the bot actually uses (GraphQL + REST merged)
+  try {
+    const summary = await getMarketRewardSummary(arg);
+    console.log(`  bot's summary  → ${summary.totalHourlyRate.toFixed(2)} PP/h`);
+    console.log(`  bot's title    → ${summary.title ?? '(none)'}`);
+    console.log(`  bot's slug key → ${summary.orderbookKey}`);
+  } catch (err) {
+    console.log(`  bot's summary  → failed: ${err.message}`);
   }
 })().catch((err) => {
   console.error(err);
