@@ -113,6 +113,10 @@ export const config = {
   autodiscover: bool('AUTODISCOVER', false),
   discoveryIntervalMs: num('DISCOVERY_INTERVAL_MS', 60 * 60 * 1000),
   discoveryMaxMarkets: num('DISCOVERY_MAX_MARKETS', 200),
+  // Skip auto-discovered markets whose total hourlyRate is below this. Useful
+  // for filtering out short-lived high-frequency markets (like 15-min Bitcoin
+  // up/down) that clutter the watchlist but never trigger stall alerts.
+  minHourlyRate: num('MIN_HOURLY_RATE', 0),
 
   // History + daily digest
   historyEnabled: bool('HISTORY_ENABLED', true),
