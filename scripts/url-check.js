@@ -68,8 +68,9 @@ async function probeUrl(url) {
   // 3. Probe REST single-market endpoint(s) to see what fields it returns
   console.log(`\n> trying REST single-market lookups`);
   for (const path of [
+    // /markets/<id> works and returns the right market with categorySlug.
+    // /markets?id=<id> is silently ignored (returns page 1) so we skip it.
     `/markets/${encodeURIComponent(arg)}`,
-    `/markets?id=${encodeURIComponent(arg)}`,
     market.conditionId ? `/markets/${encodeURIComponent(market.conditionId)}` : null,
   ].filter(Boolean)) {
     const url = `${config.restUrl}${path}`;

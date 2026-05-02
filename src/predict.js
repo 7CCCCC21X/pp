@@ -316,6 +316,42 @@ export async function getSlugMapCached() {
   return _slugCache.inFlight;
 }
 
+// Fetch a single market via REST `/v1/markets/<id>` to grab fields the
+// GraphQL query doesn't expose — most importantly `categorySlug` which
+// is Predict.fun's actual URL slug. Returns null on any error so callers
+// can fall back to the bulk slug map / title slugify chain.
+const _restMarketCache = new Map();   // id -> { market, at }
+const _restMarketInflight = new Map(); // id -> Promise
+
+export async function getMarketRestById(id) {
+  const key = String(id);
+  const cached = _restMarketCache.get(key);
+  const ttl = config.marketsCacheTtlMs;
+  if (cached && Date.now() - cached.at < ttl) return cached.market;
+  if (_restMarketInflight.has(key)) return _restMarketInflight.get(key);
+  const p = (async () => {
+    const url = `${config.restUrl}/markets/${encodeURIComponent(key)}`;
+    try {
+      const json = await fetchJson(url, {
+        headers: restHeaders(),
+        timeoutMs: config.orderbookTimeoutMs ?? 10_000,
+        retries: 1,
+      });
+      const data = json?.data ?? json;
+      const market = Array.isArray(data) ? data[0] : data;
+      if (market?.id != null) {
+        _restMarketCache.set(key, { market, at: Date.now() });
+        return market;
+      }
+    } catch {
+      // swallow — caller has fallbacks
+    }
+    return null;
+  })().finally(() => _restMarketInflight.delete(key));
+  _restMarketInflight.set(key, p);
+  return p;
+}
+
 export async function getMarketByIdFast(id) {
   if (_cache.byId) {
     const hit = _cache.byId.get(String(id));
