@@ -44,21 +44,32 @@ export function summarize24h(records) {
       jumpAlerts: 0,
       wideSpreadAlerts: 0,
       emptyBookAlerts: 0,
+      rewardZoneAlerts: 0,
       lastHourlyRate: null,
       maxStallMs: 0,
+      ppEarned: 0,
+      observedMs: 0,
     };
     if (r.title && !slot.title) slot.title = r.title;
     if (r.event === 'move') slot.moves += 1;
+    if (r.event === 'rate') {
+      if (Number.isFinite(r.ppEarned)) slot.ppEarned += r.ppEarned;
+      if (Number.isFinite(r.dtMs)) slot.observedMs += r.dtMs;
+      if (Number.isFinite(r.hourlyRate)) slot.lastHourlyRate = r.hourlyRate;
+    }
     if (r.event === 'alert') {
       if (r.kind === 'stall') slot.stallAlerts += 1;
       if (r.kind === 'mid_jump') slot.jumpAlerts += 1;
       if (r.kind === 'wide_spread') slot.wideSpreadAlerts += 1;
       if (r.kind === 'empty_book') slot.emptyBookAlerts += 1;
+      if (r.kind === 'reward_zone') slot.rewardZoneAlerts += 1;
       if (r.kind === 'stall' && Number.isFinite(r.elapsedMs)) {
         slot.maxStallMs = Math.max(slot.maxStallMs, r.elapsedMs);
       }
     }
-    if (Number.isFinite(r.totalHourlyRate)) slot.lastHourlyRate = r.totalHourlyRate;
+    if (Number.isFinite(r.totalHourlyRate) && slot.lastHourlyRate == null) {
+      slot.lastHourlyRate = r.totalHourlyRate;
+    }
     byMarket.set(id, slot);
   }
   return [...byMarket.values()];

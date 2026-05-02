@@ -90,15 +90,25 @@ function uniq(arr) {
   return [...new Set(arr.map(String))];
 }
 
+function zoneTag(slot) {
+  const z = slot?.zoneStatus;
+  if (!z) return '';
+  if (z.bidActivated && z.askActivated) return ' · 区内✓';
+  const sides = [];
+  if (!z.bidActivated) sides.push('买✗');
+  if (!z.askActivated) sides.push('卖✗');
+  return ` · 区外(${sides.join(',')})`;
+}
+
 function statusLine(state, id) {
   const slot = state.markets[id];
   const paused = state.pausedIds.includes(id);
   const tag = paused ? ' [paused]' : '';
   if (!slot) return `#${id}${tag} — 等待首次抓取`;
   const since = Date.now() - (slot.lastChangeAt ?? Date.now());
-  const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(4) : '?';
-  const title = slot.title ? slot.title.slice(0, 50) : `Market ${id}`;
-  return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · PP ${rate}/h`;
+  const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
+  const title = slot.title ? slot.title.slice(0, 40) : `Market ${id}`;
+  return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · ${rate}/h${zoneTag(slot)}`;
 }
 
 async function handle(text, state, ctx) {
@@ -118,8 +128,18 @@ async function handle(text, state, ctx) {
     case '/status': {
       const ids = activeMarketIds(state);
       if (!ids.length) return '当前没有监控的市场。用 /add &lt;id&gt; 加一个。';
+      // Compute 24h PP total from history (best-effort, async).
+      let header = `<b>监控中 ${ids.length} 个市场</b>`;
+      try {
+        const { readHistorySince, summarize24h } = await import('./history.js');
+        const since = Date.now() - 24 * 3600 * 1000;
+        const records = await readHistorySince(since);
+        const summary = summarize24h(records);
+        const totalPP = summary.reduce((a, m) => a + (m.ppEarned ?? 0), 0);
+        if (totalPP > 0) header += `\n过去 24h 累计 PP: <b>${totalPP.toFixed(2)}</b>`;
+      } catch {}
       const lines = ids.map((id) => htmlEscape(statusLine(state, id)));
-      return [`<b>监控中 ${ids.length} 个市场</b>`, ...lines].join('\n');
+      return [header, ...lines].join('\n');
     }
 
     case '/list': {

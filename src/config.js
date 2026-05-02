@@ -101,6 +101,15 @@ export const config = {
   alertEmptyBook: bool('ALERT_EMPTY_BOOK', true),
   emptyBookMinMinutes: num('EMPTY_BOOK_MIN_MINUTES', 30),
 
+  // Reward-zone alert: detect markets where the top of book sits outside
+  // Predict.fun's reward zone (orders too far from mid OR too small) so PP
+  // is up for grabs. Per-market spreadThreshold / shareThreshold from the
+  // market object override these defaults when present.
+  alertRewardZone: bool('ALERT_REWARD_ZONE', true),
+  rewardZoneMaxDistance: num('REWARD_ZONE_MAX_DISTANCE', 0.06),
+  rewardZoneMinSize: num('REWARD_ZONE_MIN_SIZE', 100),
+  rewardZoneMinMinutes: num('REWARD_ZONE_MIN_MINUTES', 15),
+
   skipNoReward: bool('SKIP_NO_REWARD', true),
 
   // Filters: a market only emits alerts when its top-N book passes ALL set

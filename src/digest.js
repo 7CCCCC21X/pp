@@ -13,24 +13,33 @@ export async function sendDailyDigest() {
     await sendTelegramMessage('<b>过去 24 小时摘要</b>\n无任何事件。');
     return;
   }
-  summary.sort((a, b) => b.maxStallMs - a.maxStallMs || (b.lastHourlyRate ?? 0) - (a.lastHourlyRate ?? 0));
+  // Sort by PP earned descending — most productive markets first.
+  summary.sort((a, b) => (b.ppEarned ?? 0) - (a.ppEarned ?? 0));
+  const totalPP = summary.reduce((acc, m) => acc + (m.ppEarned ?? 0), 0);
+  const totalAlerts = summary.reduce((acc, m) =>
+    acc + m.stallAlerts + m.jumpAlerts + m.wideSpreadAlerts + m.emptyBookAlerts + m.rewardZoneAlerts, 0);
   const top = summary.slice(0, 15);
-  const lines = [`<b>过去 24 小时摘要 (${summary.length} 个市场)</b>`];
+  const lines = [
+    `<b>过去 24 小时摘要</b>`,
+    `<b>累计 PP 产出: ${totalPP.toFixed(2)}</b> · ${summary.length} 个市场 · ${totalAlerts} 条提醒`,
+    '',
+  ];
   for (const m of top) {
     const title = m.title ? htmlEscape(m.title.slice(0, 40)) : `Market ${m.marketId}`;
-    const rate = Number.isFinite(m.lastHourlyRate) ? m.lastHourlyRate.toFixed(2) : '?';
+    const rate = Number.isFinite(m.lastHourlyRate) ? m.lastHourlyRate.toFixed(0) : '?';
+    const pp = (m.ppEarned ?? 0).toFixed(1);
     const stall = m.maxStallMs > 0 ? `最长停滞 ${fmtElapsed(m.maxStallMs)}` : '';
     const counts = [
-      m.moves > 0 ? `${m.moves} 次变动` : '',
       m.stallAlerts > 0 ? `停滞×${m.stallAlerts}` : '',
       m.jumpAlerts > 0 ? `跳变×${m.jumpAlerts}` : '',
       m.wideSpreadAlerts > 0 ? `阔差×${m.wideSpreadAlerts}` : '',
       m.emptyBookAlerts > 0 ? `空簿×${m.emptyBookAlerts}` : '',
+      m.rewardZoneAlerts > 0 ? `区外×${m.rewardZoneAlerts}` : '',
     ].filter(Boolean).join(' · ');
-    lines.push(`#${m.marketId} ${title} — PP ${rate}/h · ${counts || '稳定'}${stall ? ' · ' + stall : ''}`);
+    lines.push(`#${m.marketId} ${title} — ${pp} PP · ${rate}/h${counts ? ' · ' + counts : ''}${stall ? ' · ' + stall : ''}`);
   }
   await sendTelegramMessage(lines.join('\n'));
-  log('sent digest');
+  log(`sent digest (24h PP=${totalPP.toFixed(2)})`);
 }
 
 export function shouldSendDigest(state) {

@@ -97,7 +97,12 @@ const OPTIONAL_STATUS_FIELDS = [
   'closeTime',
   'isResolved',
   'resolvedAt',
-  'resolution',
+  // Reward zone parameters: max distance from mid for an order to qualify,
+  // and the minimum order size that earns rewards. Predict.fun exposes
+  // these as scalars on Market in REST; we include them when available
+  // so the bot can use per-market rules instead of global env defaults.
+  'spreadThreshold',
+  'shareThreshold',
 ];
 let _marketsQueryCache = null;
 

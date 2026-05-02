@@ -20,6 +20,40 @@ export function marketLink(marketId, title) {
   return `<a href="https://predict.fun/market/${encodeURIComponent(marketId)}">${safeTitle}</a>`;
 }
 
+// Reward-zone evaluation. Predict.fun gives PP rewards to limit orders
+// within ±maxDistance of mid with size ≥ minSize. Per-market
+// spreadThreshold / shareThreshold in the market object override the
+// global defaults.
+export function rewardZoneStatus(orderbook, market, defaults) {
+  const maxDistance = Number.isFinite(market?.spreadThreshold) && market.spreadThreshold > 0
+    ? market.spreadThreshold
+    : defaults.maxDistance;
+  const minSize = Number.isFinite(market?.shareThreshold) && market.shareThreshold > 0
+    ? market.shareThreshold
+    : defaults.minSize;
+  const bid = orderbook.bestBid;
+  const ask = orderbook.bestAsk;
+  if (!bid || !ask) {
+    return { maxDistance, minSize, mid: null, bidActivated: false, askActivated: false, bidReason: bid ? null : '无买单', askReason: ask ? null : '无卖单' };
+  }
+  const mid = (bid.price + ask.price) / 2;
+  const bidDist = mid - bid.price;
+  const askDist = ask.price - mid;
+  const bidInZone = bidDist <= maxDistance;
+  const askInZone = askDist <= maxDistance;
+  const bidSizeOk = bid.size >= minSize;
+  const askSizeOk = ask.size >= minSize;
+  return {
+    maxDistance,
+    minSize,
+    mid,
+    bidActivated: bidInZone && bidSizeOk,
+    askActivated: askInZone && askSizeOk,
+    bidReason: !bidInZone ? `离 mid ${(bidDist * 100).toFixed(2)}¢` : !bidSizeOk ? `量 ${bid.size} < ${minSize}` : null,
+    askReason: !askInZone ? `离 mid ${(askDist * 100).toFixed(2)}¢` : !askSizeOk ? `量 ${ask.size} < ${minSize}` : null,
+  };
+}
+
 export function midOf(orderbook) {
   const bid = orderbook.bestBid?.price;
   const ask = orderbook.bestAsk?.price;

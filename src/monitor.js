@@ -2,7 +2,7 @@ import { config } from './config.js';
 import { getMarketRewardSummary, getOrderbook } from './predict.js';
 import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
-import { fmtSide, fmtElapsed, marketLink, midOf, spreadOf } from './format.js';
+import { fmtSide, fmtElapsed, marketLink, midOf, spreadOf, rewardZoneStatus } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
 import { alertKeyboard } from './commands.js';
 
@@ -122,7 +122,39 @@ export async function checkMarket(marketId, state, { isPaused }) {
   const slot = ensureSlot(state, marketId, cur, now);
   if (rewardSummary?.title) slot.title = rewardSummary.title;
   slot.lastHourlyRate = totalHourlyRate;
+  const lastSeenAt = slot.lastSeenAt ?? now;
   slot.lastSeenAt = now;
+
+  // Per-tick rate logging — used by /digest to compute 24h PP totals.
+  // Cap dt at 2 × poll interval so a long offline gap doesn't attribute
+  // phantom PP to a window we weren't actually watching.
+  if (totalHourlyRate > 0) {
+    const dtMs = Math.min(now - lastSeenAt, 2 * config.pollIntervalMs);
+    if (dtMs > 0) {
+      appendHistory({
+        event: 'rate',
+        marketId,
+        title: slot.title ?? null,
+        hourlyRate: totalHourlyRate,
+        dtMs,
+        ppEarned: (totalHourlyRate * dtMs) / 3600000,
+      }).catch(() => {});
+    }
+  }
+
+  // Reward-zone evaluation per tick.
+  const zone = rewardZoneStatus(orderbook, market, {
+    maxDistance: config.rewardZoneMaxDistance,
+    minSize: config.rewardZoneMinSize,
+  });
+  slot.zoneStatus = {
+    bidActivated: zone.bidActivated,
+    askActivated: zone.askActivated,
+    bidReason: zone.bidReason,
+    askReason: zone.askReason,
+    maxDistance: zone.maxDistance,
+    minSize: zone.minSize,
+  };
 
   const bidChanged = topMoved(slot.baseline.bidPrice, slot.baseline.bidSize, orderbook.bestBid);
   const askChanged = topMoved(slot.baseline.askPrice, slot.baseline.askSize, orderbook.bestAsk);
@@ -177,6 +209,38 @@ export async function checkMarket(marketId, state, { isPaused }) {
       }
     } else {
       slot.wideSpreadSince = null;
+    }
+  }
+
+  // --- Reward zone unstaffed: bid or ask side outside Predict.fun's
+  // reward parameters (price too far from mid OR size below threshold)
+  // sustained for REWARD_ZONE_MIN_MINUTES. Means PP is sitting unclaimed.
+  if (config.alertRewardZone && !isPaused && !filtered && totalHourlyRate > 0) {
+    const unstaffed = !zone.bidActivated || !zone.askActivated;
+    if (unstaffed) {
+      if (!slot.rewardZoneSince) slot.rewardZoneSince = now;
+      const elapsed = now - slot.rewardZoneSince;
+      const need = config.rewardZoneMinMinutes * 60 * 1000;
+      const cooldownOk = now - (slot.rewardZoneAlertedAt ?? 0) >= 60 * 60 * 1000;
+      if (elapsed >= need && cooldownOk) {
+        const sides = [];
+        if (!zone.bidActivated) sides.push(`买侧 (${zone.bidReason ?? '未激活'})`);
+        if (!zone.askActivated) sides.push(`卖侧 (${zone.askReason ?? '未激活'})`);
+        const msg = [
+          `<b>奖励区可激活 (持续 ${fmtElapsed(elapsed)})</b>`,
+          `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
+          `规则: 离 mid ≤ ±${(zone.maxDistance * 100).toFixed(1)}¢，单边量 ≥ ${zone.minSize}`,
+          `当前买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
+          `当前卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
+          `${htmlEscape(sides.join('，'))}`,
+          `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
+        ].join('\n');
+        if (await alert('reward_zone', slot, marketId, msg, { elapsedMs: elapsed, bidActivated: zone.bidActivated, askActivated: zone.askActivated })) {
+          slot.rewardZoneAlertedAt = now;
+        }
+      }
+    } else {
+      slot.rewardZoneSince = null;
     }
   }
 
