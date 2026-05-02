@@ -1,5 +1,5 @@
 import { config } from './config.js';
-import { getMarketRewardSummary, getOrderbook } from './predict.js';
+import { getMarketRewardSummary, getOrderbook, marketEndMs } from './predict.js';
 import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtElapsed, midOf, spreadOf, rewardZoneStatus } from './format.js';
@@ -134,6 +134,23 @@ export async function checkMarket(marketId, state, { isPaused }) {
     stub.lastError = null;
     log(`[${marketId}] skip: no PP reward`);
     return;
+  }
+
+  // Tick-level remaining-time guard — even if discovery added this market
+  // when it had hours to go, skip alerting once it drops below the limit.
+  // Stops 15-min Bitcoin markets from spamming once the autoIds list is
+  // stale between discovery cycles.
+  if (config.minRemainingHours > 0) {
+    const endMs = marketEndMs(market);
+    if (endMs != null && endMs < tickStart + config.minRemainingHours * 3600 * 1000) {
+      const stub = ensureStubSlot(state, marketId, tickStart);
+      stub.title = rewardSummary.title ?? stub.title;
+      const remainingHours = Math.max(0, (endMs - tickStart) / 3600000);
+      stub.lastSkipReason = `剩余 ${remainingHours.toFixed(1)}h < ${config.minRemainingHours}h，跳过`;
+      stub.lastError = null;
+      log(`[${marketId}] skip: remaining ${remainingHours.toFixed(1)}h`);
+      return;
+    }
   }
 
   let orderbook;

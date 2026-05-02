@@ -274,8 +274,35 @@ const CLOSED_STATUSES = new Set([
   'ARCHIVED', 'EXPIRED', 'SETTLED', 'INACTIVE',
 ]);
 
-// Returns the market end timestamp in ms (or null if none of the known
-// end-time fields are populated).
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+// Predict.fun's GraphQL Market type doesn't expose endsAt. For dated
+// titles like "Bitcoin Up or Down - May 2, 11:45AM-12PM ET" or
+// "BNB up or down (May 2 2026 2am ET)", parse the end time directly
+// from the title text. This lets MIN_REMAINING_HOURS actually filter
+// short-lived intraday markets.
+export function parseEndFromTitle(title) {
+  if (!title) return null;
+  const monthMatch = title.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})(?:[,\s]+(20\d{2}))?/i);
+  if (!monthMatch) return null;
+  const month = MONTHS[monthMatch[1].slice(0, 3).toLowerCase()];
+  const day = Number(monthMatch[2]);
+  const year = monthMatch[3] ? Number(monthMatch[3]) : new Date().getUTCFullYear();
+  // Find the last time before "ET" — for "11:45AM-12PM ET" this is "12PM".
+  const timeMatch = title.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*ET/i);
+  if (!timeMatch) return null;
+  let hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2] ?? 0);
+  const ampm = timeMatch[3].toUpperCase();
+  if (ampm === 'PM' && hour !== 12) hour += 12;
+  if (ampm === 'AM' && hour === 12) hour = 0;
+  // ET offset: EDT (UTC-4) Mar-Nov, EST (UTC-5) Dec-Feb. Approximate
+  // since exact DST boundaries vary by 1h once per year.
+  const isEdt = month >= 2 && month <= 10;
+  const utcHour = hour + (isEdt ? 4 : 5);
+  return Date.UTC(year, month, day, utcHour, minute);
+}
+
 export function marketEndMs(m) {
   if (!m) return null;
   for (const f of ['endsAt', 'endTime', 'endsAtTimestamp', 'closeTime']) {
@@ -284,7 +311,9 @@ export function marketEndMs(m) {
     const ts = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
     if (Number.isFinite(ts)) return ts;
   }
-  return null;
+  // Fallback: parse the end time from the title (Predict.fun GraphQL
+  // doesn't expose a real end-time field for many markets).
+  return parseEndFromTitle(m.title);
 }
 
 export function isMarketTradeable(m) {

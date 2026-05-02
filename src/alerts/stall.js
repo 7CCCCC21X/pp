@@ -1,10 +1,10 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
-import { fmtSide, fmtElapsed, marketLink } from '../format.js';
+import { fmtElapsed, marketLink, formatOrderbookBlock } from '../format.js';
 import { effectiveOverride } from '../state.js';
 
 export async function detectStall(ctx) {
-  const { state, slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, log } = ctx;
+  const { state, slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, log, zone } = ctx;
   if (!config.alertStall || isPaused || filtered) {
     const why = !config.alertStall ? 'stall alerts off' : isPaused ? 'paused' : 'filtered';
     log(`[${marketId}] unchanged ${fmtElapsed(now - slot.lastChangeAt)} (${why})`);
@@ -21,11 +21,9 @@ export async function detectStall(ctx) {
   const msg = [
     `<b>订单簿停滞超过 ${staleHours} 小时</b>`,
     `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-    `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-    `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-    `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-    `已停滞: ${htmlEscape(fmtElapsed(elapsedMs))}`,
-    `起点: ${new Date(slot.lastChangeAt).toISOString()}`,
+    `已停滞: ${htmlEscape(fmtElapsed(elapsedMs))} · PP ${totalHourlyRate.toFixed(2)}/h`,
+    '',
+    formatOrderbookBlock(orderbook, zone),
   ].join('\n');
   if (await alert('stall', slot, marketId, msg, { elapsedMs })) {
     slot.alerted = true;

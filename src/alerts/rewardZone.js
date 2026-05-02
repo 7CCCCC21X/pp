@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
-import { fmtSide, fmtElapsed, marketLink } from '../format.js';
+import { fmtElapsed, marketLink, formatOrderbookBlock } from '../format.js';
 
 export async function detectRewardZone(ctx) {
   const { slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
@@ -11,9 +11,9 @@ export async function detectRewardZone(ctx) {
       const msg = [
         `<b>奖励区已重新激活</b>`,
         `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-        `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-        `规则: 离 mid ≤ ±${(zone.maxDistance * 100).toFixed(1)}¢，量 ≥ ${zone.minSize}`,
+        `PP ${totalHourlyRate.toFixed(2)}/h`,
+        '',
+        formatOrderbookBlock(orderbook, zone),
       ].join('\n');
       if (await alert('reward_zone_recovered', slot, marketId, msg, {})) {
         slot.rewardZoneRecovered = true;
@@ -29,17 +29,12 @@ export async function detectRewardZone(ctx) {
   const cooldownOk = now - (slot.rewardZoneAlertedAt ?? 0) >= 60 * 60 * 1000;
   if (elapsed < need || !cooldownOk) return;
 
-  const sides = [];
-  if (!zone.bidActivated) sides.push(`买侧 (${zone.bidReason ?? '未激活'})`);
-  if (!zone.askActivated) sides.push(`卖侧 (${zone.askReason ?? '未激活'})`);
   const msg = [
     `<b>奖励区可激活 (持续 ${fmtElapsed(elapsed)})</b>`,
     `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-    `规则: 离 mid ≤ ±${(zone.maxDistance * 100).toFixed(1)}¢，单边量 ≥ ${zone.minSize}`,
-    `当前买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-    `当前卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-    `${htmlEscape(sides.join('，'))}`,
-    `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
+    `PP ${totalHourlyRate.toFixed(2)}/h`,
+    '',
+    formatOrderbookBlock(orderbook, zone),
   ].join('\n');
   if (await alert('reward_zone', slot, marketId, msg, { elapsedMs: elapsed, bidActivated: zone.bidActivated, askActivated: zone.askActivated })) {
     slot.rewardZoneAlertedAt = now;
