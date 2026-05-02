@@ -105,9 +105,13 @@ const OPTIONAL_STATUS_FIELDS = [
   'shareThreshold',
 ];
 let _marketsQueryCache = null;
+let _selectionCache = null;
+let _filterFieldsCache = null;
 
-async function getMarketsPageQuery() {
-  if (_marketsQueryCache) return _marketsQueryCache;
+async function getMarketSelection() {
+  if (_selectionCache != null) {
+    return { selection: _selectionCache, filterFields: _filterFieldsCache };
+  }
   let scalarMarketFields = new Set();
   let filterFields = new Set();
   try {
@@ -128,7 +132,6 @@ async function getMarketsPageQuery() {
       'Introspect',
     );
     for (const f of intro?.market?.fields ?? []) {
-      // Walk through NON_NULL / LIST wrappers to find the underlying kind.
       let t = f.type;
       while (t && (t.kind === 'NON_NULL' || t.kind === 'LIST')) t = t.ofType;
       if (!t) continue;
@@ -140,32 +143,50 @@ async function getMarketsPageQuery() {
   } catch {
     // Fall back to the minimal known-good query.
   }
-
-  const selection = [];
+  const fields = [];
   for (const f of REQUIRED_FIELDS) {
-    if (!scalarMarketFields.size || scalarMarketFields.has(f)) selection.push(f);
+    if (!scalarMarketFields.size || scalarMarketFields.has(f)) fields.push(f);
   }
-  // rewardTimings is a list of objects, special-case it.
-  selection.push('rewardTimings { hourlyRate }');
+  fields.push('rewardTimings { hourlyRate }');
   for (const f of OPTIONAL_STATUS_FIELDS) {
-    if (scalarMarketFields.has(f)) selection.push(f);
+    if (scalarMarketFields.has(f)) fields.push(f);
   }
+  _selectionCache = fields.join('\n          ');
+  _filterFieldsCache = filterFields;
+  return { selection: _selectionCache, filterFields };
+}
 
+async function getMarketsPageQuery() {
+  if (_marketsQueryCache) return _marketsQueryCache;
+  const { selection, filterFields } = await getMarketSelection();
   const filterClause = filterFields.has('isResolved')
     ? 'filter: { isResolved: false }, '
     : '';
-
   _marketsQueryCache = `query AllMarkets($first: Int!, $after: String) {
     markets(${filterClause}pagination: { first: $first, after: $after }) {
       edges {
         node {
-          ${selection.join('\n          ')}
+          ${selection}
         }
       }
       pageInfo { hasNextPage endCursor }
     }
   }`;
   return _marketsQueryCache;
+}
+
+// Direct single-market lookup via GraphQL market(id:). Used when the cache
+// hasn't been populated (e.g. /probe before any discovery, or markets in
+// MARKET_IDS env that aren't on the auto-discover list).
+export async function getMarketDirect(id) {
+  const { selection } = await getMarketSelection();
+  const query = `query GetSingleMarket($id: ID!) {
+    market(id: $id) {
+      ${selection}
+    }
+  }`;
+  const data = await postGraphQL(query, { id: String(id) }, 'GetSingleMarket');
+  return data?.market ?? null;
 }
 
 // Paginate ALL markets via GraphQL markets(...) using cursor-based
@@ -244,6 +265,19 @@ export async function getMarketById(id) {
   return _cache.byId?.get(String(id)) ?? null;
 }
 
+// Look up a market without triggering a full list scan. Returns the cached
+// entry if the cache is already populated, otherwise falls back to a
+// direct GraphQL market(id:) call. Used by getMarketRewardSummary and the
+// /probe handler — anywhere that wants one market without paying for
+// loading thousands.
+export async function getMarketByIdFast(id) {
+  if (_cache.byId) {
+    const hit = _cache.byId.get(String(id));
+    if (hit) return hit;
+  }
+  return getMarketDirect(id);
+}
+
 const CLOSED_STATUSES = new Set([
   'CLOSED', 'RESOLVED', 'PAUSED', 'CANCELLED', 'CANCELED',
   'ARCHIVED', 'EXPIRED', 'SETTLED', 'INACTIVE',
@@ -278,9 +312,9 @@ export function isMarketTradeable(m) {
 export async function getMarketRewardSummary(marketId) {
   let market = null;
   try {
-    market = await getMarketById(marketId);
+    market = await getMarketByIdFast(marketId);
   } catch (err) {
-    console.warn(new Date().toISOString(), '[predict] getMarketById failed:', err.message);
+    console.warn(new Date().toISOString(), '[predict] getMarketByIdFast failed:', err.message);
   }
   if (!market) {
     return {
