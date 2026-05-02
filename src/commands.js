@@ -324,16 +324,22 @@ async function handle(text, state, ctx) {
     }
 
     case '/top': {
-      const snap = listMarketsSnapshot(state);
-      snap.sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
+      const snap = listMarketsSnapshot(state)
+        .filter(({ slot }) => !slot.lastError && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0);
+      snap.sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
       const top = snap.slice(0, 20);
-      if (!top.length) return '暂无数据，等待第一轮抓取。';
+      if (!top.length) {
+        const total = activeMarketIds(state).length;
+        return total === 0
+          ? '当前没有监控的市场。试试 AUTODISCOVER=true 或 /add &lt;id&gt;。'
+          : `所有 ${total} 个监控市场暂无可用 PP 数据（可能全部已 resolve 或 fetch 失败）。/status 看具体原因。`;
+      }
       return [`<b>PP/h Top ${top.length}</b>`, ...top.map(({ id, slot }) => htmlEscape(fmtMarketLine(id, slot)))].join('\n');
     }
 
     case '/gaps': {
       const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => slot.zoneStatus && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated));
+        .filter(({ slot }) => !slot.lastError && slot.zoneStatus && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated));
       snap.sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
       const top = snap.slice(0, 20);
       if (!top.length) return '当前所有监控市场都在奖励区内。';
@@ -347,6 +353,7 @@ async function handle(text, state, ctx) {
 
     case '/wide': {
       const snap = listMarketsSnapshot(state)
+        .filter(({ slot }) => !slot.lastError)
         .map(({ id, slot }) => {
           const bid = slot.baseline?.bidPrice;
           const ask = slot.baseline?.askPrice;
@@ -363,7 +370,7 @@ async function handle(text, state, ctx) {
 
     case '/empty': {
       const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => slot.baseline?.bidPrice == null || slot.baseline?.askPrice == null);
+        .filter(({ slot }) => !slot.lastError && slot.baseline && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null));
       if (!snap.length) return '当前没有空簿/单边市场。';
       return [`<b>单边/空簿 ${snap.length} 个</b>`, ...snap.slice(0, 20).map(({ id, slot }) => {
         const sides = [];
@@ -376,11 +383,12 @@ async function handle(text, state, ctx) {
     case '/opportunities':
     case '/opp': {
       const snap = listMarketsSnapshot(state)
+        .filter(({ slot }) => !slot.lastError)
         .map(({ id, slot }) => ({ id, slot, score: opportunityScore(slot) }))
         .filter((x) => x.score > 0);
       snap.sort((a, b) => b.score - a.score);
       const top = snap.slice(0, 20);
-      if (!top.length) return '暂无机会数据。';
+      if (!top.length) return '暂无机会数据。/status 看是否所有市场都失败/已 resolve。';
       return [`<b>机会评分 Top ${top.length}</b> (PP × 缺口 × 价差)`, ...top.map(({ id, slot, score }) =>
         htmlEscape(fmtMarketLine(id, slot, `score ${score.toFixed(0)}`)))].join('\n');
     }

@@ -147,10 +147,16 @@ export async function checkMarket(marketId, state, { isPaused }) {
     warn(`[${marketId}] orderbook fetch failed:`, err.message);
     const stub = ensureStubSlot(state, marketId, tickStart);
     stub.title = rewardSummary.title ?? stub.title;
-    stub.lastError = `订单簿失败: ${err.message.slice(0, 100)}`;
+    // Compact reason: keep the actionable bit, drop the URL.
+    const m = err.message.match(/(404|403|401|5\d\d|timed out)/i);
+    const code = m ? m[0] : 'fetch failed';
+    const tries = err.message.match(/tried (\d+)/i)?.[1];
+    stub.lastError = `订单簿 ${code}${tries ? ` (尝试 ${tries} 种组合)` : ''} — 市场可能已 resolve`;
     stub.lastSkipReason = null;
+    stub.consecutiveOrderbookErrors = (stub.consecutiveOrderbookErrors ?? 0) + 1;
     return;
   }
+  // Reset error counter on a successful fetch so a recovered market clears.
 
   const filters = effectiveFilters(state);
   const filterReason = checkFilter(orderbook, filters);
@@ -172,6 +178,7 @@ export async function checkMarket(marketId, state, { isPaused }) {
   };
   slot.lastError = null;
   slot.lastSkipReason = null;
+  slot.consecutiveOrderbookErrors = 0;
   if (rewardSummary?.title) slot.title = rewardSummary.title;
   slot.lastHourlyRate = totalHourlyRate;
   const lastSeenAt = slot.lastSeenAt ?? now;
