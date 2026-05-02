@@ -44,6 +44,20 @@ test('marketLink falls back to id when no title', () => {
   assert.match(link, /Market 123/);
 });
 
+test('marketLink prefers question over title for slug (outcome markets)', () => {
+  // Soccer outcome market: title="Draw", question="Real Madrid vs Barcelona — Match Result"
+  const link = marketLink('210562', 'Draw', 'Real Madrid vs Barcelona — Match Result');
+  // Slug derived from question, not from title
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/real-madrid-vs-barcelona-match-result"/);
+  // But the displayed text is still the short title
+  assert.match(link, />Draw<\/a>/);
+});
+
+test('marketLink falls back to title slug when no question', () => {
+  const link = marketLink('1', 'BNB up or down (May 2 2026 2am ET)', null);
+  assert.match(link, /\/bnb-up-or-down-may-2-2026-2am-et/);
+});
+
 test('marketLink escapes title text', () => {
   const link = marketLink('123', '<bad>');
   assert.match(link, /&lt;bad&gt;/);

@@ -9,7 +9,7 @@ import {
   answerCallbackQuery,
 } from './telegram.js';
 import { activeMarketIds } from './state.js';
-import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle } from './format.js';
+import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
 import { getMarketRewardSummary, getOrderbook, resolveSlugToId } from './predict.js';
 import { slugifyMarketTitle } from './format.js';
@@ -386,8 +386,8 @@ async function buildProbeMessage(marketId) {
     minSize: config.rewardZoneMinSize,
   });
   const lines = [
-    `<b>${htmlEscape((m.title ?? m.question ?? '').slice(0, 60))}</b> (#${htmlEscape(marketId)})`,
-    `PP/h: ${summary.totalHourlyRate.toFixed(2)}  ·  status: ${htmlEscape(String(m.status ?? m.tradingStatus ?? '?'))}`,
+    marketLink(marketId, m.title, m.question),
+    `<code>#${htmlEscape(marketId)}</code> · PP/h: <b>${summary.totalHourlyRate.toFixed(2)}</b> · status: ${htmlEscape(String(m.status ?? m.tradingStatus ?? '?'))}`,
   ];
   lines.push('');
   lines.push('<b>买盘</b>');
@@ -438,12 +438,16 @@ function fmtRemaining(endMs) {
 }
 
 function compactMarketRow(id, slot, extra = '') {
-  const title = htmlEscape(shortTitle(slot?.title ?? `Market ${id}`, 44));
+  // Title is hyperlinked when we have enough info to derive a working
+  // slug (use question for outcome-only titles like "Draw" / "Yes").
+  const linked = slot?.title || slot?.question
+    ? marketLink(id, slot.title, slot.question)
+    : htmlEscape(`Market ${id}`);
   const rate = Number.isFinite(slot?.lastHourlyRate)
     ? `${slot.lastHourlyRate.toFixed(0)}/h`
     : '?/h';
   const suffix = extra ? ` · ${htmlEscape(extra)}` : '';
-  return `<code>#${htmlEscape(id)}</code> ${title} — <b>${rate}</b>${suffix}`;
+  return `<code>#${htmlEscape(id)}</code> ${linked} — <b>${rate}</b>${suffix}`;
 }
 
 async function buildStatusDashboard(state) {

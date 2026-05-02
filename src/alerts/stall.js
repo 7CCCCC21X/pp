@@ -20,7 +20,7 @@ export async function detectStall(ctx) {
   if (slot.alerted) return;
   const msg = [
     `🟡 <b>订单簿停滞超过 ${staleHours} 小时</b>`,
-    `${marketLink(marketId, slot.title)}`,
+    `${marketLink(marketId, slot.title, slot.question)}`,
     `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 停滞 ${htmlEscape(fmtElapsed(elapsedMs))}`,
     '',
     formatOrderbookBlock(orderbook, zone),

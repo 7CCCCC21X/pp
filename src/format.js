@@ -66,10 +66,14 @@ export function slugifyMarketTitle(title) {
   return slugify(s);
 }
 
-export function marketLink(marketId, title) {
-  const label = title ? shortTitle(title, 72) : `Market ${marketId}`;
-  const safeTitle = htmlEscape(label);
-  const slug = title ? slugifyMarketTitle(title) : '';
+// Title is what we display (often short — "Draw", "Yes" for outcome
+// markets), question is the full event-level prompt that Predict.fun uses
+// to generate the URL slug. Prefer question for slug, fall back to title.
+export function marketLink(marketId, title, question) {
+  const display = title || question || `Market ${marketId}`;
+  const safeTitle = htmlEscape(shortTitle(display, 72));
+  const slugSource = question || title;
+  const slug = slugSource ? slugifyMarketTitle(slugSource) : '';
   // predict.fun's canonical paths are /<lang>/market/<slug>. /zh-cn/ is a
   // safe default that 302s when needed; without it some clients land on
   // an empty page.

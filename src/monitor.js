@@ -216,6 +216,9 @@ export async function checkMarket(marketId, state, { isPaused }) {
   // total available PP without redoing the regex match each command.
   slot.endMs = marketEndMs(market);
   if (rewardSummary?.title) slot.title = rewardSummary.title;
+  // question is the event-level prompt; for outcome-name markets ("Draw",
+  // "Yes") only the question slugifies to the right predict.fun URL.
+  if (rewardSummary?.market?.question) slot.question = rewardSummary.market.question;
   slot.lastHourlyRate = totalHourlyRate;
   const lastSeenAt = slot.lastSeenAt ?? now;
   slot.lastSeenAt = now;

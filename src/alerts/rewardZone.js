@@ -10,7 +10,7 @@ export async function detectRewardZone(ctx) {
     if (config.alertRecovery && slot.rewardZoneAlertedAt > 0 && !slot.rewardZoneRecovered) {
       const msg = [
         `✅ <b>奖励区已重新激活</b>`,
-        `${marketLink(marketId, slot.title)}`,
+        `${marketLink(marketId, slot.title, slot.question)}`,
         `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),
@@ -31,7 +31,7 @@ export async function detectRewardZone(ctx) {
 
   const msg = [
     `🎯 <b>奖励区可激活</b>`,
-    `${marketLink(marketId, slot.title)}`,
+    `${marketLink(marketId, slot.title, slot.question)}`,
     `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
     '',
     formatOrderbookBlock(orderbook, zone),
