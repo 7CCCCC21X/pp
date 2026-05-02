@@ -14,6 +14,7 @@
     "diagnose": "node scripts/diagnose.js",
     "rewards": "node scripts/rewards.js",
     "probe": "node scripts/probe.js",
+    "url-check": "node scripts/url-check.js",
     "prune-history": "node scripts/prune-history.js",
     "test": "node --test test/*.test.js",
     "check": "node --check src/*.js src/alerts/*.js scripts/*.js"
