@@ -385,8 +385,16 @@ async function buildProbeMessage(marketId) {
     maxDistance: config.rewardZoneMaxDistance,
     minSize: config.rewardZoneMinSize,
   });
+  // Probe builds a fresh link from the live market — pull a real slug
+  // from the same REST cache the monitor uses (best effort).
+  let realSlug = null;
+  try {
+    const { getSlugMapCached } = await import('./predict.js');
+    const slugMap = await getSlugMapCached();
+    realSlug = slugMap?.get(String(marketId)) ?? null;
+  } catch {}
   const lines = [
-    marketLink(marketId, m.title, m.question),
+    marketLink(marketId, m.title, m.question, realSlug),
     `<code>#${htmlEscape(marketId)}</code> · PP/h: <b>${summary.totalHourlyRate.toFixed(2)}</b> · status: ${htmlEscape(String(m.status ?? m.tradingStatus ?? '?'))}`,
   ];
   lines.push('');
@@ -441,7 +449,7 @@ function compactMarketRow(id, slot, extra = '') {
   // Title is hyperlinked when we have enough info to derive a working
   // slug (use question for outcome-only titles like "Draw" / "Yes").
   const linked = slot?.title || slot?.question
-    ? marketLink(id, slot.title, slot.question)
+    ? marketLink(id, slot.title, slot.question, slot.slug)
     : htmlEscape(`Market ${id}`);
   const rate = Number.isFinite(slot?.lastHourlyRate)
     ? `${slot.lastHourlyRate.toFixed(0)}/h`

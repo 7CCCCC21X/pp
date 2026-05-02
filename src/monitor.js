@@ -1,5 +1,5 @@
 import { config } from './config.js';
-import { getMarketRewardSummary, getOrderbook, marketEndMs } from './predict.js';
+import { getMarketRewardSummary, getOrderbook, marketEndMs, getSlugMapCached } from './predict.js';
 import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtElapsed, midOf, spreadOf, rewardZoneStatus } from './format.js';
@@ -219,6 +219,15 @@ export async function checkMarket(marketId, state, { isPaused }) {
   // question is the event-level prompt; for outcome-name markets ("Draw",
   // "Yes") only the question slugifies to the right predict.fun URL.
   if (rewardSummary?.market?.question) slot.question = rewardSummary.market.question;
+  // The real URL slug — `categorySlug` from REST. Falls back to existing
+  // value when the slug map hasn't yet covered this market.
+  try {
+    const slugMap = await getSlugMapCached();
+    const realSlug = slugMap?.get(String(marketId));
+    if (realSlug) slot.slug = realSlug;
+  } catch {
+    // Cache fetch failure is non-fatal; we still have title/question slugify fallback.
+  }
   slot.lastHourlyRate = totalHourlyRate;
   const lastSeenAt = slot.lastSeenAt ?? now;
   slot.lastSeenAt = now;

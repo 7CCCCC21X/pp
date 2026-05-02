@@ -19,7 +19,7 @@ export async function detectMidJump(ctx) {
       const direction = curMid > slot.lastMid ? '↑' : '↓';
       const msg = [
         `⚡ <b>中价跳变 ${direction} ${jump.toFixed(4)}</b>`,
-        `${marketLink(marketId, slot.title, slot.question)}`,
+        `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
         `<code>#${htmlEscape(marketId)}</code> · ${slot.lastMid.toFixed(4)} → <b>${curMid.toFixed(4)}</b> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),

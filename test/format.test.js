@@ -33,29 +33,31 @@ test('fmtElapsed clamps negative', () => {
   assert.equal(fmtElapsed(-1000), '0 分');
 });
 
-test('marketLink uses slug from title (zh-cn prefix)', () => {
-  const link = marketLink('123', 'BNB up or down (May 2 2026 2am ET)');
-  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/bnb-up-or-down-may-2-2026-2am-et"/);
-});
-
-test('marketLink falls back to id when no title', () => {
-  const link = marketLink('123', null);
-  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/123"/);
-  assert.match(link, /Market 123/);
-});
-
-test('marketLink prefers question over title for slug (outcome markets)', () => {
-  // Soccer outcome market: title="Draw", question="Real Madrid vs Barcelona — Match Result"
-  const link = marketLink('210562', 'Draw', 'Real Madrid vs Barcelona — Match Result');
-  // Slug derived from question, not from title
-  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/real-madrid-vs-barcelona-match-result"/);
-  // But the displayed text is still the short title
+test('marketLink: explicit slug wins (real categorySlug from REST)', () => {
+  const link = marketLink('210562', 'Draw', 'whatever', 'english-premier-league-winner');
+  assert.match(link, /href="https:\/\/predict\.fun\/market\/english-premier-league-winner"/);
   assert.match(link, />Draw<\/a>/);
 });
 
-test('marketLink falls back to title slug when no question', () => {
-  const link = marketLink('1', 'BNB up or down (May 2 2026 2am ET)', null);
+test('marketLink: question slugified when no explicit slug', () => {
+  const link = marketLink('210562', 'Draw', 'Real Madrid vs Barcelona — Match Result');
+  assert.match(link, /href="https:\/\/predict\.fun\/market\/real-madrid-vs-barcelona-match-result"/);
+});
+
+test('marketLink: falls back to title slug when no question or explicit slug', () => {
+  const link = marketLink('1', 'BNB up or down (May 2 2026 2am ET)');
   assert.match(link, /\/bnb-up-or-down-may-2-2026-2am-et/);
+});
+
+test('marketLink: id fallback when nothing else', () => {
+  const link = marketLink('123', null);
+  assert.match(link, /href="https:\/\/predict\.fun\/market\/123"/);
+  assert.match(link, /Market 123/);
+});
+
+test('marketLink: no /zh-cn/ prefix (matches predict.fun canonical)', () => {
+  const link = marketLink('1', 'Foo', null, 'foo-slug');
+  assert.doesNotMatch(link, /\/zh-cn\//);
 });
 
 test('marketLink escapes title text', () => {

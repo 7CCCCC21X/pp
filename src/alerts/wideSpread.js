@@ -13,7 +13,7 @@ export async function detectWideSpread(ctx) {
     if (config.alertRecovery && slot.wideSpreadAlertedAt > 0 && !slot.wideSpreadRecovered) {
       const msg = [
         `✅ <b>价差恢复正常 ${(curSpread * 100).toFixed(2)}¢</b>`,
-        `${marketLink(marketId, slot.title, slot.question)}`,
+        `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
         `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),
@@ -34,7 +34,7 @@ export async function detectWideSpread(ctx) {
 
   const msg = [
     `🔴 <b>价差走阔 ${(curSpread * 100).toFixed(2)}¢</b>`,
-    `${marketLink(marketId, slot.title, slot.question)}`,
+    `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
     `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
     '',
     formatOrderbookBlock(orderbook, zone),

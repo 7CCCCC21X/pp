@@ -24,7 +24,7 @@ export async function detectWatch(ctx) {
   if (askChanged) moves.push(htmlEscape(fmtMove('卖1', prevAsk, orderbook.bestAsk)));
   const msg = [
     `👁 <b>盯盘变动</b>`,
-    `${marketLink(marketId, slot.title, slot.question)}`,
+    `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
     `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
     ...moves,
     '',

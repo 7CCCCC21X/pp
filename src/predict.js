@@ -261,6 +261,61 @@ export async function getMarketById(id) {
 // direct GraphQL market(id:) call. Used by getMarketRewardSummary and the
 // /probe handler — anywhere that wants one market without paying for
 // loading thousands.
+// REST `/v1/markets` exposes a `categorySlug` field (and sometimes
+// `slug` / `marketSlug`) that maps to the actual predict.fun URL path —
+// the GraphQL Market type doesn't surface this, so we run a parallel
+// REST scan and cache the id → slug mapping. Refreshed on the same
+// MARKETS_CACHE_TTL_MS schedule as the main GraphQL list.
+let _slugCache = { at: 0, byId: null, inFlight: null };
+
+function pickSlug(m) {
+  return m?.slug || m?.marketSlug || m?.categorySlug || m?.category_slug || null;
+}
+
+export async function getSlugMapCached() {
+  const ttl = config.marketsCacheTtlMs;
+  const now = Date.now();
+  if (_slugCache.byId && now - _slugCache.at < ttl) return _slugCache.byId;
+  if (_slugCache.inFlight) return _slugCache.inFlight;
+  _slugCache.inFlight = (async () => {
+    const map = new Map();
+    let lastId = null;
+    for (let page = 0; page < 50; page++) {
+      const params = new URLSearchParams({ first: '100' });
+      if (lastId != null) params.set('after', String(lastId));
+      const url = `${config.restUrl}/markets?${params.toString()}`;
+      let arr;
+      try {
+        const json = await fetchJson(url, {
+          headers: restHeaders(),
+          timeoutMs: config.orderbookTimeoutMs ?? 10_000,
+          retries: 1,
+        });
+        arr = unwrapList(json);
+      } catch {
+        break;
+      }
+      if (!arr.length) break;
+      let progress = 0;
+      for (const m of arr) {
+        if (m?.id == null || map.has(String(m.id))) continue;
+        const slug = pickSlug(m);
+        if (slug) map.set(String(m.id), String(slug));
+        progress += 1;
+      }
+      if (!progress) break;
+      if (arr.length < 100) break;
+      const newLast = arr[arr.length - 1]?.id;
+      if (newLast == null || newLast === lastId) break;
+      lastId = newLast;
+    }
+    _slugCache.byId = map;
+    _slugCache.at = Date.now();
+    return map;
+  })().finally(() => { _slugCache.inFlight = null; });
+  return _slugCache.inFlight;
+}
+
 export async function getMarketByIdFast(id) {
   if (_cache.byId) {
     const hit = _cache.byId.get(String(id));
