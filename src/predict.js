@@ -244,20 +244,27 @@ const CLOSED_STATUSES = new Set([
   'ARCHIVED', 'EXPIRED', 'SETTLED', 'INACTIVE',
 ]);
 
-export function isMarketTradeable(m) {
-  if (!m) return false;
-  if (m.isResolved === true) return false;
-  if (m.resolvedAt != null) return false;
-  if (m.resolution != null && m.resolution !== '' && m.resolution !== 'UNRESOLVED') return false;
-  const status = String(m.tradingStatus ?? m.status ?? '').toUpperCase();
-  if (status && CLOSED_STATUSES.has(status)) return false;
-  // If we have an end timestamp and it's in the past, the market is over.
+// Returns the market end timestamp in ms (or null if none of the known
+// end-time fields are populated).
+export function marketEndMs(m) {
+  if (!m) return null;
   for (const f of ['endsAt', 'endTime', 'endsAtTimestamp', 'closeTime']) {
     const v = m[f];
     if (v == null || v === '') continue;
     const ts = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
-    if (Number.isFinite(ts) && ts <= Date.now()) return false;
+    if (Number.isFinite(ts)) return ts;
   }
+  return null;
+}
+
+export function isMarketTradeable(m) {
+  if (!m) return false;
+  if (m.isResolved === true) return false;
+  if (m.resolvedAt != null) return false;
+  const status = String(m.tradingStatus ?? m.status ?? '').toUpperCase();
+  if (status && CLOSED_STATUSES.has(status)) return false;
+  const endMs = marketEndMs(m);
+  if (endMs != null && endMs <= Date.now()) return false;
   return true;
 }
 

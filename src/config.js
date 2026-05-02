@@ -117,6 +117,11 @@ export const config = {
   // for filtering out short-lived high-frequency markets (like 15-min Bitcoin
   // up/down) that clutter the watchlist but never trigger stall alerts.
   minHourlyRate: num('MIN_HOURLY_RATE', 0),
+  // Skip auto-discovered markets ending within this many hours from now.
+  // Useful for filtering out 15-min Bitcoin Up/Down markets that resolve
+  // before STALE_HOURS could ever fire. Default = STALE_HOURS so a stall
+  // alert at least has a chance of firing before the market closes.
+  minRemainingHours: num('MIN_REMAINING_HOURS', num('STALE_HOURS', 6)),
 
   // History + daily digest
   historyEnabled: bool('HISTORY_ENABLED', true),
