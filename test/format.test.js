@@ -1,0 +1,99 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  fmtSide,
+  fmtElapsed,
+  marketLink,
+  midOf,
+  spreadOf,
+  rewardZoneStatus,
+} from '../src/format.js';
+
+test('fmtSide handles null', () => {
+  assert.equal(fmtSide(null), '无');
+});
+
+test('fmtSide formats price and size', () => {
+  const out = fmtSide({ price: 0.5, size: 100 });
+  assert.match(out, /0\.5000/);
+  assert.match(out, /100/);
+});
+
+test('fmtElapsed minutes', () => {
+  assert.equal(fmtElapsed(45 * 60 * 1000), '45 分');
+});
+
+test('fmtElapsed hours and minutes', () => {
+  assert.equal(fmtElapsed(2 * 3600 * 1000 + 30 * 60 * 1000), '2 小时 30 分');
+});
+
+test('fmtElapsed clamps negative', () => {
+  assert.equal(fmtElapsed(-1000), '0 分');
+});
+
+test('marketLink escapes title', () => {
+  const link = marketLink('123', '<bad>');
+  assert.match(link, /href="https:\/\/predict\.fun\/market\/123"/);
+  assert.match(link, /&lt;bad&gt;/);
+});
+
+test('midOf and spreadOf', () => {
+  const ob = { bestBid: { price: 0.49, size: 1 }, bestAsk: { price: 0.51, size: 1 } };
+  assert.equal(midOf(ob), 0.5);
+  assert.equal(Math.round(spreadOf(ob) * 1000) / 1000, 0.02);
+});
+
+test('midOf returns null when missing side', () => {
+  assert.equal(midOf({ bestBid: null, bestAsk: { price: 0.5, size: 1 } }), null);
+});
+
+test('rewardZoneStatus activates both sides when tight', () => {
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.49, size: 200 }, bestAsk: { price: 0.51, size: 200 } },
+    {},
+    { maxDistance: 0.06, minSize: 100 },
+  );
+  assert.equal(z.bidActivated, true);
+  assert.equal(z.askActivated, true);
+});
+
+test('rewardZoneStatus rejects oversized spread', () => {
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.30, size: 200 }, bestAsk: { price: 0.70, size: 200 } },
+    {},
+    { maxDistance: 0.06, minSize: 100 },
+  );
+  assert.equal(z.bidActivated, false);
+  assert.equal(z.askActivated, false);
+  assert.match(z.bidReason, /离 mid/);
+});
+
+test('rewardZoneStatus rejects undersized', () => {
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.49, size: 50 }, bestAsk: { price: 0.51, size: 200 } },
+    {},
+    { maxDistance: 0.06, minSize: 100 },
+  );
+  assert.equal(z.bidActivated, false);
+  assert.equal(z.askActivated, true);
+  assert.match(z.bidReason, /量 50 < 100/);
+});
+
+test('rewardZoneStatus uses per-market overrides', () => {
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.49, size: 50 }, bestAsk: { price: 0.51, size: 50 } },
+    { spreadThreshold: 0.005, shareThreshold: 30 },
+    { maxDistance: 0.06, minSize: 100 },
+  );
+  assert.equal(z.maxDistance, 0.005);
+  assert.equal(z.minSize, 30);
+  assert.equal(z.bidActivated, false); // spread/2 = 1¢ > 0.5¢
+});
+
+test('rewardZoneStatus handles empty book', () => {
+  const z = rewardZoneStatus({ bestBid: null, bestAsk: null }, {}, { maxDistance: 0.06, minSize: 100 });
+  assert.equal(z.bidActivated, false);
+  assert.equal(z.askActivated, false);
+  assert.equal(z.bidReason, '无买单');
+});

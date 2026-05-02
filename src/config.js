@@ -40,7 +40,9 @@ function numOrNull(name) {
 function bool(name, fallback) {
   const v = process.env[name];
   if (v == null || v === '') return fallback;
-  return /^(1|true|yes|y|on)$/i.test(v);
+  if (/^(1|true|yes|y|on)$/i.test(v)) return true;
+  if (/^(0|false|no|n|off)$/i.test(v)) return false;
+  throw new Error(`${name} must be a boolean (true/false/1/0/yes/no), got "${v}"`);
 }
 
 function buildFilterDefaults() {
@@ -175,6 +177,31 @@ export function validateConfig() {
   if (config.pollIntervalMs < 5_000) errors.push('POLL_INTERVAL_MS must be >= 5000');
   if (config.digestHourUtc < 0 || config.digestHourUtc > 23) {
     errors.push('DAILY_DIGEST_HOUR_UTC must be 0..23');
+  }
+  if (config.priceEpsilon <= 0) errors.push('PRICE_EPSILON must be > 0');
+  if (config.maxSpread <= 0 || config.maxSpread >= 1) {
+    errors.push('MAX_SPREAD must be in (0, 1)');
+  }
+  if (config.midJumpThreshold <= 0 || config.midJumpThreshold >= 1) {
+    errors.push('MID_JUMP_THRESHOLD must be in (0, 1)');
+  }
+  if (config.rewardZoneMaxDistance <= 0 || config.rewardZoneMaxDistance >= 1) {
+    errors.push('REWARD_ZONE_MAX_DISTANCE must be in (0, 1)');
+  }
+  if (config.rewardZoneMinSize < 0) errors.push('REWARD_ZONE_MIN_SIZE must be >= 0');
+  if (config.discoveryMaxMarkets < 0) errors.push('DISCOVERY_MAX_MARKETS must be >= 0');
+  if (config.discoveryIntervalMs < 60_000) errors.push('DISCOVERY_INTERVAL_MS must be >= 60000');
+  if (config.marketsCacheTtlMs < 10_000) errors.push('MARKETS_CACHE_TTL_MS must be >= 10000');
+  if (config.graphqlTimeoutMs < 1_000) errors.push('GRAPHQL_TIMEOUT_MS must be >= 1000');
+  if (config.orderbookTimeoutMs < 1_000) errors.push('ORDERBOOK_TIMEOUT_MS must be >= 1000');
+  if (config.minHourlyRate < 0) errors.push('MIN_HOURLY_RATE must be >= 0');
+  if (config.minRemainingHours < 0) errors.push('MIN_REMAINING_HOURS must be >= 0');
+  if (config.historyKeepDays < 0) errors.push('HISTORY_KEEP_DAYS must be >= 0');
+  for (const k of Object.keys(config.filters)) {
+    const v = config.filters[k];
+    if (v != null && (!Number.isFinite(v) || v < 0)) {
+      errors.push(`FILTER ${k} must be a non-negative number`);
+    }
   }
   if (errors.length) {
     throw new Error('Invalid configuration:\n  - ' + errors.join('\n  - '));

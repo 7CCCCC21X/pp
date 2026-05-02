@@ -2,9 +2,15 @@ import { config } from './config.js';
 import { getMarketRewardSummary, getOrderbook } from './predict.js';
 import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
-import { fmtSide, fmtElapsed, marketLink, midOf, spreadOf, rewardZoneStatus } from './format.js';
+import { fmtElapsed, midOf, spreadOf, rewardZoneStatus } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
 import { alertKeyboard } from './commands.js';
+import { detectStall } from './alerts/stall.js';
+import { detectWatch } from './alerts/watch.js';
+import { detectMidJump } from './alerts/midJump.js';
+import { detectWideSpread } from './alerts/wideSpread.js';
+import { detectRewardZone } from './alerts/rewardZone.js';
+import { detectEmptyBook } from './alerts/emptyBook.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[monitor]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[monitor]', ...args);
@@ -40,7 +46,10 @@ function ensureSlot(state, marketId, cur, now) {
       lastChangeAt: now,
       lastSeenAt: now,
       alerted: false,
-      lastMid: midOf({ bestBid: cur.bidPrice != null ? { price: cur.bidPrice, size: cur.bidSize } : null, bestAsk: cur.askPrice != null ? { price: cur.askPrice, size: cur.askSize } : null }),
+      lastMid: midOf({
+        bestBid: cur.bidPrice != null ? { price: cur.bidPrice, size: cur.bidSize } : null,
+        bestAsk: cur.askPrice != null ? { price: cur.askPrice, size: cur.askSize } : null,
+      }),
       midJumpAlertedAt: 0,
       wideSpreadSince: null,
       wideSpreadAlertedAt: 0,
@@ -71,6 +80,16 @@ async function alert(kind, slot, marketId, message, extra = {}) {
   }).catch(() => {});
   return true;
 }
+
+const DETECTORS = [
+  detectWatch,        // fires on every detected change (watched markets only)
+  detectMidJump,      // tick-to-tick mid drift; also updates slot.lastMid
+  detectWideSpread,
+  detectRewardZone,
+  detectEmptyBook,
+  // Stall is special — also resets on book move; runs last because it
+  // depends on baseline state from the move-detection block.
+];
 
 export async function checkMarket(marketId, state, { isPaused }) {
   let rewardSummary = null;
@@ -125,8 +144,6 @@ export async function checkMarket(marketId, state, { isPaused }) {
   slot.lastSeenAt = now;
 
   // Per-tick rate logging — used by /digest to compute 24h PP totals.
-  // Cap dt at 2 × poll interval so a long offline gap doesn't attribute
-  // phantom PP to a window we weren't actually watching.
   if (totalHourlyRate > 0) {
     const dtMs = Math.min(now - lastSeenAt, 2 * config.pollIntervalMs);
     if (dtMs > 0) {
@@ -158,143 +175,35 @@ export async function checkMarket(marketId, state, { isPaused }) {
   const bidChanged = topMoved(slot.baseline.bidPrice, slot.baseline.bidSize, orderbook.bestBid);
   const askChanged = topMoved(slot.baseline.askPrice, slot.baseline.askSize, orderbook.bestAsk);
 
-  // --- Watch mode: market is in state.watchedIds, fire on every detected
-  // change (with a 1-min cooldown so a flapping book doesn't spam).
-  const isWatched = (state.watchedIds ?? []).includes(marketId);
-  if (isWatched && (bidChanged || askChanged) && !isPaused && !filtered) {
-    const cooldownOk = now - (slot.watchAlertedAt ?? 0) >= 60_000;
-    if (cooldownOk) {
-      const fmtMove = (label, prev, next) => {
-        const prevPart = prev?.price != null ? `${prev.price.toFixed(4)} × ${prev.size}` : '空';
-        const nextPart = next?.price != null ? `${next.price.toFixed(4)} × ${next.size}` : '空';
-        return `${label}: ${prevPart} → ${nextPart}`;
-      };
-      const prevBid = slot.baseline.bidPrice != null ? { price: slot.baseline.bidPrice, size: slot.baseline.bidSize } : null;
-      const prevAsk = slot.baseline.askPrice != null ? { price: slot.baseline.askPrice, size: slot.baseline.askSize } : null;
-      const msg = [
-        `<b>盯盘变动</b>`,
-        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        bidChanged ? htmlEscape(fmtMove('买1', prevBid, orderbook.bestBid)) : `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-        askChanged ? htmlEscape(fmtMove('卖1', prevAsk, orderbook.bestAsk)) : `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-        `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-      ].join('\n');
-      if (await alert('watch', slot, marketId, msg, { bidChanged, askChanged })) {
-        slot.watchAlertedAt = now;
-      }
+  const ctx = {
+    state,
+    slot,
+    orderbook,
+    marketId,
+    market,
+    totalHourlyRate,
+    isPaused,
+    filtered,
+    filterReason,
+    now,
+    bidChanged,
+    askChanged,
+    zone,
+    alert,
+    log,
+  };
+
+  for (const detect of DETECTORS) {
+    try {
+      await detect(ctx);
+    } catch (err) {
+      warn(`[${marketId}] detector ${detect.name} failed:`, err.message);
     }
   }
 
-  // --- Mid-jump: compare against previous tick's mid (not baseline)
-  const curMid = midOf(orderbook);
-  const curSpread = spreadOf(orderbook);
-  if (
-    config.alertMidJump &&
-    !isPaused && !filtered &&
-    Number.isFinite(curMid) &&
-    Number.isFinite(slot.lastMid)
-  ) {
-    const jump = Math.abs(curMid - slot.lastMid);
-    const cooldownOk = now - (slot.midJumpAlertedAt ?? 0) >= config.midJumpCooldownMs;
-    if (jump >= config.midJumpThreshold && cooldownOk) {
-      const direction = curMid > slot.lastMid ? '↑' : '↓';
-      const msg = [
-        `<b>中价跳变 ${direction} ${jump.toFixed(4)}</b>`,
-        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        `中价: ${slot.lastMid.toFixed(4)} → ${curMid.toFixed(4)}`,
-        `当前买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-        `当前卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-        `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-      ].join('\n');
-      if (await alert('mid_jump', slot, marketId, msg, { from: slot.lastMid, to: curMid, jump })) {
-        slot.midJumpAlertedAt = now;
-      }
-    }
-  }
-  if (Number.isFinite(curMid)) slot.lastMid = curMid;
-
-  // --- Wide-spread: alert if spread > MAX_SPREAD continuously for WIDE_SPREAD_MIN_MINUTES
-  if (config.alertWideSpread && !isPaused && !filtered) {
-    if (Number.isFinite(curSpread) && curSpread > config.maxSpread) {
-      if (!slot.wideSpreadSince) slot.wideSpreadSince = now;
-      const elapsed = now - slot.wideSpreadSince;
-      const need = config.wideSpreadMinMinutes * 60 * 1000;
-      const cooldownOk = now - (slot.wideSpreadAlertedAt ?? 0) >= 60 * 60 * 1000;
-      if (elapsed >= need && cooldownOk) {
-        const msg = [
-          `<b>价差走阔 ${curSpread.toFixed(4)} (持续 ${fmtElapsed(elapsed)})</b>`,
-          `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-          `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-          `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-          `阈值: ${config.maxSpread.toFixed(4)}`,
-          `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-        ].join('\n');
-        if (await alert('wide_spread', slot, marketId, msg, { spread: curSpread, elapsedMs: elapsed })) {
-          slot.wideSpreadAlertedAt = now;
-        }
-      }
-    } else {
-      slot.wideSpreadSince = null;
-    }
-  }
-
-  // --- Reward zone unstaffed: bid or ask side outside Predict.fun's
-  // reward parameters (price too far from mid OR size below threshold)
-  // sustained for REWARD_ZONE_MIN_MINUTES. Means PP is sitting unclaimed.
-  if (config.alertRewardZone && !isPaused && !filtered && totalHourlyRate > 0) {
-    const unstaffed = !zone.bidActivated || !zone.askActivated;
-    if (unstaffed) {
-      if (!slot.rewardZoneSince) slot.rewardZoneSince = now;
-      const elapsed = now - slot.rewardZoneSince;
-      const need = config.rewardZoneMinMinutes * 60 * 1000;
-      const cooldownOk = now - (slot.rewardZoneAlertedAt ?? 0) >= 60 * 60 * 1000;
-      if (elapsed >= need && cooldownOk) {
-        const sides = [];
-        if (!zone.bidActivated) sides.push(`买侧 (${zone.bidReason ?? '未激活'})`);
-        if (!zone.askActivated) sides.push(`卖侧 (${zone.askReason ?? '未激活'})`);
-        const msg = [
-          `<b>奖励区可激活 (持续 ${fmtElapsed(elapsed)})</b>`,
-          `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-          `规则: 离 mid ≤ ±${(zone.maxDistance * 100).toFixed(1)}¢，单边量 ≥ ${zone.minSize}`,
-          `当前买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-          `当前卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-          `${htmlEscape(sides.join('，'))}`,
-          `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-        ].join('\n');
-        if (await alert('reward_zone', slot, marketId, msg, { elapsedMs: elapsed, bidActivated: zone.bidActivated, askActivated: zone.askActivated })) {
-          slot.rewardZoneAlertedAt = now;
-        }
-      }
-    } else {
-      slot.rewardZoneSince = null;
-    }
-  }
-
-  // --- Empty book
-  if (config.alertEmptyBook && !isPaused && !filtered) {
-    const empty = orderbook.bestBid == null || orderbook.bestAsk == null;
-    if (empty) {
-      if (!slot.emptyBookSince) slot.emptyBookSince = now;
-      const elapsed = now - slot.emptyBookSince;
-      const need = config.emptyBookMinMinutes * 60 * 1000;
-      const cooldownOk = now - (slot.emptyBookAlertedAt ?? 0) >= 60 * 60 * 1000;
-      if (elapsed >= need && cooldownOk) {
-        const msg = [
-          `<b>订单簿单边/空缺 (持续 ${fmtElapsed(elapsed)})</b>`,
-          `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-          `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-          `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-          `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-        ].join('\n');
-        if (await alert('empty_book', slot, marketId, msg, { elapsedMs: elapsed })) {
-          slot.emptyBookAlertedAt = now;
-        }
-      }
-    } else {
-      slot.emptyBookSince = null;
-    }
-  }
-
-  // --- Stall: top of book unchanged for STALE_HOURS
+  // Stall detection lives here because of its baseline-reset coupling: a
+  // book move resets the timer (and re-arms the alert), no move means the
+  // standard stall check.
   if (bidChanged || askChanged) {
     log(
       `[${marketId}] book moved -> reset stall timer`,
@@ -315,29 +224,5 @@ export async function checkMarket(marketId, state, { isPaused }) {
     return;
   }
 
-  if (!config.alertStall || isPaused || filtered) {
-    const why = !config.alertStall ? 'stall alerts off' : isPaused ? 'paused' : `filtered: ${filterReason}`;
-    log(`[${marketId}] unchanged ${fmtElapsed(now - slot.lastChangeAt)} (${why})`);
-    return;
-  }
-
-  const elapsedMs = now - slot.lastChangeAt;
-  const staleMs = config.staleHours * 3600 * 1000;
-  if (elapsedMs >= staleMs && !slot.alerted) {
-    const msg = [
-      `<b>订单簿停滞超过 ${config.staleHours} 小时</b>`,
-      `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-      `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
-      `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
-      `PP 奖励: ${totalHourlyRate.toFixed(4)} / 小时`,
-      `已停滞: ${htmlEscape(fmtElapsed(elapsedMs))}`,
-      `起点: ${new Date(slot.lastChangeAt).toISOString()}`,
-    ].join('\n');
-    if (await alert('stall', slot, marketId, msg, { elapsedMs })) {
-      slot.alerted = true;
-      log(`[${marketId}] alerted stall (${fmtElapsed(elapsedMs)})`);
-    }
-  } else {
-    log(`[${marketId}] unchanged ${fmtElapsed(elapsedMs)} (alerted=${slot.alerted})`);
-  }
+  await detectStall(ctx);
 }
