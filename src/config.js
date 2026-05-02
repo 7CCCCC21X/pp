@@ -134,6 +134,11 @@ export const config = {
   // How long to cache the REST market list (used by both auto-discovery
   // and per-market reward lookup). Default 10 minutes.
   marketsCacheTtlMs: num('MARKETS_CACHE_TTL_MS', 10 * 60 * 1000),
+
+  // Per-page GraphQL request timeout. Hangs in pagination get aborted
+  // after this many ms; the loop returns whatever has already been
+  // collected.
+  graphqlTimeoutMs: num('GRAPHQL_TIMEOUT_MS', 30_000),
 };
 
 export function validateConfig() {

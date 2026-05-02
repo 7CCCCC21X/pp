@@ -54,13 +54,15 @@ process.on('SIGINT', () => {
   allMarkets = await listAllMarkets({
     pageSize,
     maxPages,
-    onProgress: ({ page, edges, newMarkets, total, hasNext, error }) => {
+    onProgress: (p) => {
       if (interrupted) return;
-      if (error) {
-        console.log(`  page ${page} error: ${error}`);
-      } else {
-        const tag = hasNext ? '' : ' [last]';
-        console.log(`  page ${page}: +${newMarkets} new (${edges} edges, ${total} unique)${tag}`);
+      if (p.phase === 'fetching') {
+        process.stdout.write(`  page ${p.page}: fetching ... `);
+      } else if (p.phase === 'page') {
+        const tag = p.hasNext ? '' : ' [last]';
+        process.stdout.write(`+${p.newMarkets} new (${p.edges} edges, ${p.total} unique)${tag}\n`);
+      } else if (p.phase === 'error') {
+        process.stdout.write(`ERROR: ${p.error}\n`);
       }
     },
   });

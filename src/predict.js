@@ -59,16 +59,27 @@ function unwrapList(json) {
   return [];
 }
 
-async function postGraphQL(query, variables, operationName) {
-  const res = await fetch(config.graphqlUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables, operationName }),
-  });
-  if (!res.ok) throw new Error(`GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const json = await res.json();
-  if (json.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors).slice(0, 200)}`);
-  return json.data;
+async function postGraphQL(query, variables, operationName, { timeoutMs } = {}) {
+  const ctrl = new AbortController();
+  const ms = Number.isFinite(timeoutMs) ? timeoutMs : (config.graphqlTimeoutMs ?? 30_000);
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(config.graphqlUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables, operationName }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+    if (json.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors).slice(0, 200)}`);
+    return json.data;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error(`GraphQL request timed out after ${ms}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const MARKETS_PAGE_QUERY = `query AllMarkets($first: Int!, $after: String) {
@@ -98,11 +109,12 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100, onProgres
   const seen = new Map();
   let after = null;
   for (let page = 0; page < maxPages; page++) {
+    if (onProgress) onProgress({ phase: 'fetching', page, after, total: seen.size });
     let data;
     try {
       data = await postGraphQL(MARKETS_PAGE_QUERY, { first: pageSize, after }, 'AllMarkets');
     } catch (err) {
-      if (onProgress) onProgress({ page, error: err.message, total: seen.size });
+      if (onProgress) onProgress({ phase: 'error', page, error: err.message, total: seen.size });
       break;
     }
     const conn = data?.markets;
@@ -118,6 +130,7 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100, onProgres
     const hasNext = !!pageInfo?.hasNextPage && !!pageInfo?.endCursor;
     if (onProgress) {
       onProgress({
+        phase: 'page',
         page,
         edges: edges.length,
         newMarkets: progress,
