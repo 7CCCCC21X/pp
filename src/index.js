@@ -101,6 +101,11 @@ async function tick(state) {
   await maybePruneHistory(state);
   await maybeDiscover(state);
   const ids = activeMarketIds(state);
+  if (!ids.length) {
+    log('no markets to monitor (empty MARKET_IDS, no autodiscovered, nothing /add\'d). Idle tick.');
+    await persist(state);
+    return;
+  }
   for (const id of ids) {
     const isPaused = state.pausedIds.includes(id) || isSnoozed(state, id);
     try {

@@ -173,10 +173,12 @@ export const config = {
 
 export function validateConfig() {
   const errors = [];
+  const warnings = [];
   if (!config.telegramBotToken) errors.push('TELEGRAM_BOT_TOKEN is required');
   if (!config.telegramChatId) errors.push('TELEGRAM_CHAT_ID is required');
   if (!config.marketIds.length && !config.autodiscover) {
-    errors.push('Set MARKET_IDS, or enable AUTODISCOVER=true');
+    // Soft warning — bot can still serve /add and other commands.
+    warnings.push('No MARKET_IDS and AUTODISCOVER=false. Bot will idle until you /add a market or set AUTODISCOVER=true.');
   }
   if (config.staleHours <= 0) errors.push('STALE_HOURS must be > 0');
   if (config.pollIntervalMs < 5_000) errors.push('POLL_INTERVAL_MS must be >= 5000');
@@ -210,6 +212,9 @@ export function validateConfig() {
   }
   if (errors.length) {
     throw new Error('Invalid configuration:\n  - ' + errors.join('\n  - '));
+  }
+  for (const w of warnings) {
+    console.warn(new Date().toISOString(), '[config] WARN:', w);
   }
 }
 
