@@ -188,12 +188,28 @@ async function lookupViaMarketsFilter(value, fields, shape) {
   return null;
 }
 
+function extractMarketsArray(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data.markets)) return data.markets;
+  if (Array.isArray(data.items)) return data.items;
+  if (Array.isArray(data.nodes)) return data.nodes;
+  if (Array.isArray(data.edges)) {
+    return data.edges.map((e) => e?.node ?? e).filter(Boolean);
+  }
+  if (Array.isArray(data.data)) return data.data;
+  if (data.market?.id) return [data.market];
+  if (data.id) return [data];
+  return [];
+}
+
 async function lookupBySlugREST(slug) {
   // 1. Try direct REST paths
   const directPaths = [
     `/markets/${encodeURIComponent(slug)}`,
     `/markets/by-slug/${encodeURIComponent(slug)}`,
     `/markets?slug=${encodeURIComponent(slug)}`,
+    `/markets?slug=${encodeURIComponent(slug)}&first=10`,
   ];
   for (const p of directPaths) {
     const url = `${config.restUrl}${p}`;
@@ -203,12 +219,14 @@ async function lookupBySlugREST(slug) {
       if (!res.ok) continue;
       const json = await res.json();
       const data = json?.data ?? json;
-      if (data?.id && (!slug || data.slug === slug || !data.slug)) return data;
-      const arr = data?.markets ?? data?.items ?? (Array.isArray(data) ? data : null);
-      if (Array.isArray(arr)) {
-        const m = arr.find((x) => x?.slug === slug || String(x?.id) === slug);
-        if (m) return m;
-      }
+      console.log(`     keys=${Object.keys(data ?? {}).join(',')}`);
+      const arr = extractMarketsArray(data);
+      console.log(`     extracted ${arr.length} market(s)`);
+      if (!arr.length) continue;
+      const exact = arr.find((x) => x?.slug === slug);
+      if (exact) return exact;
+      // Filter endpoints with ?slug= should only return 1 -> trust it
+      if (arr.length === 1 && arr[0]?.id) return arr[0];
     } catch (err) {
       console.log(`  ERR  ${url}: ${err.message}`);
     }
@@ -228,18 +246,17 @@ async function lookupBySlugREST(slug) {
     }
     const json = await res.json();
     const data = json?.data ?? json;
-    const arr =
-      data?.markets ??
-      data?.items ??
-      data?.edges?.map((e) => e?.node).filter(Boolean) ??
-      (Array.isArray(data) ? data : []);
+    const arr = extractMarketsArray(data);
+    if (page === 0) {
+      console.log(`     page 0 sample keys: ${arr[0] ? Object.keys(arr[0]).join(',') : '(empty)'}`);
+    }
     for (const m of arr) {
       if (m?.slug === slug) {
-        console.log(`  found on page ${page} (${arr.length} markets/page)`);
+        console.log(`  found on page ${page}`);
         return m;
       }
     }
-    const pageInfo = data?.pageInfo;
+    const pageInfo = data?.pageInfo ?? json?.pageInfo;
     cursor = pageInfo?.endCursor ?? data?.nextCursor ?? null;
     if (!cursor || pageInfo?.hasNextPage === false) break;
   }
