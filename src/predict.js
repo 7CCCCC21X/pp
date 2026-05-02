@@ -103,18 +103,34 @@ let _marketsQueryCache = null;
 
 async function getMarketsPageQuery() {
   if (_marketsQueryCache) return _marketsQueryCache;
-  let marketFields = new Set();
+  let scalarMarketFields = new Set();
   let filterFields = new Set();
   try {
     const intro = await postGraphQL(
       `query Introspect {
-        market: __type(name: "Market") { fields { name } }
+        market: __type(name: "Market") {
+          fields {
+            name
+            type {
+              kind name
+              ofType { kind name ofType { kind name ofType { kind name } } }
+            }
+          }
+        }
         filter: __type(name: "MarketFilterInput") { inputFields { name } }
       }`,
       {},
       'Introspect',
     );
-    marketFields = new Set((intro?.market?.fields ?? []).map((f) => f.name));
+    for (const f of intro?.market?.fields ?? []) {
+      // Walk through NON_NULL / LIST wrappers to find the underlying kind.
+      let t = f.type;
+      while (t && (t.kind === 'NON_NULL' || t.kind === 'LIST')) t = t.ofType;
+      if (!t) continue;
+      if (t.kind === 'SCALAR' || t.kind === 'ENUM') {
+        scalarMarketFields.add(f.name);
+      }
+    }
     filterFields = new Set((intro?.filter?.inputFields ?? []).map((f) => f.name));
   } catch {
     // Fall back to the minimal known-good query.
@@ -122,13 +138,12 @@ async function getMarketsPageQuery() {
 
   const selection = [];
   for (const f of REQUIRED_FIELDS) {
-    if (!marketFields.size || marketFields.has(f)) selection.push(f);
+    if (!scalarMarketFields.size || scalarMarketFields.has(f)) selection.push(f);
   }
-  if (!marketFields.size || marketFields.has('rewardTimings')) {
-    selection.push('rewardTimings { hourlyRate }');
-  }
+  // rewardTimings is a list of objects, special-case it.
+  selection.push('rewardTimings { hourlyRate }');
   for (const f of OPTIONAL_STATUS_FIELDS) {
-    if (marketFields.has(f)) selection.push(f);
+    if (scalarMarketFields.has(f)) selection.push(f);
   }
 
   const filterClause = filterFields.has('isResolved')
