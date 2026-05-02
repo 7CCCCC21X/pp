@@ -541,13 +541,21 @@ export function isMarketTradeable(m) {
 // Reward + orderbook key lookup that the rest of the bot uses. Reads from
 // the cached REST market list (no per-market GraphQL).
 export async function getMarketRewardSummary(marketId) {
-  let market = null;
-  try {
-    market = await getMarketByIdFast(marketId);
-  } catch (err) {
-    console.warn(new Date().toISOString(), '[predict] getMarketByIdFast failed:', err.message);
+  // Pull both GraphQL and REST in parallel. Either source alone is
+  // enough to compute a result — Predict.fun's GraphQL `market(id:)`
+  // sometimes returns null for markets that REST still serves (e.g.
+  // ended-but-not-resolved games where the schedule still pays).
+  // Cached lookups so this is O(1) after the first hit per TTL.
+  const [graphRes, restRes] = await Promise.allSettled([
+    getMarketByIdFast(marketId),
+    getMarketRestById(marketId),
+  ]);
+  const market = graphRes.status === 'fulfilled' ? graphRes.value : null;
+  const rest = restRes.status === 'fulfilled' ? restRes.value : null;
+  if (graphRes.status === 'rejected') {
+    console.warn(new Date().toISOString(), '[predict] getMarketByIdFast failed:', graphRes.reason?.message ?? graphRes.reason);
   }
-  if (!market) {
+  if (!market && !rest) {
     return {
       marketId: String(marketId),
       title: null,
@@ -556,35 +564,32 @@ export async function getMarketRewardSummary(marketId) {
       market: null,
     };
   }
-  // Merge REST single-market data when available — Predict.fun's REST
-  // exposes `rewards.current.hourlyRate` (the authoritative current
-  // rate) and `tradingStatus`, neither of which GraphQL surfaces.
-  // Cached per-market in getMarketRestById so the extra fetch is O(1)
-  // after the first hit per cache TTL.
-  try {
-    const rest = await getMarketRestById(marketId);
-    if (rest) {
-      const merged = { ...market };
-      if (rest.rewards != null) merged.rewards = rest.rewards;
-      if (rest.tradingStatus != null) merged.tradingStatus = rest.tradingStatus;
-      if (rest.isResolved != null) merged.isResolved = rest.isResolved;
-      if (rest.endsAt != null) merged.endsAt = rest.endsAt;
-      market = merged;
+
+  // Combine — start with whichever side we got, then overlay the other
+  // for missing fields. REST wins on the time-sensitive bits (rewards,
+  // tradingStatus, isResolved, endsAt) since GraphQL has no equivalents.
+  const combined = market ? { ...market } : { id: rest?.id ?? marketId };
+  if (rest) {
+    for (const k of ['title', 'question', 'conditionId', 'spreadThreshold', 'shareThreshold', 'status', 'categorySlug']) {
+      if (combined[k] == null && rest[k] != null) combined[k] = rest[k];
     }
-  } catch {
-    // Non-fatal — fall back to GraphQL-only data.
+    if (rest.rewards != null) combined.rewards = rest.rewards;
+    if (rest.tradingStatus != null) combined.tradingStatus = rest.tradingStatus;
+    if (rest.isResolved != null) combined.isResolved = rest.isResolved;
+    if (rest.endsAt != null) combined.endsAt = rest.endsAt;
   }
-  const totalHourlyRate = extractHourlyRate(market);
-  const preferredKey = market[config.orderbookKeyField];
+
+  const totalHourlyRate = extractHourlyRate(combined);
+  const preferredKey = combined[config.orderbookKeyField];
   const orderbookKey = preferredKey != null && preferredKey !== ''
     ? String(preferredKey)
-    : String(market.conditionId ?? market.id ?? marketId);
+    : String(combined.conditionId ?? combined.id ?? marketId);
   return {
-    marketId: String(market.id),
-    title: market.title ?? market.question ?? null,
+    marketId: String(combined.id ?? marketId),
+    title: combined.title ?? combined.question ?? null,
     totalHourlyRate,
     orderbookKey,
-    market,
+    market: combined,
   };
 }
 
