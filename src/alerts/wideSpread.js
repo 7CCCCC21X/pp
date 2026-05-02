@@ -28,7 +28,8 @@ export async function detectWideSpread(ctx) {
   slot.wideSpreadRecovered = false;
   if (!slot.wideSpreadSince) slot.wideSpreadSince = now;
   const elapsed = now - slot.wideSpreadSince;
-  const need = config.wideSpreadMinMinutes * 60 * 1000;
+  const minMinutes = effectiveOverride(state, marketId, 'wideSpreadMinMinutes', config.wideSpreadMinMinutes);
+  const need = minMinutes * 60 * 1000;
   const cooldownOk = now - (slot.wideSpreadAlertedAt ?? 0) >= 60 * 60 * 1000;
   if (elapsed < need || !cooldownOk) return;
 

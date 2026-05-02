@@ -1,9 +1,10 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
 import { fmtElapsed, marketLink, formatOrderbookBlock } from '../format.js';
+import { effectiveOverride } from '../state.js';
 
 export async function detectEmptyBook(ctx) {
-  const { slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
+  const { state, slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
   if (!config.alertEmptyBook || isPaused || filtered) return;
   const empty = orderbook.bestBid == null || orderbook.bestAsk == null;
   if (!empty) {
@@ -25,7 +26,8 @@ export async function detectEmptyBook(ctx) {
   slot.emptyBookRecovered = false;
   if (!slot.emptyBookSince) slot.emptyBookSince = now;
   const elapsed = now - slot.emptyBookSince;
-  const need = config.emptyBookMinMinutes * 60 * 1000;
+  const minMinutes = effectiveOverride(state, marketId, 'emptyBookMinMinutes', config.emptyBookMinMinutes);
+  const need = minMinutes * 60 * 1000;
   const cooldownOk = now - (slot.emptyBookAlertedAt ?? 0) >= 60 * 60 * 1000;
   if (elapsed < need || !cooldownOk) return;
 

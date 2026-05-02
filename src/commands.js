@@ -930,9 +930,18 @@ async function handle(text, state, ctx) {
     case '/setmarket': {
       const [id, key, value] = arg.split(/\s+/);
       if (!id || !key || value == null || value === '') {
-        return '用法：/setmarket &lt;id&gt; &lt;key&gt; &lt;value&gt;\n可用 key: staleHours, maxSpread, midJumpThreshold, rewardZoneMaxDistance, rewardZoneMinSize';
+        return '用法：/setmarket &lt;id&gt; &lt;key&gt; &lt;value&gt;\n可用 key: staleHours, maxSpread, midJumpThreshold, rewardZoneMaxDistance, rewardZoneMinSize, wideSpreadMinMinutes, rewardZoneMinMinutes, emptyBookMinMinutes';
       }
-      const allowed = new Set(['staleHours', 'maxSpread', 'midJumpThreshold', 'rewardZoneMaxDistance', 'rewardZoneMinSize']);
+      const allowed = new Set([
+        'staleHours',
+        'maxSpread',
+        'midJumpThreshold',
+        'rewardZoneMaxDistance',
+        'rewardZoneMinSize',
+        'wideSpreadMinMinutes',
+        'rewardZoneMinMinutes',
+        'emptyBookMinMinutes',
+      ]);
       if (!allowed.has(key)) return `未知 key "${htmlEscape(key)}"，可用: ${[...allowed].join(', ')}`;
       const v = Number(value);
       if (!Number.isFinite(v) || v <= 0) return `值必须是正数，收到 "${htmlEscape(value)}"`;

@@ -1,9 +1,10 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
 import { fmtElapsed, marketLink, formatOrderbookBlock } from '../format.js';
+import { effectiveOverride } from '../state.js';
 
 export async function detectRewardZone(ctx) {
-  const { slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
+  const { state, slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
   if (!config.alertRewardZone || isPaused || filtered || totalHourlyRate <= 0) return;
   const unstaffed = !zone.bidActivated || !zone.askActivated;
   if (!unstaffed) {
@@ -25,7 +26,8 @@ export async function detectRewardZone(ctx) {
   slot.rewardZoneRecovered = false;
   if (!slot.rewardZoneSince) slot.rewardZoneSince = now;
   const elapsed = now - slot.rewardZoneSince;
-  const need = config.rewardZoneMinMinutes * 60 * 1000;
+  const minMinutes = effectiveOverride(state, marketId, 'rewardZoneMinMinutes', config.rewardZoneMinMinutes);
+  const need = minMinutes * 60 * 1000;
   const cooldownOk = now - (slot.rewardZoneAlertedAt ?? 0) >= 60 * 60 * 1000;
   if (elapsed < need || !cooldownOk) return;
 
