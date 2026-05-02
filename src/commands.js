@@ -11,7 +11,7 @@ import {
 import { activeMarketIds } from './state.js';
 import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
-import { getMarketRewardSummary, getOrderbook, resolveSlugToId } from './predict.js';
+import { getMarketRewardSummary, getOrderbook, resolveSlugToId, getCacheStats, refreshAllCaches } from './predict.js';
 import { slugifyMarketTitle } from './format.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
@@ -40,6 +40,7 @@ const COMMAND_MENU = [
   { command: 'resume', description: '恢复监控' },
   { command: 'snooze', description: '临时静音 (用法: /snooze <id> 1h)' },
   { command: 'discover', description: '立即触发自动发现' },
+  { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
   { command: 'help', description: '显示帮助（含进阶命令）' },
 ];
@@ -65,6 +66,7 @@ function menuKeyboard() {
         { text: '🔍 自定义筛选', callback_data: '/find' },
       ],
       [
+        { text: '⚡ 刷新 PP', callback_data: '/refresh' },
         { text: '🔄 立即发现', callback_data: '/discover' },
         { text: '📈 24h 摘要', callback_data: '/digest' },
       ],
@@ -276,6 +278,7 @@ const HELP = [
   '',
   '<b>批量 / 维护</b>',
   '/discover — 立即触发自动发现',
+  '/refresh — 立即刷新 PP/h 缓存（显示耗时）',
   '/digest — 立即发送 24h 摘要',
   '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
   '',
@@ -451,6 +454,73 @@ function fmtRemaining(endMs) {
   return `${h.toFixed(1)}h`;
 }
 
+function fmtAgo(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '?';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec} 秒前`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} 分前`;
+  const h = Math.floor(min / 60);
+  const remM = min % 60;
+  return remM > 0 ? `${h} 小时 ${remM} 分前` : `${h} 小时前`;
+}
+
+function fmtIn(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '即将';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec} 秒后`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} 分后`;
+  const h = Math.floor(min / 60);
+  const remM = min % 60;
+  return remM > 0 ? `${h} 小时 ${remM} 分后` : `${h} 小时后`;
+}
+
+// "Last refreshed" panel for /status and list views.
+// Surfaces the three cadences a user should know about:
+//   - PP/h cache (GraphQL markets list, MARKETS_CACHE_TTL_MS)
+//   - autodiscover (DISCOVERY_INTERVAL_MS)
+//   - last orderbook tick (POLL_INTERVAL_MS, max lastSeenAt across slots)
+function freshnessLines(state, { compact = false } = {}) {
+  const now = Date.now();
+  const lines = [];
+  let stats;
+  try { stats = getCacheStats(); } catch { stats = null; }
+  if (stats?.marketsAt) {
+    const ago = now - stats.marketsAt;
+    const next = stats.marketsTtlMs - ago;
+    if (compact) {
+      lines.push(`PP/h 缓存 ${fmtAgo(ago)} (下次 ${fmtIn(next)})`);
+    } else {
+      lines.push(`💰 <b>PP/h 缓存</b>: ${fmtAgo(ago)} · 下次 ${fmtIn(next)} · ${stats.marketsCount} 个市场`);
+    }
+  }
+  const lastDisc = state.lastDiscoveryAt ?? 0;
+  if (lastDisc) {
+    const ago = now - lastDisc;
+    const next = (config.discoveryIntervalMs ?? 0) - ago;
+    if (compact) {
+      lines.push(`自动发现 ${fmtAgo(ago)}`);
+    } else {
+      lines.push(`🔄 <b>自动发现</b>: ${fmtAgo(ago)} · 下次 ${fmtIn(next)}`);
+    }
+  }
+  let maxSeen = 0;
+  for (const slot of Object.values(state.markets ?? {})) {
+    if (slot?.lastSeenAt > maxSeen) maxSeen = slot.lastSeenAt;
+  }
+  if (maxSeen) {
+    const ago = now - maxSeen;
+    if (compact) {
+      lines.push(`最近 tick ${fmtAgo(ago)}`);
+    } else {
+      const interval = Math.round(config.pollIntervalMs / 60_000);
+      lines.push(`📡 <b>最近 tick</b>: ${fmtAgo(ago)} · 每 ${interval} 分一次`);
+    }
+  }
+  return lines;
+}
+
 function compactMarketRow(id, slot, extra = '') {
   // Always render as a link — even with no title/question the marketLink
   // helper falls back to "Market <id>" with a /market/<id> URL, so the
@@ -595,6 +665,12 @@ function renderListPage(cmd, page, state) {
     const extra = extraFn ? extraFn(row.slot, row) : '';
     lines.push(compactMarketRow(row.id, row.slot, extra));
   }
+  // Compact freshness footer so the user knows how stale the data is.
+  const fresh = freshnessLines(state, { compact: true });
+  if (fresh.length) {
+    lines.push('');
+    lines.push(`<i>📅 ${fresh.join(' · ')}</i>`);
+  }
   return {
     text: lines.join('\n'),
     replyMarkup: pageKeyboard(cmd, safePage, totalPages),
@@ -681,7 +757,13 @@ async function buildStatusDashboard(state) {
   }
 
   lines.push('');
-  lines.push('更多: /top /gaps /wide /empty /opportunities');
+  const fresh = freshnessLines(state, { compact: false });
+  if (fresh.length) {
+    lines.push('<b>📅 数据新鲜度</b>');
+    for (const f of fresh) lines.push(f);
+    lines.push('');
+  }
+  lines.push('更多: /top /gaps /thin /wide /empty');
 
   return lines.join('\n');
 }
@@ -775,6 +857,23 @@ async function handle(text, state, ctx) {
     case '/discover': {
       ctx.requestDiscovery();
       return '已触发自动发现，几分钟内完成。';
+    }
+
+    case '/refresh': {
+      // Force-invalidate the PP/h cache + slug cache + per-market REST
+      // cache, then refetch. Reports elapsed time so the user knows
+      // how long a full GraphQL/REST scan actually takes on their host.
+      const result = await refreshAllCaches();
+      const sec = (result.elapsedMs / 1000).toFixed(1);
+      const lines = [
+        `🔄 <b>缓存已刷新</b> (耗时 ${sec}s)`,
+        `💰 PP/h 数据: ${result.marketsCount} 个市场`,
+        `🔗 URL slug 缓存: ${result.slugCount} 个`,
+      ];
+      if (result.error) lines.push(`⚠ 部分失败: ${htmlEscape(result.error)}`);
+      lines.push('');
+      lines.push('下次 tick (5 分内) 将用最新数据。');
+      return lines.join('\n');
     }
 
     case '/find':

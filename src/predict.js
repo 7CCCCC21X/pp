@@ -274,6 +274,50 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100, onProgres
 // for every market.
 let _cache = { at: 0, markets: null, byId: null, inFlight: null };
 
+// Surface freshness for /status / list footers — when did each cache last
+// successfully refresh? 0 = never.
+export function getCacheStats() {
+  return {
+    marketsAt: _cache.at,
+    marketsTtlMs: config.marketsCacheTtlMs,
+    marketsCount: _cache.markets?.length ?? 0,
+    slugAt: _slugCache.at,
+    slugCount: _slugCache.byId?.size ?? 0,
+  };
+}
+
+// Force-refresh the PP/h markets cache + slug cache. Returns timing
+// metadata so the /refresh command can report elapsed time. If a refresh
+// is already in flight, awaits it instead of starting a duplicate.
+export async function refreshAllCaches() {
+  const t0 = Date.now();
+  _cache.at = 0;        // invalidate so getAllMarketsCached re-fetches
+  _slugCache.at = 0;
+  let markets = [];
+  let slugCount = 0;
+  let error = null;
+  try {
+    markets = await getAllMarketsCached();
+  } catch (err) {
+    error = err.message;
+  }
+  try {
+    const map = await getSlugMapCached();
+    slugCount = map.size;
+  } catch (err) {
+    if (!error) error = err.message;
+  }
+  // Also clear the per-market REST cache so fresh slug lookups don't
+  // serve stale data on next tick.
+  _restMarketCache.clear();
+  return {
+    elapsedMs: Date.now() - t0,
+    marketsCount: markets.length,
+    slugCount,
+    error,
+  };
+}
+
 export async function getAllMarketsCached() {
   const ttl = config.marketsCacheTtlMs;
   const now = Date.now();
