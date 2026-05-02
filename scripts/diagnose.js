@@ -141,6 +141,16 @@ async function lookupViaMarketsFilter(value, fields, shape) {
 
   if (!filterFieldNames.length) return null;
 
+  // Short-circuit: if there's no slug/id/search-like filter key, the schema
+  // can't help us; let the REST fallback do the work.
+  const hasUsableKey = filterFieldNames.some((n) =>
+    /^slug$|^id$|^ids$|marketId|search|title|name|query|keyword/i.test(n),
+  );
+  if (!hasUsableKey) {
+    console.log('  no slug/id-like filter key -> skipping GraphQL filter lookup');
+    return null;
+  }
+
   const limitKey = pageFieldNames.includes('first') ? 'first'
     : pageFieldNames.includes('limit') ? 'limit'
     : pageFieldNames[0];
@@ -243,16 +253,24 @@ async function lookupBySlugREST(slug) {
     }
   }
 
-  // 2. Paginated scan with slugify(title) matching. Predict.fun does not
-  //    expose a slug field on Market; the URL slug is derived from title.
+  // 2. Paginated scan. REST /v1/markets returns a top-level array with no
+  //    pageInfo, so we use the last item's id as the `after` cursor.
   console.log('  scanning paginated /markets and slugifying titles ...');
-  let cursor = null;
-  let scanned = 0;
-  for (let page = 0; page < 80; page++) {
-    const params = new URLSearchParams({ first: '50' });
-    if (cursor) params.set('after', cursor);
+  const PAGE_SIZE = 100;
+  const seen = new Set();
+  let lastId = null;
+  let stalled = 0;
+  for (let page = 0; page < 200; page++) {
+    const params = new URLSearchParams({ first: String(PAGE_SIZE) });
+    if (lastId != null) params.set('after', String(lastId));
     const url = `${config.restUrl}/markets?${params}`;
-    const res = await fetch(url, { headers: restHeaders() });
+    let res;
+    try {
+      res = await fetch(url, { headers: restHeaders() });
+    } catch (err) {
+      console.log(`  ERR  ${url}: ${err.message}`);
+      break;
+    }
     if (!res.ok) {
       console.log(`  ${res.status}  ${url}`);
       break;
@@ -260,23 +278,53 @@ async function lookupBySlugREST(slug) {
     const json = await res.json();
     const data = json?.data ?? json;
     const arr = extractMarketsArray(data);
-    scanned += arr.length;
     if (page === 0) {
       const sample = arr[0];
       if (sample) console.log(`     sample keys: ${Object.keys(sample).join(',')}`);
-      if (sample?.title) console.log(`     sample title->slug: "${sample.title}" -> "${slugify(sample.title)}"`);
+      console.log(`     first 3 titles:`);
+      for (const m of arr.slice(0, 3)) {
+        console.log(`       "${m.title}" -> "${slugify(m.title)}"`);
+      }
     }
+    if (!arr.length) {
+      console.log(`  page ${page}: empty -> done`);
+      break;
+    }
+    let progress = 0;
     for (const m of arr) {
+      if (m?.id == null) continue;
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      progress += 1;
       if (looksLikeMatch(m, slug)) {
-        console.log(`  found on page ${page} after ${scanned} markets (matched on ${m.slug ? 'slug' : slugify(m.title) === slug ? 'title' : 'question'})`);
+        console.log(`  found on page ${page} after ${seen.size} unique markets (matched on ${m.slug ? 'slug' : slugify(m.title) === slug ? 'title' : 'question'})`);
         return m;
       }
     }
-    const pageInfo = data?.pageInfo ?? json?.pageInfo;
-    cursor = pageInfo?.endCursor ?? data?.nextCursor ?? null;
-    if (!cursor || pageInfo?.hasNextPage === false) break;
+    if (page > 0 && page % 5 === 0) {
+      console.log(`  ... page ${page}: ${seen.size} unique scanned`);
+    }
+    if (progress === 0) {
+      stalled += 1;
+      if (stalled >= 2) {
+        console.log(`  page ${page}: no new markets -> done (cursor likely doesn't advance with 'after')`);
+        break;
+      }
+    } else {
+      stalled = 0;
+    }
+    if (arr.length < PAGE_SIZE) {
+      console.log(`  page ${page}: short page (${arr.length} < ${PAGE_SIZE}) -> done`);
+      break;
+    }
+    const newLastId = arr[arr.length - 1]?.id;
+    if (newLastId == null || newLastId === lastId) {
+      console.log(`  page ${page}: cursor didn't advance -> done`);
+      break;
+    }
+    lastId = newLastId;
   }
-  console.log(`  scanned ${scanned} markets, no match`);
+  console.log(`  scanned ${seen.size} unique markets, no match`);
   return null;
 }
 
