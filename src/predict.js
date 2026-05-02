@@ -6,30 +6,47 @@ function restHeaders() {
   return h;
 }
 
-// Recursively pull every numeric `hourlyRate` (or alias) out of an
-// arbitrary REST `rewards` payload and sum them. Handles arrays, nested
-// objects, and absent fields.
-export function extractHourlyRate(rewards) {
-  if (rewards == null) return 0;
-  if (typeof rewards === 'number') return Number.isFinite(rewards) ? rewards : 0;
-  if (Array.isArray(rewards)) {
+// Sum hourlyRate across both possible shapes:
+//   GraphQL: market.rewardTimings = [{ hourlyRate }, ...]
+//   REST:    market.rewards = arbitrary nested object (recursive find)
+function sumHourlyRateRecursive(value) {
+  if (value == null) return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (Array.isArray(value)) {
     let total = 0;
-    for (const item of rewards) total += extractHourlyRate(item);
+    for (const item of value) total += sumHourlyRateRecursive(item);
     return total;
   }
-  if (typeof rewards === 'object') {
+  if (typeof value === 'object') {
     let total = 0;
-    for (const [k, v] of Object.entries(rewards)) {
+    for (const [k, v] of Object.entries(value)) {
       if (k === 'hourlyRate' || k === 'hourly_rate' || k === 'hourly' || k === 'rate') {
         const n = Number(v);
         if (Number.isFinite(n)) total += n;
       } else if (typeof v === 'object' && v !== null) {
-        total += extractHourlyRate(v);
+        total += sumHourlyRateRecursive(v);
       }
     }
     return total;
   }
   return 0;
+}
+
+export function extractHourlyRate(marketOrRewards) {
+  if (marketOrRewards == null) return 0;
+  // If passed a market object, prefer the GraphQL `rewardTimings` array.
+  if (Array.isArray(marketOrRewards?.rewardTimings)) {
+    return marketOrRewards.rewardTimings
+      .map((r) => Number(r?.hourlyRate))
+      .filter(Number.isFinite)
+      .reduce((a, b) => a + b, 0);
+  }
+  // If passed a market object with a `rewards` field, recurse into it.
+  if (marketOrRewards && typeof marketOrRewards === 'object' && 'rewards' in marketOrRewards) {
+    return sumHourlyRateRecursive(marketOrRewards.rewards);
+  }
+  // If passed a raw value, recurse directly.
+  return sumHourlyRateRecursive(marketOrRewards);
 }
 
 function unwrapList(json) {
@@ -42,33 +59,60 @@ function unwrapList(json) {
   return [];
 }
 
-// Paginate the REST /v1/markets endpoint using the last item's id as the
-// `after` cursor (matches the docs `?first=&after=`).
-export async function listAllMarkets({ pageSize = 100, maxPages = 50 } = {}) {
-  const seen = new Map();
-  let lastId = null;
-  for (let page = 0; page < maxPages; page++) {
-    const params = new URLSearchParams({ first: String(pageSize) });
-    if (lastId != null) params.set('after', String(lastId));
-    const url = `${config.restUrl}/markets?${params.toString()}`;
-    const res = await fetch(url, { headers: restHeaders() });
-    if (!res.ok) {
-      throw new Error(`listMarkets ${res.status}: ${(await res.text()).slice(0, 200)}`);
+async function postGraphQL(query, variables, operationName) {
+  const res = await fetch(config.graphqlUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, variables, operationName }),
+  });
+  if (!res.ok) throw new Error(`GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const json = await res.json();
+  if (json.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors).slice(0, 200)}`);
+  return json.data;
+}
+
+const MARKETS_PAGE_QUERY = `query AllMarkets($first: Int!, $after: String) {
+  markets(pagination: { first: $first, after: $after }) {
+    edges {
+      node {
+        id
+        conditionId
+        title
+        question
+        rewardTimings { hourlyRate }
+      }
     }
-    const arr = unwrapList(await res.json());
-    if (!arr.length) break;
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+
+// Paginate ALL markets via GraphQL markets(...) using cursor-based
+// MarketConnection pagination. Returns an array of market objects with
+// id / conditionId / title / question / rewardTimings.
+export async function listAllMarkets({ pageSize = 100, maxPages = 100 } = {}) {
+  const seen = new Map();
+  let after = null;
+  for (let page = 0; page < maxPages; page++) {
+    let data;
+    try {
+      data = await postGraphQL(MARKETS_PAGE_QUERY, { first: pageSize, after }, 'AllMarkets');
+    } catch (err) {
+      throw new Error(`listAllMarkets page ${page}: ${err.message}`);
+    }
+    const conn = data?.markets;
+    const edges = conn?.edges ?? [];
+    if (!edges.length) break;
     let progress = 0;
-    for (const m of arr) {
-      const id = m?.id;
-      if (id == null || seen.has(id)) continue;
-      seen.set(id, m);
+    for (const e of edges) {
+      const node = e?.node;
+      if (!node?.id || seen.has(node.id)) continue;
+      seen.set(node.id, node);
       progress += 1;
     }
     if (!progress) break;
-    if (arr.length < pageSize) break;
-    const newLast = arr[arr.length - 1]?.id;
-    if (newLast == null || newLast === lastId) break;
-    lastId = newLast;
+    const pageInfo = conn?.pageInfo;
+    if (!pageInfo?.hasNextPage || !pageInfo?.endCursor) break;
+    after = pageInfo.endCursor;
   }
   return [...seen.values()];
 }
@@ -123,7 +167,7 @@ export async function getMarketRewardSummary(marketId) {
       market: null,
     };
   }
-  const totalHourlyRate = extractHourlyRate(market.rewards);
+  const totalHourlyRate = extractHourlyRate(market);
   const preferredKey = market[config.orderbookKeyField];
   const orderbookKey = preferredKey != null && preferredKey !== ''
     ? String(preferredKey)

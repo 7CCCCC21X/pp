@@ -10,7 +10,7 @@ export async function discoverRewardedMarkets() {
   const rewarded = [];
   for (const m of all) {
     if (!isMarketTradeable(m)) continue;
-    const rate = extractHourlyRate(m.rewards);
+    const rate = extractHourlyRate(m);
     if (rate > 0) {
       rewarded.push({
         id: String(m.id),

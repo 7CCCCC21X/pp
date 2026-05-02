@@ -12,7 +12,7 @@ const minRate = Number(process.env.MIN_HOURLY_RATE ?? 0);
   const rows = [];
   for (const m of all) {
     if (!isMarketTradeable(m)) continue;
-    const rate = extractHourlyRate(m.rewards);
+    const rate = extractHourlyRate(m);
     if (rate <= minRate) continue;
     rows.push({
       id: String(m.id),
