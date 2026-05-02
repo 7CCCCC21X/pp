@@ -27,6 +27,22 @@ function restHeaders() {
   return headers;
 }
 
+async function introspectQueryRoot() {
+  const q = `query QIntrospect {
+    __schema {
+      queryType {
+        fields { name args { name type { kind name ofType { kind name } } } }
+      }
+    }
+  }`;
+  const json = await postGraphQL(q);
+  const fields = json?.data?.__schema?.queryType?.fields ?? [];
+  return fields.map((f) => ({
+    name: f.name,
+    args: (f.args ?? []).map((a) => `${a.name}:${a.type?.name ?? a.type?.ofType?.name ?? '?'}`),
+  }));
+}
+
 async function introspectMarket() {
   const q = `query Introspect {
     __type(name: "Market") {
@@ -80,7 +96,21 @@ async function probe(template, key) {
 }
 
 (async () => {
-  console.log(`> introspecting Market type at ${config.graphqlUrl}`);
+  console.log(`> introspecting root Query at ${config.graphqlUrl}`);
+  try {
+    const root = await introspectQueryRoot();
+    const candidates = root.filter((f) => /market/i.test(f.name));
+    if (candidates.length) {
+      console.log('  market-related root queries:');
+      for (const c of candidates) console.log(`    ${c.name}(${c.args.join(', ')})`);
+    } else {
+      console.log('  no market-related root queries found');
+    }
+  } catch (err) {
+    console.log('  introspection failed:', err.message);
+  }
+
+  console.log(`\n> introspecting Market type`);
   const fields = await introspectMarket();
   console.log(`  scalar (String|ID) fields: ${fields.join(', ')}`);
 
