@@ -5,7 +5,7 @@
   "description": "Telegram bot that watches Predict.fun PP-rewarded markets and alerts when the top of book hasn't moved for N hours.",
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "scripts": {
     "start": "node src/index.js",
