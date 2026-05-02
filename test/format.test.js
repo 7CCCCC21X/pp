@@ -33,14 +33,14 @@ test('fmtElapsed clamps negative', () => {
   assert.equal(fmtElapsed(-1000), '0 分');
 });
 
-test('marketLink uses slug from title', () => {
+test('marketLink uses slug from title (zh-cn prefix)', () => {
   const link = marketLink('123', 'BNB up or down (May 2 2026 2am ET)');
-  assert.match(link, /href="https:\/\/predict\.fun\/market\/bnb-up-or-down-may-2-2026-2am-et"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/bnb-up-or-down-may-2-2026-2am-et"/);
 });
 
 test('marketLink falls back to id when no title', () => {
   const link = marketLink('123', null);
-  assert.match(link, /href="https:\/\/predict\.fun\/market\/123"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/123"/);
   assert.match(link, /Market 123/);
 });
 

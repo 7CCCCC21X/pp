@@ -23,10 +23,10 @@ export async function detectWatch(ctx) {
   if (bidChanged) moves.push(htmlEscape(fmtMove('买1', prevBid, orderbook.bestBid)));
   if (askChanged) moves.push(htmlEscape(fmtMove('卖1', prevAsk, orderbook.bestAsk)));
   const msg = [
-    `<b>盯盘变动</b>`,
-    `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
+    `👁 <b>盯盘变动</b>`,
+    `${marketLink(marketId, slot.title)}`,
+    `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
     ...moves,
-    `PP ${totalHourlyRate.toFixed(2)}/h`,
     '',
     formatOrderbookBlock(orderbook, zone),
   ].join('\n');

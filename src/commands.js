@@ -8,7 +8,7 @@ import {
   answerCallbackQuery,
 } from './telegram.js';
 import { activeMarketIds } from './state.js';
-import { fmtElapsed, rewardZoneStatus, midOf, spreadOf } from './format.js';
+import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
 import { getMarketRewardSummary, getOrderbook, resolveSlugToId } from './predict.js';
 import { slugifyMarketTitle } from './format.js';
@@ -74,11 +74,20 @@ function menuKeyboard() {
 // Inline keyboard attached to alert messages so the user can act
 // straight from the alert push without typing.
 export function alertKeyboard(marketId) {
+  const id = String(marketId);
   return {
     inline_keyboard: [
       [
-        { text: '静音此市场', callback_data: `/pause ${marketId}` },
-        { text: '查看状态', callback_data: '/status' },
+        { text: '🔎 快照', callback_data: `/probe ${id}` },
+        { text: '👁 追踪', callback_data: `/watch ${id}` },
+      ],
+      [
+        { text: '😴 静音1h', callback_data: `/snooze ${id} 1h` },
+        { text: '⏸ 永久静音', callback_data: `/pause ${id}` },
+      ],
+      [
+        { text: '📊 状态', callback_data: '/status' },
+        { text: '🎯 空缺榜', callback_data: '/gaps' },
       ],
     ],
   };
@@ -269,6 +278,88 @@ function fmtRemaining(endMs) {
   return `${h.toFixed(1)}h`;
 }
 
+function compactMarketRow(id, slot, extra = '') {
+  const title = htmlEscape(shortTitle(slot?.title ?? `Market ${id}`, 44));
+  const rate = Number.isFinite(slot?.lastHourlyRate)
+    ? `${slot.lastHourlyRate.toFixed(0)}/h`
+    : '?/h';
+  const suffix = extra ? ` · ${htmlEscape(extra)}` : '';
+  return `<code>#${htmlEscape(id)}</code> ${title} — <b>${rate}</b>${suffix}`;
+}
+
+async function buildStatusDashboard(state) {
+  const ids = activeMarketIds(state);
+  if (!ids.length) {
+    return '当前没有监控的市场。用 /add &lt;id&gt; 加一个，或开启 AUTODISCOVER=true。';
+  }
+  const rows = ids.map((id) => ({ id, slot: state.markets[id] }));
+  const errors = rows.filter(({ slot }) => slot?.lastError);
+  const skipped = rows.filter(({ slot }) => slot?.lastSkipReason);
+  const waiting = rows.filter(({ slot }) => !slot);
+  const paused = rows.filter(({ id }) => state.pausedIds.includes(id));
+  const watched = rows.filter(({ id }) => (state.watchedIds ?? []).includes(id));
+  const gaps = rows.filter(({ slot }) =>
+    slot?.zoneStatus
+    && !slot.lastError
+    && !slot.lastSkipReason
+    && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated)
+  );
+  const ppRows = rows
+    .filter(({ slot }) => slot && !slot.lastError && !slot.lastSkipReason && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
+    .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
+
+  let totalPP24h = null;
+  try {
+    const { readHistorySince, summarize24h } = await import('./history.js');
+    const since = Date.now() - 24 * 3600 * 1000;
+    const records = await readHistorySince(since);
+    const summary = summarize24h(records);
+    totalPP24h = summary.reduce((a, m) => a + (m.ppEarned ?? 0), 0);
+  } catch {}
+
+  const lines = [
+    '📡 <b>监控面板</b>',
+    `市场 <b>${ids.length}</b> · 空缺 <b>${gaps.length}</b> · 错误 <b>${errors.length}</b> · 跳过 <b>${skipped.length}</b> · 等待 <b>${waiting.length}</b>`,
+    `暂停 <b>${paused.length}</b> · 追踪 <b>${watched.length}</b>${totalPP24h != null && totalPP24h > 0 ? ` · 24h PP <b>${totalPP24h.toFixed(2)}</b>` : ''}`,
+    '',
+  ];
+
+  if (errors.length) {
+    lines.push('⚠️ <b>错误</b>');
+    for (const { id, slot } of errors.slice(0, 8)) {
+      lines.push(compactMarketRow(id, slot, slot.lastError));
+    }
+    if (errors.length > 8) lines.push(`……还有 ${errors.length - 8} 个错误市场`);
+    lines.push('');
+  }
+
+  if (gaps.length) {
+    lines.push('🎯 <b>奖励区空缺 (PP 待捡)</b>');
+    const sorted = gaps.sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
+    for (const { id, slot } of sorted.slice(0, 10)) {
+      const sides = [];
+      if (!slot.zoneStatus.bidActivated) sides.push('买✗');
+      if (!slot.zoneStatus.askActivated) sides.push('卖✗');
+      lines.push(compactMarketRow(id, slot, sides.join(',')));
+    }
+    if (gaps.length > 10) lines.push(`……还有 ${gaps.length - 10} 个空缺市场`);
+    lines.push('');
+  }
+
+  if (ppRows.length) {
+    lines.push('🔥 <b>PP/h Top</b>');
+    for (const { id, slot } of ppRows.slice(0, 10)) {
+      const since = slot.lastChangeAt ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}` : '';
+      lines.push(compactMarketRow(id, slot, since));
+    }
+  }
+
+  lines.push('');
+  lines.push('更多: /top /gaps /wide /empty /opportunities');
+
+  return lines.join('\n');
+}
+
 function statusLine(state, id) {
   const slot = state.markets[id];
   const paused = state.pausedIds.includes(id);
@@ -317,22 +408,8 @@ async function handle(text, state, ctx) {
     case '/help':
       return HELP;
 
-    case '/status': {
-      const ids = activeMarketIds(state);
-      if (!ids.length) return '当前没有监控的市场。用 /add &lt;id&gt; 加一个。';
-      // Compute 24h PP total from history (best-effort, async).
-      let header = `<b>监控中 ${ids.length} 个市场</b>`;
-      try {
-        const { readHistorySince, summarize24h } = await import('./history.js');
-        const since = Date.now() - 24 * 3600 * 1000;
-        const records = await readHistorySince(since);
-        const summary = summarize24h(records);
-        const totalPP = summary.reduce((a, m) => a + (m.ppEarned ?? 0), 0);
-        if (totalPP > 0) header += `\n过去 24h 累计 PP: <b>${totalPP.toFixed(2)}</b>`;
-      } catch {}
-      const lines = ids.map((id) => htmlEscape(statusLine(state, id)));
-      return [header, ...lines].join('\n');
-    }
+    case '/status':
+      return await buildStatusDashboard(state);
 
     case '/list': {
       const ids = activeMarketIds(state);

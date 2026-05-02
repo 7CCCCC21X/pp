@@ -16,9 +16,9 @@ export async function detectMidJump(ctx) {
     if (jump >= config.midJumpThreshold && cooldownOk) {
       const direction = curMid > slot.lastMid ? '↑' : '↓';
       const msg = [
-        `<b>中价跳变 ${direction} ${jump.toFixed(4)}</b>`,
-        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        `中价: ${slot.lastMid.toFixed(4)} → ${curMid.toFixed(4)} · PP ${totalHourlyRate.toFixed(2)}/h`,
+        `⚡ <b>中价跳变 ${direction} ${jump.toFixed(4)}</b>`,
+        `${marketLink(marketId, slot.title)}`,
+        `<code>#${htmlEscape(marketId)}</code> · ${slot.lastMid.toFixed(4)} → <b>${curMid.toFixed(4)}</b> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),
       ].join('\n');

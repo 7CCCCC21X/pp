@@ -9,9 +9,9 @@ export async function detectRewardZone(ctx) {
   if (!unstaffed) {
     if (config.alertRecovery && slot.rewardZoneAlertedAt > 0 && !slot.rewardZoneRecovered) {
       const msg = [
-        `<b>奖励区已重新激活</b>`,
-        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        `PP ${totalHourlyRate.toFixed(2)}/h`,
+        `✅ <b>奖励区已重新激活</b>`,
+        `${marketLink(marketId, slot.title)}`,
+        `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),
       ].join('\n');
@@ -30,9 +30,9 @@ export async function detectRewardZone(ctx) {
   if (elapsed < need || !cooldownOk) return;
 
   const msg = [
-    `<b>奖励区可激活 (持续 ${fmtElapsed(elapsed)})</b>`,
-    `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-    `PP ${totalHourlyRate.toFixed(2)}/h`,
+    `🎯 <b>奖励区可激活</b>`,
+    `${marketLink(marketId, slot.title)}`,
+    `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
     '',
     formatOrderbookBlock(orderbook, zone),
   ].join('\n');

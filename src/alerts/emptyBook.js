@@ -9,9 +9,9 @@ export async function detectEmptyBook(ctx) {
   if (!empty) {
     if (config.alertRecovery && slot.emptyBookAlertedAt > 0 && !slot.emptyBookRecovered) {
       const msg = [
-        `<b>订单簿恢复双边</b>`,
-        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        `PP ${totalHourlyRate.toFixed(2)}/h`,
+        `✅ <b>订单簿恢复双边</b>`,
+        `${marketLink(marketId, slot.title)}`,
+        `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),
       ].join('\n');
@@ -30,9 +30,9 @@ export async function detectEmptyBook(ctx) {
   if (elapsed < need || !cooldownOk) return;
 
   const msg = [
-    `<b>订单簿单边/空缺 (持续 ${fmtElapsed(elapsed)})</b>`,
-    `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-    `PP ${totalHourlyRate.toFixed(2)}/h`,
+    `🌊 <b>订单簿单边 / 空缺</b>`,
+    `${marketLink(marketId, slot.title)}`,
+    `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
     '',
     formatOrderbookBlock(orderbook, zone),
   ].join('\n');

@@ -10,9 +10,9 @@ export async function detectWideSpread(ctx) {
   if (!wide) {
     if (config.alertRecovery && slot.wideSpreadAlertedAt > 0 && !slot.wideSpreadRecovered) {
       const msg = [
-        `<b>价差恢复正常 ${curSpread.toFixed(4)}</b>`,
-        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-        `阈值: ${config.maxSpread.toFixed(4)} · PP ${totalHourlyRate.toFixed(2)}/h`,
+        `✅ <b>价差恢复正常 ${(curSpread * 100).toFixed(2)}¢</b>`,
+        `${marketLink(marketId, slot.title)}`,
+        `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b>`,
         '',
         formatOrderbookBlock(orderbook, zone),
       ].join('\n');
@@ -31,9 +31,9 @@ export async function detectWideSpread(ctx) {
   if (elapsed < need || !cooldownOk) return;
 
   const msg = [
-    `<b>价差走阔 ${curSpread.toFixed(4)} (持续 ${fmtElapsed(elapsed)})</b>`,
-    `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
-    `阈值: ${config.maxSpread.toFixed(4)} · PP ${totalHourlyRate.toFixed(2)}/h`,
+    `🔴 <b>价差走阔 ${(curSpread * 100).toFixed(2)}¢</b>`,
+    `${marketLink(marketId, slot.title)}`,
+    `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
     '',
     formatOrderbookBlock(orderbook, zone),
   ].join('\n');
