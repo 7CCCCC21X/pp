@@ -222,6 +222,23 @@ function zoneTag(slot) {
   return ` · 区外(${sides.join(',')})`;
 }
 
+// Format a number as "1.2k" / "12k" / "3.4M" for compact PP totals.
+function fmtBig(n) {
+  if (!Number.isFinite(n)) return '?';
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e4) return `${(n / 1e3).toFixed(0)}k`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return n.toFixed(0);
+}
+
+function fmtRemaining(endMs) {
+  if (!endMs) return null;
+  const h = (endMs - Date.now()) / 3600000;
+  if (h <= 0) return '已结束';
+  if (h >= 48) return `${(h / 24).toFixed(1)}d`;
+  return `${h.toFixed(1)}h`;
+}
+
 function statusLine(state, id) {
   const slot = state.markets[id];
   const paused = state.pausedIds.includes(id);
@@ -241,7 +258,19 @@ function statusLine(state, id) {
   if (slot.lastChangeAt == null) return `#${id}${tag} ${title} — 等待首次抓取`;
   const since = Date.now() - slot.lastChangeAt;
   const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
-  return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · ${rate}/h${zoneTag(slot)}`;
+
+  // Remaining time + estimated total PP available for the rest of the market.
+  let timeBadge = '';
+  if (slot.endMs && Number.isFinite(slot.lastHourlyRate)) {
+    const rem = fmtRemaining(slot.endMs);
+    const remH = Math.max(0, (slot.endMs - Date.now()) / 3600000);
+    const totalPP = slot.lastHourlyRate * remH;
+    timeBadge = ` · 余${rem}≈${fmtBig(totalPP)}PP`;
+  } else if (slot.endMs) {
+    timeBadge = ` · 余${fmtRemaining(slot.endMs)}`;
+  }
+
+  return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · ${rate}/h${timeBadge}${zoneTag(slot)}`;
 }
 
 async function handle(text, state, ctx) {

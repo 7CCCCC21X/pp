@@ -196,6 +196,9 @@ export async function checkMarket(marketId, state, { isPaused }) {
   slot.lastError = null;
   slot.lastSkipReason = null;
   slot.consecutiveOrderbookErrors = 0;
+  // Stash the parsed end time for /status to compute remaining hours +
+  // total available PP without redoing the regex match each command.
+  slot.endMs = marketEndMs(market);
   if (rewardSummary?.title) slot.title = rewardSummary.title;
   slot.lastHourlyRate = totalHourlyRate;
   const lastSeenAt = slot.lastSeenAt ?? now;
