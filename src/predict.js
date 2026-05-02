@@ -16,19 +16,26 @@ async function postGraphQL(query, variables, operationName) {
   return json.data;
 }
 
-const MARKET_QUERY = `query GetMarket($marketId: ID!) {
+function buildMarketQuery() {
+  // The orderbook key field (e.g. id, conditionId, slug) is selected via env;
+  // include it in the response so getOrderbook knows what to use.
+  const extra = config.orderbookKeyField && config.orderbookKeyField !== 'id'
+    ? `\n    ${config.orderbookKeyField}`
+    : '';
+  return `query GetMarket($marketId: ID!) {
   market(id: $marketId) {
-    id
+    id${extra}
     title
     rewardTimings {
       hourlyRate
     }
   }
 }`;
+}
 
 export async function getMarketRewardSummary(marketId) {
   const data = await postGraphQL(
-    MARKET_QUERY,
+    buildMarketQuery(),
     { marketId: String(marketId) },
     'GetMarket',
   );
@@ -38,10 +45,12 @@ export async function getMarketRewardSummary(marketId) {
     .map((x) => Number(x.hourlyRate))
     .filter(Number.isFinite);
   const totalHourlyRate = hourlyRates.reduce((a, b) => a + b, 0);
+  const orderbookKey = market?.[config.orderbookKeyField] ?? market?.id ?? String(marketId);
   return {
     marketId: String(marketId),
     title: market?.title ?? null,
     totalHourlyRate,
+    orderbookKey: String(orderbookKey),
   };
 }
 
@@ -60,16 +69,18 @@ function restHeaders() {
   return headers;
 }
 
-export async function getOrderbook(marketId) {
-  const url = `${config.restUrl}/markets/${encodeURIComponent(marketId)}/orderbook`;
+export async function getOrderbook(orderbookKey, { contextMarketId } = {}) {
+  const path = config.orderbookPathTemplate.replace('{key}', encodeURIComponent(orderbookKey));
+  const url = `${config.restUrl}${path.startsWith('/') ? path : '/' + path}`;
   const res = await fetch(url, { headers: restHeaders() });
   if (!res.ok) {
-    throw new Error(`Orderbook ${res.status}: ${await res.text()}`);
+    throw new Error(`Orderbook ${res.status} for key=${orderbookKey} url=${url}: ${await res.text()}`);
   }
   const json = await res.json();
   const data = json?.data ?? json;
   return {
-    marketId: String(marketId),
+    marketId: String(contextMarketId ?? orderbookKey),
+    orderbookKey: String(orderbookKey),
     updatedAtMs: Number(data?.updateTimestampMs ?? Date.now()),
     bestBid: topOfBook(data?.bids),
     bestAsk: topOfBook(data?.asks),

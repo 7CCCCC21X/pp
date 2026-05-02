@@ -71,22 +71,20 @@ async function alert(kind, slot, marketId, message, extra = {}) {
 }
 
 export async function checkMarket(marketId, state, { isPaused }) {
-  const [rewardResult, orderbookResult] = await Promise.allSettled([
-    getMarketRewardSummary(marketId),
-    getOrderbook(marketId),
-  ]);
-
-  if (orderbookResult.status === 'rejected') {
-    warn(`[${marketId}] orderbook fetch failed:`, orderbookResult.reason?.message ?? orderbookResult.reason);
-    return;
-  }
-  const orderbook = orderbookResult.value;
-
   let rewardSummary = null;
-  if (rewardResult.status === 'fulfilled') {
-    rewardSummary = rewardResult.value;
-  } else {
-    warn(`[${marketId}] reward fetch failed:`, rewardResult.reason?.message ?? rewardResult.reason);
+  try {
+    rewardSummary = await getMarketRewardSummary(marketId);
+  } catch (err) {
+    warn(`[${marketId}] reward fetch failed:`, err.message);
+  }
+  const orderbookKey = rewardSummary?.orderbookKey ?? marketId;
+
+  let orderbook;
+  try {
+    orderbook = await getOrderbook(orderbookKey, { contextMarketId: marketId });
+  } catch (err) {
+    warn(`[${marketId}] orderbook fetch failed:`, err.message);
+    return;
   }
 
   const totalHourlyRate = rewardSummary?.totalHourlyRate ?? 0;

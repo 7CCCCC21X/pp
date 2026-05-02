@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "once": "node src/index.js --once",
-    "get-chat-id": "node scripts/get-chat-id.js"
+    "get-chat-id": "node scripts/get-chat-id.js",
+    "diagnose": "node scripts/diagnose.js"
   }
 }

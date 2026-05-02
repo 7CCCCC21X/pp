@@ -91,6 +91,12 @@ export const config = {
   stateFile: process.env.STATE_FILE ?? './state.json',
   graphqlUrl: process.env.GRAPHQL_URL ?? 'https://graphql.predict.fun/graphql',
   restUrl: (process.env.REST_URL ?? 'https://api.predict.fun/v1').replace(/\/$/, ''),
+
+  // Orderbook URL shape. {key} is replaced with the value of the GraphQL
+  // Market field named ORDERBOOK_KEY_FIELD. Run `npm run diagnose <marketId>`
+  // to find the correct combination if you hit 404s.
+  orderbookPathTemplate: process.env.ORDERBOOK_PATH_TEMPLATE ?? '/markets/{key}/orderbook',
+  orderbookKeyField: process.env.ORDERBOOK_KEY_FIELD ?? 'id',
 };
 
 export function validateConfig() {
