@@ -1,6 +1,7 @@
 import { config, isAllowedChat } from './config.js';
 import {
   sendTelegramMessage,
+  sendLongTelegramMessage,
   htmlEscape,
   getUpdates,
   setMyCommands,
@@ -326,7 +327,7 @@ async function dispatchCommand(text, state, ctx, { chatId }) {
   }
   const norm = normalizeReply(reply);
   if (!norm) return;
-  await sendTelegramMessage(norm.text, { chatId, replyMarkup: norm.replyMarkup }).catch((err) => {
+  await sendLongTelegramMessage(norm.text, { chatId, replyMarkup: norm.replyMarkup }).catch((err) => {
     warn('send reply failed:', err.message);
   });
 }

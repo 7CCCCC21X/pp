@@ -11,6 +11,7 @@ function emptyState() {
     watchedIds: [],
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
+    lastHistoryPruneAt: 0,
     telegramOffset: 0,
     filters: {},
   };

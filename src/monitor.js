@@ -90,13 +90,6 @@ export async function checkMarket(marketId, state, { isPaused }) {
       market,
       cache,
     });
-    // Persist the working (template, key) so future ticks skip retries.
-    if (state.markets[marketId]) {
-      state.markets[marketId].orderbookCache = {
-        template: orderbook.template,
-        key: orderbook.orderbookKey,
-      };
-    }
   } catch (err) {
     warn(`[${marketId}] orderbook fetch failed:`, err.message);
     return;
@@ -120,6 +113,12 @@ export async function checkMarket(marketId, state, { isPaused }) {
     askSize: orderbook.bestAsk?.size ?? null,
   };
   const slot = ensureSlot(state, marketId, cur, now);
+  // Persist the working (template, key) so future ticks skip the
+  // self-heal probe loop — even on the very first tick for a market.
+  slot.orderbookCache = {
+    template: orderbook.template,
+    key: orderbook.orderbookKey,
+  };
   if (rewardSummary?.title) slot.title = rewardSummary.title;
   slot.lastHourlyRate = totalHourlyRate;
   const lastSeenAt = slot.lastSeenAt ?? now;

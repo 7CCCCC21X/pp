@@ -1,4 +1,5 @@
 import { config } from './config.js';
+import { fetchJson } from './http.js';
 
 function restHeaders() {
   const h = { Accept: 'application/json' };
@@ -59,27 +60,17 @@ function unwrapList(json) {
   return [];
 }
 
-async function postGraphQL(query, variables, operationName, { timeoutMs } = {}) {
-  const ctrl = new AbortController();
+async function postGraphQL(query, variables, operationName, { timeoutMs, retries } = {}) {
   const ms = Number.isFinite(timeoutMs) ? timeoutMs : (config.graphqlTimeoutMs ?? 30_000);
-  const timer = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const res = await fetch(config.graphqlUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, variables, operationName }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const json = await res.json();
-    if (json.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors).slice(0, 200)}`);
-    return json.data;
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error(`GraphQL request timed out after ${ms}ms`);
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
+  const json = await fetchJson(config.graphqlUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, variables, operationName }),
+    timeoutMs: ms,
+    retries: retries ?? 1,
+  });
+  if (json?.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors).slice(0, 200)}`);
+  return json?.data;
 }
 
 // Build the markets() page query lazily, after introspecting which fields are
@@ -369,13 +360,17 @@ const FALLBACK_TEMPLATES = ['/markets/{key}/orderbook', '/orderbook/{key}'];
 
 async function tryFetchOrderbook(template, key) {
   const url = buildOrderbookUrl(template, key);
-  const res = await fetch(url, { headers: restHeaders() });
-  if (res.status === 404) return { kind: '404', url };
-  if (!res.ok) {
-    const body = (await res.text()).slice(0, 200);
-    return { kind: 'err', url, status: res.status, body };
+  try {
+    const json = await fetchJson(url, {
+      headers: restHeaders(),
+      timeoutMs: config.orderbookTimeoutMs ?? 10_000,
+      retries: 1,
+    });
+    return { kind: 'ok', url, json };
+  } catch (err) {
+    if (err.status === 404) return { kind: '404', url };
+    return { kind: 'err', url, status: err.status, body: err.body ?? err.message };
   }
-  return { kind: 'ok', url, json: await res.json() };
 }
 
 export async function getOrderbook(orderbookKey, opts = {}) {

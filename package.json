@@ -13,6 +13,7 @@
     "get-chat-id": "node scripts/get-chat-id.js",
     "diagnose": "node scripts/diagnose.js",
     "rewards": "node scripts/rewards.js",
-    "probe": "node scripts/probe.js"
+    "probe": "node scripts/probe.js",
+    "prune-history": "node scripts/prune-history.js"
   }
 }

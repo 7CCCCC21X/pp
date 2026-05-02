@@ -1,10 +1,11 @@
+import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
 import { loadState, saveState, activeMarketIds } from './state.js';
 import { checkMarket } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
 import { sendDailyDigest, shouldSendDigest } from './digest.js';
-import { sendTelegramMessage } from './telegram.js';
+import { sendLongTelegramMessage } from './telegram.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[main]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[main]', ...args);
@@ -13,13 +14,14 @@ let pendingDiscovery = false;
 let pendingDigest = false;
 
 // Serialize state writes so the command loop and the tick loop don't clobber.
+// Each caller awaits its own save and sees its own failure (so command
+// handlers can tell the user "actually didn't save"). The shared chain
+// absorbs failures so the next caller still proceeds.
 let saveChain = Promise.resolve();
 function persist(state) {
-  const next = saveChain.then(() => saveState(state)).catch((err) => {
-    warn('persist failed:', err.message);
-  });
-  saveChain = next;
-  return next;
+  const next = saveChain.then(() => saveState(state));
+  saveChain = next.catch(() => {}); // chain absorbs to keep going
+  return next; // caller sees the original rejection
 }
 
 async function maybeDiscover(state) {
@@ -35,7 +37,7 @@ async function maybeDiscover(state) {
         .slice(0, 10)
         .map((m) => `#${m.id} (${m.hourlyRate.toFixed(2)}/h)`)
         .join(', ');
-      await sendTelegramMessage(
+      await sendLongTelegramMessage(
         `<b>自动发现</b>: ${rewarded.length} 个有奖励的市场\n${preview}${rewarded.length > 10 ? ' ...' : ''}`,
       ).catch(() => {});
     }
@@ -55,7 +57,48 @@ async function maybeDigest(state) {
   }
 }
 
+async function maybePruneHistory(state) {
+  if (!config.historyEnabled || config.historyKeepDays <= 0) return;
+  const ONE_DAY = 24 * 3600 * 1000;
+  if (Date.now() - (state.lastHistoryPruneAt ?? 0) < ONE_DAY) return;
+  try {
+    const text = await fs.readFile(config.historyFile, 'utf8').catch((err) => {
+      if (err.code === 'ENOENT') return '';
+      throw err;
+    });
+    if (!text) {
+      state.lastHistoryPruneAt = Date.now();
+      return;
+    }
+    const cutoff = Date.now() - config.historyKeepDays * ONE_DAY;
+    const out = [];
+    let total = 0;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      total += 1;
+      try {
+        const rec = JSON.parse(line);
+        if (Number.isFinite(rec?.ts) && rec.ts >= cutoff) out.push(line);
+      } catch {
+        // drop malformed
+      }
+    }
+    if (out.length === total) {
+      state.lastHistoryPruneAt = Date.now();
+      return;
+    }
+    const tmp = `${config.historyFile}.tmp`;
+    await fs.writeFile(tmp, out.length ? out.join('\n') + '\n' : '');
+    await fs.rename(tmp, config.historyFile);
+    state.lastHistoryPruneAt = Date.now();
+    log(`pruned ${total - out.length} of ${total} history records (keep ${config.historyKeepDays}d)`);
+  } catch (err) {
+    warn('history prune failed:', err.message);
+  }
+}
+
 async function tick(state) {
+  await maybePruneHistory(state);
   await maybeDiscover(state);
   const ids = activeMarketIds(state);
   for (const id of ids) {

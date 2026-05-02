@@ -1,5 +1,5 @@
 import { config } from './config.js';
-import { sendTelegramMessage, htmlEscape } from './telegram.js';
+import { sendLongTelegramMessage, htmlEscape } from './telegram.js';
 import { readHistorySince, summarize24h } from './history.js';
 import { fmtElapsed } from './format.js';
 
@@ -10,7 +10,7 @@ export async function sendDailyDigest() {
   const records = await readHistorySince(since);
   const summary = summarize24h(records);
   if (!summary.length) {
-    await sendTelegramMessage('<b>过去 24 小时摘要</b>\n无任何事件。');
+    await sendLongTelegramMessage('<b>过去 24 小时摘要</b>\n无任何事件。');
     return;
   }
   // Sort by PP earned descending — most productive markets first.
@@ -38,7 +38,7 @@ export async function sendDailyDigest() {
     ].filter(Boolean).join(' · ');
     lines.push(`#${m.marketId} ${title} — ${pp} PP · ${rate}/h${counts ? ' · ' + counts : ''}${stall ? ' · ' + stall : ''}`);
   }
-  await sendTelegramMessage(lines.join('\n'));
+  await sendLongTelegramMessage(lines.join('\n'));
   log(`sent digest (24h PP=${totalPP.toFixed(2)})`);
 }
 

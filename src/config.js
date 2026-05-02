@@ -135,6 +135,8 @@ export const config = {
   // History + daily digest
   historyEnabled: bool('HISTORY_ENABLED', true),
   historyFile: process.env.HISTORY_FILE ?? './history.jsonl',
+  // Auto-prune history older than this many days. 0 disables.
+  historyKeepDays: num('HISTORY_KEEP_DAYS', 14),
   digestEnabled: bool('DAILY_DIGEST_ENABLED', true),
   digestHourUtc: num('DAILY_DIGEST_HOUR_UTC', 12),
 
@@ -157,6 +159,9 @@ export const config = {
   // after this many ms; the loop returns whatever has already been
   // collected.
   graphqlTimeoutMs: num('GRAPHQL_TIMEOUT_MS', 30_000),
+  // Per-orderbook-fetch timeout (REST). Lower than GraphQL because the
+  // bot fetches one per market per tick.
+  orderbookTimeoutMs: num('ORDERBOOK_TIMEOUT_MS', 10_000),
 };
 
 export function validateConfig() {
