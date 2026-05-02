@@ -82,20 +82,71 @@ async function postGraphQL(query, variables, operationName, { timeoutMs } = {}) 
   }
 }
 
-const MARKETS_PAGE_QUERY = `query AllMarkets($first: Int!, $after: String) {
-  markets(pagination: { first: $first, after: $after }) {
-    edges {
-      node {
-        id
-        conditionId
-        title
-        question
-        rewardTimings { hourlyRate }
-      }
-    }
-    pageInfo { hasNextPage endCursor }
+// Build the markets() page query lazily, after introspecting which fields are
+// actually exposed on Market and MarketFilterInput. This way we can include
+// optional status/endsAt fields if present (for closed-market filtering), and
+// pass isResolved:false at the source if the schema supports it - without
+// hard-coding fields that may not exist on every deployment.
+const REQUIRED_FIELDS = ['id', 'conditionId', 'title', 'question'];
+const OPTIONAL_STATUS_FIELDS = [
+  'status',
+  'tradingStatus',
+  'endsAt',
+  'endTime',
+  'endsAtTimestamp',
+  'closeTime',
+  'isResolved',
+  'resolvedAt',
+  'resolution',
+];
+let _marketsQueryCache = null;
+
+async function getMarketsPageQuery() {
+  if (_marketsQueryCache) return _marketsQueryCache;
+  let marketFields = new Set();
+  let filterFields = new Set();
+  try {
+    const intro = await postGraphQL(
+      `query Introspect {
+        market: __type(name: "Market") { fields { name } }
+        filter: __type(name: "MarketFilterInput") { inputFields { name } }
+      }`,
+      {},
+      'Introspect',
+    );
+    marketFields = new Set((intro?.market?.fields ?? []).map((f) => f.name));
+    filterFields = new Set((intro?.filter?.inputFields ?? []).map((f) => f.name));
+  } catch {
+    // Fall back to the minimal known-good query.
   }
-}`;
+
+  const selection = [];
+  for (const f of REQUIRED_FIELDS) {
+    if (!marketFields.size || marketFields.has(f)) selection.push(f);
+  }
+  if (!marketFields.size || marketFields.has('rewardTimings')) {
+    selection.push('rewardTimings { hourlyRate }');
+  }
+  for (const f of OPTIONAL_STATUS_FIELDS) {
+    if (marketFields.has(f)) selection.push(f);
+  }
+
+  const filterClause = filterFields.has('isResolved')
+    ? 'filter: { isResolved: false }, '
+    : '';
+
+  _marketsQueryCache = `query AllMarkets($first: Int!, $after: String) {
+    markets(${filterClause}pagination: { first: $first, after: $after }) {
+      edges {
+        node {
+          ${selection.join('\n          ')}
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }`;
+  return _marketsQueryCache;
+}
 
 // Paginate ALL markets via GraphQL markets(...) using cursor-based
 // MarketConnection pagination. Returns an array of market objects with
@@ -112,7 +163,8 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100, onProgres
     if (onProgress) onProgress({ phase: 'fetching', page, after, total: seen.size });
     let data;
     try {
-      data = await postGraphQL(MARKETS_PAGE_QUERY, { first: pageSize, after }, 'AllMarkets');
+      const query = await getMarketsPageQuery();
+      data = await postGraphQL(query, { first: pageSize, after }, 'AllMarkets');
     } catch (err) {
       if (onProgress) onProgress({ phase: 'error', page, error: err.message, total: seen.size });
       break;
@@ -172,10 +224,26 @@ export async function getMarketById(id) {
   return _cache.byId?.get(String(id)) ?? null;
 }
 
+const CLOSED_STATUSES = new Set([
+  'CLOSED', 'RESOLVED', 'PAUSED', 'CANCELLED', 'CANCELED',
+  'ARCHIVED', 'EXPIRED', 'SETTLED', 'INACTIVE',
+]);
+
 export function isMarketTradeable(m) {
-  const status = String(m?.tradingStatus ?? m?.status ?? '').toUpperCase();
-  if (!status) return true;
-  return !['CLOSED', 'RESOLVED', 'PAUSED', 'CANCELLED', 'CANCELED', 'ARCHIVED'].includes(status);
+  if (!m) return false;
+  if (m.isResolved === true) return false;
+  if (m.resolvedAt != null) return false;
+  if (m.resolution != null && m.resolution !== '' && m.resolution !== 'UNRESOLVED') return false;
+  const status = String(m.tradingStatus ?? m.status ?? '').toUpperCase();
+  if (status && CLOSED_STATUSES.has(status)) return false;
+  // If we have an end timestamp and it's in the past, the market is over.
+  for (const f of ['endsAt', 'endTime', 'endsAtTimestamp', 'closeTime']) {
+    const v = m[f];
+    if (v == null || v === '') continue;
+    const ts = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
+    if (Number.isFinite(ts) && ts <= Date.now()) return false;
+  }
+  return true;
 }
 
 // Reward + orderbook key lookup that the rest of the bot uses. Reads from
