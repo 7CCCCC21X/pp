@@ -3,6 +3,7 @@ import { getMarketRewardSummary, getOrderbook } from './predict.js';
 import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtSide, fmtElapsed, marketLink, midOf, spreadOf } from './format.js';
+import { effectiveFilters, checkFilter } from './filters.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[monitor]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[monitor]', ...args);
@@ -93,6 +94,10 @@ export async function checkMarket(marketId, state, { isPaused }) {
     return;
   }
 
+  const filters = effectiveFilters(state);
+  const filterReason = checkFilter(orderbook, filters);
+  const filtered = filterReason !== null;
+
   const now = Date.now();
   const cur = {
     bidPrice: orderbook.bestBid?.price ?? null,
@@ -113,7 +118,7 @@ export async function checkMarket(marketId, state, { isPaused }) {
   const curSpread = spreadOf(orderbook);
   if (
     config.alertMidJump &&
-    !isPaused &&
+    !isPaused && !filtered &&
     Number.isFinite(curMid) &&
     Number.isFinite(slot.lastMid)
   ) {
@@ -137,7 +142,7 @@ export async function checkMarket(marketId, state, { isPaused }) {
   if (Number.isFinite(curMid)) slot.lastMid = curMid;
 
   // --- Wide-spread: alert if spread > MAX_SPREAD continuously for WIDE_SPREAD_MIN_MINUTES
-  if (config.alertWideSpread && !isPaused) {
+  if (config.alertWideSpread && !isPaused && !filtered) {
     if (Number.isFinite(curSpread) && curSpread > config.maxSpread) {
       if (!slot.wideSpreadSince) slot.wideSpreadSince = now;
       const elapsed = now - slot.wideSpreadSince;
@@ -162,7 +167,7 @@ export async function checkMarket(marketId, state, { isPaused }) {
   }
 
   // --- Empty book
-  if (config.alertEmptyBook && !isPaused) {
+  if (config.alertEmptyBook && !isPaused && !filtered) {
     const empty = orderbook.bestBid == null || orderbook.bestAsk == null;
     if (empty) {
       if (!slot.emptyBookSince) slot.emptyBookSince = now;
@@ -207,8 +212,9 @@ export async function checkMarket(marketId, state, { isPaused }) {
     return;
   }
 
-  if (!config.alertStall || isPaused) {
-    log(`[${marketId}] unchanged ${fmtElapsed(now - slot.lastChangeAt)} (stall alerts off${isPaused ? ', paused' : ''})`);
+  if (!config.alertStall || isPaused || filtered) {
+    const why = !config.alertStall ? 'stall alerts off' : isPaused ? 'paused' : `filtered: ${filterReason}`;
+    log(`[${marketId}] unchanged ${fmtElapsed(now - slot.lastChangeAt)} (${why})`);
     return;
   }
 

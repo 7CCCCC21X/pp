@@ -11,6 +11,7 @@ function emptyState() {
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     telegramOffset: 0,
+    filters: {},
   };
 }
 
@@ -28,6 +29,7 @@ export async function loadState() {
       pausedIds: json.pausedIds ?? [],
       removedIds: json.removedIds ?? [],
       autoIds: json.autoIds ?? [],
+      filters: json.filters ?? {},
     };
   } catch (err) {
     if (err.code === 'ENOENT') return emptyState();

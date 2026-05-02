@@ -29,10 +29,36 @@ function num(name, fallback) {
   return n;
 }
 
+function numOrNull(name) {
+  const v = process.env[name];
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new Error(`${name} must be numeric, got "${v}"`);
+  return n;
+}
+
 function bool(name, fallback) {
   const v = process.env[name];
   if (v == null || v === '') return fallback;
   return /^(1|true|yes|y|on)$/i.test(v);
+}
+
+function buildFilterDefaults() {
+  const out = {};
+  const depth = 3;
+  for (const side of ['Bid', 'Ask']) {
+    for (let lvl = 1; lvl <= depth; lvl++) {
+      for (const op of ['min', 'max']) {
+        for (const attr of ['Price', 'Size']) {
+          if (op === 'max' && attr === 'Size') continue;
+          const key = `${op}${side}${lvl}${attr}`;
+          const env = 'FILTER_' + key.replace(/([A-Z])/g, '_$1').toUpperCase();
+          out[key] = numOrNull(env);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 function csv(name) {
@@ -76,6 +102,12 @@ export const config = {
   emptyBookMinMinutes: num('EMPTY_BOOK_MIN_MINUTES', 30),
 
   skipNoReward: bool('SKIP_NO_REWARD', true),
+
+  // Filters: a market only emits alerts when its top-N book passes ALL set
+  // filters. null/empty = no filter on that dimension. Env names follow
+  // FILTER_<MIN|MAX>_<BID|ASK><1..3>_<PRICE|SIZE>, e.g. FILTER_MIN_BID1_PRICE.
+  // Live overrides via /setfilter live in state.filters.
+  filters: buildFilterDefaults(),
 
   // Auto-discovery
   autodiscover: bool('AUTODISCOVER', false),

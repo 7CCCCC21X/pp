@@ -2,6 +2,7 @@ import { config, isAllowedChat } from './config.js';
 import { sendTelegramMessage, htmlEscape, getUpdates } from './telegram.js';
 import { activeMarketIds } from './state.js';
 import { fmtElapsed } from './format.js';
+import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
@@ -16,6 +17,14 @@ const HELP = [
   '/resume &lt;id&gt; — 取消静音',
   '/discover — 立即触发一次自动发现',
   '/digest — 立即发送 24 小时摘要',
+  '',
+  '<b>过滤器</b>（只有满足条件的市场才会触发提醒，支持 1-3 档）',
+  '/filter — 查看当前过滤器',
+  '/setfilter &lt;name&gt; &lt;value&gt; — 设置（如 /setfilter minBid1Price 0.05）',
+  '/clearfilter &lt;name|all&gt; — 清除单项或全部覆盖',
+  '字段命名: min/max + Bid/Ask + 1/2/3 + Price/Size',
+  '示例: minBid1Price, maxBid1Price, minBid1Size, minAsk2Price ...',
+  '',
   '/help — 本帮助',
 ].join('\n');
 
@@ -98,6 +107,44 @@ async function handle(text, state, ctx) {
     case '/digest': {
       ctx.requestDigest();
       return '已触发 24 小时摘要。';
+    }
+
+    case '/filter': {
+      const eff = effectiveFilters(state);
+      return `<b>当前过滤器</b>\n${formatFilters(eff, state)}`;
+    }
+
+    case '/setfilter': {
+      const [name, ...rest] = arg.split(/\s+/);
+      const valueStr = rest.join(' ').trim();
+      if (!name || !valueStr) {
+        return `用法：/setfilter &lt;name&gt; &lt;value&gt;\n字段: ${FILTER_KEYS.join(', ')}`;
+      }
+      if (!FILTER_KEYS.includes(name)) {
+        return `未知字段 "${htmlEscape(name)}"。可用: ${FILTER_KEYS.join(', ')}`;
+      }
+      const v = Number(valueStr);
+      if (!Number.isFinite(v)) return `值必须是数字，收到 "${htmlEscape(valueStr)}"`;
+      state.filters = { ...(state.filters ?? {}), [name]: v };
+      await ctx.persist();
+      return `已设置 ${FILTER_LABELS[name]} ${v}`;
+    }
+
+    case '/clearfilter': {
+      if (!arg) return '用法：/clearfilter &lt;name|all&gt;';
+      if (arg === 'all') {
+        state.filters = {};
+        await ctx.persist();
+        return '已清除全部覆盖（恢复 env 默认）。';
+      }
+      if (!FILTER_KEYS.includes(arg)) {
+        return `未知字段 "${htmlEscape(arg)}"。可用: ${FILTER_KEYS.join(', ')}, all`;
+      }
+      const next = { ...(state.filters ?? {}) };
+      delete next[arg];
+      state.filters = next;
+      await ctx.persist();
+      return `已清除覆盖 ${arg}（恢复 env 默认）。`;
     }
 
     default:

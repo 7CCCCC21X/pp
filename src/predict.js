@@ -54,13 +54,20 @@ export async function getMarketRewardSummary(marketId) {
   };
 }
 
-function topOfBook(rows) {
-  const r = rows?.[0];
-  if (!r) return null;
-  const price = Number(r[0]);
-  const size = Number(r[1]);
-  if (!Number.isFinite(price) || !Number.isFinite(size)) return null;
-  return { price, size };
+const ORDERBOOK_DEPTH = 3;
+
+function topNOfBook(rows, n = ORDERBOOK_DEPTH) {
+  const out = [];
+  if (!Array.isArray(rows)) return out;
+  for (let i = 0; i < n && i < rows.length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    const price = Number(r[0]);
+    const size = Number(r[1]);
+    if (!Number.isFinite(price) || !Number.isFinite(size)) continue;
+    out.push({ price, size });
+  }
+  return out;
 }
 
 function restHeaders() {
@@ -78,12 +85,16 @@ export async function getOrderbook(orderbookKey, { contextMarketId } = {}) {
   }
   const json = await res.json();
   const data = json?.data ?? json;
+  const bids = topNOfBook(data?.bids);
+  const asks = topNOfBook(data?.asks);
   return {
     marketId: String(contextMarketId ?? orderbookKey),
     orderbookKey: String(orderbookKey),
     updatedAtMs: Number(data?.updateTimestampMs ?? Date.now()),
-    bestBid: topOfBook(data?.bids),
-    bestAsk: topOfBook(data?.asks),
+    bids,
+    asks,
+    bestBid: bids[0] ?? null,
+    bestAsk: asks[0] ?? null,
   };
 }
 
