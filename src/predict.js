@@ -269,6 +269,18 @@ export async function getMarketByIdFast(id) {
   return getMarketDirect(id);
 }
 
+// Resolve a Predict.fun URL or slug to the friendly numeric market id by
+// scanning the cached GraphQL market list and matching slugify(title).
+// Triggers cache load if cold. Returns null if no match.
+export async function resolveSlugToId(slug, slugifier) {
+  const all = await getAllMarketsCached();
+  for (const m of all) {
+    if (slugifier(m.title) === slug) return String(m.id);
+    if (slugifier(m.question) === slug) return String(m.id);
+  }
+  return null;
+}
+
 const CLOSED_STATUSES = new Set([
   'CLOSED', 'RESOLVED', 'PAUSED', 'CANCELLED', 'CANCELED',
   'ARCHIVED', 'EXPIRED', 'SETTLED', 'INACTIVE',

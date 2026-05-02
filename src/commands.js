@@ -10,7 +10,8 @@ import {
 import { activeMarketIds } from './state.js';
 import { fmtElapsed, rewardZoneStatus, midOf, spreadOf } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
-import { getMarketRewardSummary, getOrderbook } from './predict.js';
+import { getMarketRewardSummary, getOrderbook, resolveSlugToId } from './predict.js';
+import { slugifyMarketTitle } from './format.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
@@ -118,6 +119,35 @@ const HELP = [
 
 function uniq(arr) {
   return [...new Set(arr.map(String))];
+}
+
+// Accept a numeric id, a URL like https://predict.fun/<lang>/market/<slug>,
+// or a bare slug. Returns { id, slug, kind } where kind is 'id' | 'slug'.
+function parseMarketInput(raw) {
+  let s = String(raw ?? '').trim();
+  if (!s) return null;
+  const urlMatch = s.match(/\/market\/([^/?#]+)/);
+  if (urlMatch) s = urlMatch[1];
+  if (/^\d+$/.test(s)) return { id: s, slug: null, kind: 'id' };
+  // basic slug shape
+  if (/^[a-z0-9][a-z0-9-]{1,120}$/i.test(s)) return { id: null, slug: s.toLowerCase(), kind: 'slug' };
+  return null;
+}
+
+async function resolveMarketInput(raw) {
+  const parsed = parseMarketInput(raw);
+  if (!parsed) return { error: '无法识别为 marketId / slug / URL' };
+  if (parsed.kind === 'id') return { id: parsed.id };
+  // slug -> id (scans GraphQL market list and matches slugify(title))
+  try {
+    const id = await resolveSlugToId(parsed.slug, slugifyMarketTitle);
+    if (!id) {
+      return { error: `找不到 slug "${parsed.slug}"（市场可能不在 PP-rewarded 列表里，或已 resolve）。试试用数字 id 直接 /add。` };
+    }
+    return { id };
+  } catch (err) {
+    return { error: `slug 解析失败: ${err.message}` };
+  }
 }
 
 // Parse a duration like "30m", "2h", "1d" into milliseconds.
@@ -311,11 +341,14 @@ async function handle(text, state, ctx) {
     }
 
     case '/add': {
-      if (!arg) return '用法：/add &lt;marketId&gt;';
-      state.manualIds = uniq([...state.manualIds, arg]);
-      state.removedIds = state.removedIds.filter((x) => x !== arg);
+      if (!arg) return '用法：/add &lt;marketId | slug | URL&gt;\n例：/add 241373\n或：/add will-jesus-christ-return-before-2027\n或：/add https://predict.fun/zh-cn/market/...';
+      const resolved = await resolveMarketInput(arg);
+      if (resolved.error) return htmlEscape(resolved.error);
+      const id = resolved.id;
+      state.manualIds = uniq([...state.manualIds, id]);
+      state.removedIds = state.removedIds.filter((x) => x !== id);
       await ctx.persist();
-      return `已加入 #${htmlEscape(arg)}`;
+      return `已加入 #${htmlEscape(id)}`;
     }
 
     case '/remove': {
@@ -481,11 +514,14 @@ async function handle(text, state, ctx) {
     }
 
     case '/watch': {
-      if (!arg) return '用法：/watch &lt;marketId&gt;\n密集追踪：每次 tick 检测到买1卖1变动就立刻提醒（1 分钟冷却）。';
-      state.watchedIds = uniq([...(state.watchedIds ?? []), arg]);
-      state.removedIds = state.removedIds.filter((x) => x !== arg);
+      if (!arg) return '用法：/watch &lt;marketId | slug | URL&gt;\n密集追踪：每次 tick 检测到买1卖1变动就立刻提醒（1 分钟冷却）。';
+      const resolved = await resolveMarketInput(arg);
+      if (resolved.error) return htmlEscape(resolved.error);
+      const id = resolved.id;
+      state.watchedIds = uniq([...(state.watchedIds ?? []), id]);
+      state.removedIds = state.removedIds.filter((x) => x !== id);
       await ctx.persist();
-      return `已开启密集追踪 #${htmlEscape(arg)}（每次变动都会推送）。/unwatch 取消。`;
+      return `已开启密集追踪 #${htmlEscape(id)}（每次变动都会推送）。/unwatch 取消。`;
     }
 
     case '/unwatch': {
