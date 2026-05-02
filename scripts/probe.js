@@ -43,18 +43,28 @@ if (!arg) {
   console.log(`  url:         ${ob.template.replace('{key}', ob.orderbookKey)}`);
   console.log(`  updated:     ${new Date(ob.updatedAtMs).toISOString()}`);
 
+  const fmtMoney = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  let bidTotal = 0;
+  let askTotal = 0;
   console.log('\n  买盘 (top 3):');
   if (!ob.bids.length) console.log('    (空)');
   for (let i = 0; i < ob.bids.length; i++) {
     const b = ob.bids[i];
-    console.log(`    买${i + 1}: ${b.price.toFixed(4)} × ${b.size}`);
+    const t = b.price * b.size;
+    bidTotal += t;
+    console.log(`    买${i + 1}: ${b.price.toFixed(4)} × ${fmtMoney(b.size)} = $${fmtMoney(t)}`);
   }
+  console.log(`    小计 买盘 = $${fmtMoney(bidTotal)}`);
   console.log('  卖盘 (top 3):');
   if (!ob.asks.length) console.log('    (空)');
   for (let i = 0; i < ob.asks.length; i++) {
     const a = ob.asks[i];
-    console.log(`    卖${i + 1}: ${a.price.toFixed(4)} × ${a.size}`);
+    const t = a.price * a.size;
+    askTotal += t;
+    console.log(`    卖${i + 1}: ${a.price.toFixed(4)} × ${fmtMoney(a.size)} = $${fmtMoney(t)}`);
   }
+  console.log(`    小计 卖盘 = $${fmtMoney(askTotal)}`);
+  console.log(`  总深度 = $${fmtMoney(bidTotal + askTotal)}`);
 
   const mid = midOf(ob);
   const spread = spreadOf(ob);

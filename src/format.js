@@ -120,7 +120,14 @@ export function rewardZoneStatus(orderbook, market, defaults) {
 
 function bookLine(label, row) {
   if (!row) return `${label.padEnd(4)} 空`;
-  return `${label.padEnd(4)} ${fmtPriceValue(row.price).padEnd(8)} × ${fmtSizeValue(row.size)}`;
+  // Each row's $ value = price × size (USDC equivalent on Predict.fun).
+  const total = row.price * row.size;
+  return `${label.padEnd(4)} ${fmtPriceValue(row.price).padEnd(7)} × ${fmtSizeValue(row.size).padEnd(9)} = $${fmtSizeValue(total)}`;
+}
+
+function sideTotal(rows) {
+  if (!rows?.length) return 0;
+  return rows.reduce((acc, r) => acc + r.price * r.size, 0);
 }
 
 function zoneLine(label, ok, reason) {
@@ -143,14 +150,20 @@ export function formatOrderbookBlock(orderbook, zone) {
   const mid = midOf(orderbook);
   const spread = spreadOf(orderbook);
 
-  const table = [
+  const bidTotal = sideTotal(orderbook.bids);
+  const askTotal = sideTotal(orderbook.asks);
+
+  const tableRows = [
     bookLine('买1', bid1),
     bookLine('买2', bid2),
     bookLine('买3', bid3),
+    `小计 买盘 = $${fmtSizeValue(bidTotal)}`,
     bookLine('卖1', ask1),
     bookLine('卖2', ask2),
     bookLine('卖3', ask3),
-  ].join('\n');
+    `小计 卖盘 = $${fmtSizeValue(askTotal)}`,
+  ];
+  const table = tableRows.join('\n');
 
   const lines = [
     '📊 <b>盘口</b>',
@@ -160,7 +173,7 @@ export function formatOrderbookBlock(orderbook, zone) {
   if (mid != null && spread != null) {
     const spreadIcon = spread <= 0.02 ? '🟢' : spread <= 0.05 ? '🟡' : '🔴';
     lines.push(
-      `${spreadIcon} mid <code>${mid.toFixed(4)}</code> · spread <b>${(spread * 100).toFixed(2)}¢</b>`,
+      `${spreadIcon} mid <code>${mid.toFixed(4)}</code> · spread <b>${(spread * 100).toFixed(2)}¢</b> · 总深度 $${fmtSizeValue(bidTotal + askTotal)}`,
     );
   }
 
