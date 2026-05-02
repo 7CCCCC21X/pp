@@ -1,12 +1,14 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
 import { fmtElapsed, marketLink, spreadOf, formatOrderbookBlock } from '../format.js';
+import { effectiveOverride } from '../state.js';
 
 export async function detectWideSpread(ctx) {
-  const { slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
+  const { state, slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, zone } = ctx;
   if (!config.alertWideSpread || isPaused || filtered) return;
+  const maxSpread = effectiveOverride(state, marketId, 'maxSpread', config.maxSpread);
   const curSpread = spreadOf(orderbook);
-  const wide = Number.isFinite(curSpread) && curSpread > config.maxSpread;
+  const wide = Number.isFinite(curSpread) && curSpread > maxSpread;
   if (!wide) {
     if (config.alertRecovery && slot.wideSpreadAlertedAt > 0 && !slot.wideSpreadRecovered) {
       const msg = [

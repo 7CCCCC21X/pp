@@ -4,6 +4,7 @@ import { sendTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtElapsed, midOf, spreadOf, rewardZoneStatus } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
+import { effectiveOverride } from './state.js';
 import { alertKeyboard } from './commands.js';
 import { detectStall } from './alerts/stall.js';
 import { detectWatch } from './alerts/watch.js';
@@ -234,10 +235,12 @@ export async function checkMarket(marketId, state, { isPaused }) {
     }
   }
 
-  // Reward-zone evaluation per tick.
+  // Reward-zone evaluation per tick. Per-market overrides via /setmarket
+  // beat the global config; the market object's spreadThreshold /
+  // shareThreshold (from Predict.fun's REST sample) win over either.
   const zone = rewardZoneStatus(orderbook, market, {
-    maxDistance: config.rewardZoneMaxDistance,
-    minSize: config.rewardZoneMinSize,
+    maxDistance: effectiveOverride(state, marketId, 'rewardZoneMaxDistance', config.rewardZoneMaxDistance),
+    minSize: effectiveOverride(state, marketId, 'rewardZoneMinSize', config.rewardZoneMinSize),
   });
   slot.zoneStatus = {
     bidActivated: zone.bidActivated,
