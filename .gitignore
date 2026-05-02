@@ -3,5 +3,8 @@ node_modules/
 .env.local
 state.json
 state.json.tmp
+history.jsonl
 *.log
 .DS_Store
+.smoke-state.json
+.smoke-history.jsonl

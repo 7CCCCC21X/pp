@@ -35,21 +35,59 @@ function bool(name, fallback) {
   return /^(1|true|yes|y|on)$/i.test(v);
 }
 
+function csv(name) {
+  return (process.env[name] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID ?? '',
+  telegramAllowedChats: csv('TELEGRAM_ALLOWED_CHATS'),
+  telegramCommandsEnabled: bool('TELEGRAM_COMMANDS', true),
+
   predictApiKey: process.env.PREDICT_API_KEY ?? '',
-  marketIds: (process.env.MARKET_IDS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
+  marketIds: csv('MARKET_IDS'),
+
   pollIntervalMs: num('POLL_INTERVAL_MS', 5 * 60 * 1000),
+
+  // Stall alert
+  alertStall: bool('ALERT_STALL', true),
   staleHours: num('STALE_HOURS', 6),
   priceEpsilon: num('PRICE_EPSILON', 0.001),
   trackSize: bool('TRACK_SIZE', false),
   sizeRelativeEpsilon: num('SIZE_RELATIVE_EPSILON', 0.10),
   sizeAbsoluteMin: num('SIZE_ABSOLUTE_MIN', 10),
+
+  // Wide-spread alert (reward zone health)
+  alertWideSpread: bool('ALERT_WIDE_SPREAD', true),
+  maxSpread: num('MAX_SPREAD', 0.04),
+  wideSpreadMinMinutes: num('WIDE_SPREAD_MIN_MINUTES', 15),
+
+  // Mid-jump alert
+  alertMidJump: bool('ALERT_MID_JUMP', true),
+  midJumpThreshold: num('MID_JUMP_THRESHOLD', 0.05),
+  midJumpCooldownMs: num('MID_JUMP_COOLDOWN_MS', 15 * 60 * 1000),
+
+  // Empty-book alert
+  alertEmptyBook: bool('ALERT_EMPTY_BOOK', true),
+  emptyBookMinMinutes: num('EMPTY_BOOK_MIN_MINUTES', 30),
+
   skipNoReward: bool('SKIP_NO_REWARD', true),
+
+  // Auto-discovery
+  autodiscover: bool('AUTODISCOVER', false),
+  discoveryIntervalMs: num('DISCOVERY_INTERVAL_MS', 60 * 60 * 1000),
+  discoveryMaxMarkets: num('DISCOVERY_MAX_MARKETS', 200),
+
+  // History + daily digest
+  historyEnabled: bool('HISTORY_ENABLED', true),
+  historyFile: process.env.HISTORY_FILE ?? './history.jsonl',
+  digestEnabled: bool('DAILY_DIGEST_ENABLED', true),
+  digestHourUtc: num('DAILY_DIGEST_HOUR_UTC', 12),
+
   stateFile: process.env.STATE_FILE ?? './state.json',
   graphqlUrl: process.env.GRAPHQL_URL ?? 'https://graphql.predict.fun/graphql',
   restUrl: (process.env.REST_URL ?? 'https://api.predict.fun/v1').replace(/\/$/, ''),
@@ -59,10 +97,21 @@ export function validateConfig() {
   const errors = [];
   if (!config.telegramBotToken) errors.push('TELEGRAM_BOT_TOKEN is required');
   if (!config.telegramChatId) errors.push('TELEGRAM_CHAT_ID is required');
-  if (!config.marketIds.length) errors.push('MARKET_IDS is required (comma-separated)');
+  if (!config.marketIds.length && !config.autodiscover) {
+    errors.push('Set MARKET_IDS, or enable AUTODISCOVER=true');
+  }
   if (config.staleHours <= 0) errors.push('STALE_HOURS must be > 0');
   if (config.pollIntervalMs < 5_000) errors.push('POLL_INTERVAL_MS must be >= 5000');
+  if (config.digestHourUtc < 0 || config.digestHourUtc > 23) {
+    errors.push('DAILY_DIGEST_HOUR_UTC must be 0..23');
+  }
   if (errors.length) {
     throw new Error('Invalid configuration:\n  - ' + errors.join('\n  - '));
   }
+}
+
+export function isAllowedChat(chatId) {
+  const id = String(chatId);
+  if (id === String(config.telegramChatId)) return true;
+  return config.telegramAllowedChats.includes(id);
 }

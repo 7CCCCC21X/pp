@@ -1,15 +1,36 @@
 import fs from 'node:fs/promises';
 import { config } from './config.js';
 
+function emptyState() {
+  return {
+    markets: {},
+    manualIds: [],
+    pausedIds: [],
+    removedIds: [],
+    autoIds: [],
+    lastDiscoveryAt: 0,
+    lastDigestSentAt: 0,
+    telegramOffset: 0,
+  };
+}
+
 export async function loadState() {
   try {
     const text = await fs.readFile(config.stateFile, 'utf8');
     const json = JSON.parse(text);
-    if (!json || typeof json !== 'object') return { markets: {} };
-    if (!json.markets || typeof json.markets !== 'object') json.markets = {};
-    return json;
+    const base = emptyState();
+    if (!json || typeof json !== 'object') return base;
+    return {
+      ...base,
+      ...json,
+      markets: { ...base.markets, ...(json.markets ?? {}) },
+      manualIds: json.manualIds ?? [],
+      pausedIds: json.pausedIds ?? [],
+      removedIds: json.removedIds ?? [],
+      autoIds: json.autoIds ?? [],
+    };
   } catch (err) {
-    if (err.code === 'ENOENT') return { markets: {} };
+    if (err.code === 'ENOENT') return emptyState();
     throw err;
   }
 }
@@ -18,4 +39,13 @@ export async function saveState(state) {
   const tmp = `${config.stateFile}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(state, null, 2));
   await fs.rename(tmp, config.stateFile);
+}
+
+export function activeMarketIds(state) {
+  const set = new Set();
+  for (const id of config.marketIds) set.add(String(id));
+  for (const id of state.manualIds) set.add(String(id));
+  for (const id of state.autoIds) set.add(String(id));
+  for (const id of state.removedIds) set.delete(String(id));
+  return [...set];
 }

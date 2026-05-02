@@ -54,11 +54,15 @@ function topOfBook(rows) {
   return { price, size };
 }
 
-export async function getOrderbook(marketId) {
+function restHeaders() {
   const headers = { Accept: 'application/json' };
   if (config.predictApiKey) headers['x-api-key'] = config.predictApiKey;
+  return headers;
+}
+
+export async function getOrderbook(marketId) {
   const url = `${config.restUrl}/markets/${encodeURIComponent(marketId)}/orderbook`;
-  const res = await fetch(url, { headers });
+  const res = await fetch(url, { headers: restHeaders() });
   if (!res.ok) {
     throw new Error(`Orderbook ${res.status}: ${await res.text()}`);
   }
@@ -69,5 +73,42 @@ export async function getOrderbook(marketId) {
     updatedAtMs: Number(data?.updateTimestampMs ?? Date.now()),
     bestBid: topOfBook(data?.bids),
     bestAsk: topOfBook(data?.asks),
+  };
+}
+
+function pickMarketId(node) {
+  return String(node?.id ?? node?.marketId ?? '');
+}
+
+function pickMarketTitle(node) {
+  return node?.title ?? node?.question ?? null;
+}
+
+export async function listMarketsPage(cursor) {
+  const params = new URLSearchParams();
+  params.set('first', '50');
+  if (cursor) params.set('after', cursor);
+  const url = `${config.restUrl}/markets?${params.toString()}`;
+  const res = await fetch(url, { headers: restHeaders() });
+  if (!res.ok) {
+    throw new Error(`listMarkets ${res.status}: ${await res.text()}`);
+  }
+  const json = await res.json();
+  const data = json?.data ?? json;
+  const items =
+    data?.markets ??
+    data?.edges?.map((e) => e?.node).filter(Boolean) ??
+    (Array.isArray(data) ? data : []);
+  const pageInfo = data?.pageInfo ?? json?.pageInfo ?? null;
+  const nextCursor = pageInfo?.endCursor ?? data?.nextCursor ?? null;
+  const hasNext = pageInfo?.hasNextPage ?? Boolean(nextCursor);
+  return {
+    markets: items.map((m) => ({
+      id: pickMarketId(m),
+      title: pickMarketTitle(m),
+      status: m?.status ?? null,
+    })).filter((m) => m.id),
+    nextCursor,
+    hasNext,
   };
 }
