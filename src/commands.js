@@ -101,11 +101,18 @@ const WIZARD_RATES = [0, 100, 500, 1000, 3000];
 const WIZARD_REMS = [1, 4, 12, 24, 72];
 const WIZARD_LIMITS = [20, 50, 100, 200];
 
+function fmtRateShort(r) {
+  if (r >= 1000) return `${(r / 1000).toFixed(0)}k`;
+  return String(r);
+}
+
 function findWizardText(rate, rem, limit) {
   return [
     '🔍 <b>自定义筛选</b>',
     '',
-    `当前: PP/h ≥ <b>${rate}</b> · 剩余 ≥ <b>${rem}h</b> · 上限 <b>${limit}</b>`,
+    `📊 PP/h ≥ <b>${rate}</b>`,
+    `⏱ 剩余 ≥ <b>${rem}h</b>`,
+    `📦 上限 <b>${limit}</b>`,
     '',
     '点按钮调整 → 🚀 查询（不改 watchlist）',
     '或 🔄 应用监控（替换 watchlist）',
@@ -113,22 +120,22 @@ function findWizardText(rate, rem, limit) {
 }
 
 function findWizardKeyboard(rate, rem, limit) {
-  const mark = (active) => active ? '✅' : '·';
+  const mark = (active, label) => active ? `✅ ${label}` : label;
   return {
     inline_keyboard: [
-      // PP/h row
+      // PP/h row — short numeric labels (row context shown in message body)
       WIZARD_RATES.map((r) => ({
-        text: `${mark(r === rate)} PP≥${r}`,
+        text: mark(r === rate, fmtRateShort(r)),
         callback_data: `find:set:${r}:${rem}:${limit}`,
       })),
       // Remaining hours row
       WIZARD_REMS.map((m) => ({
-        text: `${mark(m === rem)} ${m}h+`,
+        text: mark(m === rem, `${m}h`),
         callback_data: `find:set:${rate}:${m}:${limit}`,
       })),
       // Limit row
       WIZARD_LIMITS.map((l) => ({
-        text: `${mark(l === limit)} ${l}`,
+        text: mark(l === limit, String(l)),
         callback_data: `find:set:${rate}:${rem}:${l}`,
       })),
       // Action row
