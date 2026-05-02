@@ -94,6 +94,18 @@ export async function sendLongTelegramMessage(text, opts = {}) {
   return results;
 }
 
+export async function editTelegramMessage(chatId, messageId, text, replyMarkup) {
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  return tgApi('editMessageText', payload);
+}
+
 export async function setMyCommands(commands) {
   return tgApi('setMyCommands', { commands });
 }

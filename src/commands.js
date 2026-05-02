@@ -2,6 +2,7 @@ import { config, isAllowedChat } from './config.js';
 import {
   sendTelegramMessage,
   sendLongTelegramMessage,
+  editTelegramMessage,
   htmlEscape,
   getUpdates,
   setMyCommands,
@@ -93,6 +94,153 @@ export function alertKeyboard(marketId) {
       ],
     ],
   };
+}
+
+// --- /find wizard: card-style filter picker ---
+const WIZARD_RATES = [0, 100, 500, 1000, 3000];
+const WIZARD_REMS = [1, 4, 12, 24, 72];
+const WIZARD_LIMITS = [20, 50, 100, 200];
+
+function findWizardText(rate, rem, limit) {
+  return [
+    '🔍 <b>自定义筛选</b>',
+    '',
+    `当前: PP/h ≥ <b>${rate}</b> · 剩余 ≥ <b>${rem}h</b> · 上限 <b>${limit}</b>`,
+    '',
+    '点按钮调整 → 🚀 查询（不改 watchlist）',
+    '或 🔄 应用监控（替换 watchlist）',
+  ].join('\n');
+}
+
+function findWizardKeyboard(rate, rem, limit) {
+  const mark = (active) => active ? '✅' : '·';
+  return {
+    inline_keyboard: [
+      // PP/h row
+      WIZARD_RATES.map((r) => ({
+        text: `${mark(r === rate)} PP≥${r}`,
+        callback_data: `find:set:${r}:${rem}:${limit}`,
+      })),
+      // Remaining hours row
+      WIZARD_REMS.map((m) => ({
+        text: `${mark(m === rem)} ${m}h+`,
+        callback_data: `find:set:${rate}:${m}:${limit}`,
+      })),
+      // Limit row
+      WIZARD_LIMITS.map((l) => ({
+        text: `${mark(l === limit)} ${l}`,
+        callback_data: `find:set:${rate}:${rem}:${l}`,
+      })),
+      // Action row
+      [
+        { text: '🚀 查询', callback_data: `find:run:${rate}:${rem}:${limit}` },
+        { text: '🔄 应用监控', callback_data: `find:scan:${rate}:${rem}:${limit}` },
+      ],
+    ],
+  };
+}
+
+// Run the actual filter query against the cached market list. Used by
+// both the /find wizard's "Run" button and the /find <args> CLI form.
+async function runFilterQuery(minRate, minRem, limit, mode, state, ctx) {
+  const { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } =
+    await import('./predict.js');
+  let all;
+  try {
+    all = await getAllMarketsCached();
+  } catch (err) {
+    return { text: `市场列表获取失败: ${htmlEscape(err.message)}` };
+  }
+  const cutoff = minRem > 0 ? Date.now() + minRem * 3600000 : null;
+  const matches = [];
+  for (const m of all) {
+    if (!isMarketTradeable(m)) continue;
+    const rate = extractHourlyRate(m);
+    if (rate < minRate) continue;
+    if (cutoff) {
+      const endMs = marketEndMs(m);
+      if (endMs != null && endMs < cutoff) continue;
+    }
+    matches.push({
+      id: String(m.id),
+      title: m.title ?? m.question ?? null,
+      rate,
+      endMs: marketEndMs(m),
+    });
+  }
+  matches.sort((a, b) => b.rate - a.rate);
+  const top = matches.slice(0, limit);
+
+  if (mode === 'scan') {
+    state.autoIds = top.map((x) => x.id);
+    state.lastDiscoveryAt = Date.now();
+    if (ctx?.persist) await ctx.persist();
+  }
+
+  if (!matches.length) {
+    return { text: `没有匹配的市场（PP/h ≥ ${minRate}, 剩余 ≥ ${minRem}h）。试试 /find 0 1` };
+  }
+
+  const verb = mode === 'scan'
+    ? `🔄 已替换 watchlist (${top.length} 个)`
+    : `🔍 找到 ${matches.length} 个`;
+  const note = matches.length > top.length ? `，显示前 ${top.length}` : '';
+  const lines = [
+    `${verb}${note}`,
+    `条件: PP/h ≥ <b>${minRate}</b> · 剩余 ≥ <b>${minRem}h</b>`,
+    '',
+  ];
+  for (const [idx, m] of top.entries()) {
+    const medal = idx < 3 ? ['🥇', '🥈', '🥉'][idx] : `${idx + 1}.`;
+    const title = htmlEscape(shortTitle(m.title ?? `Market ${m.id}`, 42));
+    const remH = m.endMs ? Math.max(0, (m.endMs - Date.now()) / 3600000) : null;
+    const ext = remH != null
+      ? ` · ${remH < 24 ? remH.toFixed(1) + 'h' : (remH / 24).toFixed(1) + 'd'}≈${fmtBig(m.rate * remH)}PP`
+      : '';
+    lines.push(`${medal} <code>#${m.id}</code> ${title} — <b>${m.rate.toFixed(0)}/h</b>${ext}`);
+  }
+  if (mode === 'find') {
+    lines.push('');
+    lines.push('用 /add &lt;id&gt; 单独加 · /scan 同参数 = 全部加入 watchlist');
+  }
+  return { text: lines.join('\n') };
+}
+
+// Handle find:set / find:run / find:scan callback_data from the wizard.
+// Returns true if handled (so the dispatcher skips normal command routing).
+export async function handleFindWizardCallback(data, { chatId, messageId, state, fullCtx }) {
+  // data shape: find:<action>:<rate>:<rem>:<limit>
+  const parts = data.split(':');
+  if (parts[0] !== 'find') return false;
+  const [, action, rateStr, remStr, limitStr] = parts;
+  const rate = Number(rateStr ?? 0);
+  const rem = Number(remStr ?? 12);
+  const limit = Math.min(Number(limitStr ?? 50), 200);
+  if (!Number.isFinite(rate) || !Number.isFinite(rem) || !Number.isFinite(limit)) return true;
+
+  if (action === 'set') {
+    // Re-render the wizard with updated highlight
+    try {
+      await editTelegramMessage(
+        chatId,
+        messageId,
+        findWizardText(rate, rem, limit),
+        findWizardKeyboard(rate, rem, limit),
+      );
+    } catch (err) {
+      // Telegram returns 400 if the new content is identical; safe to ignore.
+      if (!/message is not modified/i.test(err.message ?? '')) {
+        warn('wizard edit failed:', err.message);
+      }
+    }
+    return true;
+  }
+  if (action === 'run' || action === 'scan') {
+    const result = await runFilterQuery(rate, rem, limit, action, state, fullCtx);
+    await sendLongTelegramMessage(result.text, { chatId });
+    return true;
+  }
+  return true; // unknown find:* — swallow
 }
 
 const HELP = [
@@ -464,69 +612,22 @@ async function handle(text, state, ctx) {
     case '/find':
     case '/scan': {
       const parts = arg.split(/\s+/).filter(Boolean);
+      // No args + /find -> show interactive wizard with default state
+      if (cmd === '/find' && parts.length === 0) {
+        const defaultRem = Math.min(72, Math.max(1, config.minRemainingHours ?? 12));
+        return {
+          text: findWizardText(0, defaultRem, 50),
+          replyMarkup: findWizardKeyboard(0, defaultRem, 50),
+        };
+      }
       const minRate = parts[0] != null ? Number(parts[0]) : 0;
       const minRem = parts[1] != null ? Number(parts[1]) : (config.minRemainingHours ?? 12);
       const limit = Math.min(parts[2] != null ? Number(parts[2]) : 50, 200);
       if (!Number.isFinite(minRate) || !Number.isFinite(minRem) || !Number.isFinite(limit)) {
-        return '用法: /find [minRate] [minRem 小时] [limit]\n例: /find 500 12 30\n  /scan 同样参数，但会替换 watchlist';
+        return '用法: /find [minRate] [minRem 小时] [limit]\n例: /find 500 12 30\n  /scan 同样参数，但会替换 watchlist\n  /find （无参数）= 交互式向导';
       }
-      const { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } = await import('./predict.js');
-      let all;
-      try {
-        all = await getAllMarketsCached();
-      } catch (err) {
-        return `市场列表获取失败: ${htmlEscape(err.message)}`;
-      }
-      const cutoff = minRem > 0 ? Date.now() + minRem * 3600000 : null;
-      const matches = [];
-      for (const m of all) {
-        if (!isMarketTradeable(m)) continue;
-        const rate = extractHourlyRate(m);
-        if (rate < minRate) continue;
-        if (cutoff) {
-          const endMs = marketEndMs(m);
-          if (endMs != null && endMs < cutoff) continue;
-        }
-        matches.push({
-          id: String(m.id),
-          title: m.title ?? m.question ?? null,
-          rate,
-          endMs: marketEndMs(m),
-        });
-      }
-      matches.sort((a, b) => b.rate - a.rate);
-      const top = matches.slice(0, limit);
-
-      if (cmd === '/scan') {
-        state.autoIds = top.map((x) => x.id);
-        state.lastDiscoveryAt = Date.now();
-        await ctx.persist();
-      }
-
-      if (!matches.length) {
-        return `没有匹配的市场（PP/h ≥ ${minRate}, 剩余 ≥ ${minRem}h）。试试 /find 0 1`;
-      }
-
-      const verb = cmd === '/scan' ? `🔄 已替换 watchlist (${top.length} 个)` : `🔍 找到 ${matches.length} 个`;
-      const note = matches.length > top.length ? `，显示前 ${top.length}` : '';
-      const lines = [
-        `${verb}${note}`,
-        `条件: PP/h ≥ <b>${minRate}</b> · 剩余 ≥ <b>${minRem}h</b>`,
-        '',
-      ];
-      for (const [idx, m] of top.entries()) {
-        const medal = idx < 3 ? ['🥇', '🥈', '🥉'][idx] : `${idx + 1}.`;
-        const title = htmlEscape(shortTitle(m.title ?? `Market ${m.id}`, 42));
-        const remH = m.endMs ? Math.max(0, (m.endMs - Date.now()) / 3600000) : null;
-        const fmtBig = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(0)}k` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : n.toFixed(0);
-        const ext = remH != null ? ` · ${remH < 24 ? remH.toFixed(1) + 'h' : (remH / 24).toFixed(1) + 'd'}≈${fmtBig(m.rate * remH)}PP` : '';
-        lines.push(`${medal} <code>#${m.id}</code> ${title} — <b>${m.rate.toFixed(0)}/h</b>${ext}`);
-      }
-      if (cmd === '/find') {
-        lines.push('');
-        lines.push('用 /add &lt;id&gt; 单独加 · /scan 同参数 = 全部加入 watchlist');
-      }
-      return lines.join('\n');
+      const result = await runFilterQuery(minRate, minRem, limit, cmd === '/scan' ? 'scan' : 'find', state, ctx);
+      return result.text;
     }
 
     case '/digest': {
@@ -763,6 +864,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
           } else if (u.callback_query) {
             const cq = u.callback_query;
             const chatId = cq.message?.chat?.id;
+            const messageId = cq.message?.message_id;
             // Always answer the callback so Telegram dismisses the loading
             // spinner, even if the chat is not allowed.
             await answerCallbackQuery(cq.id).catch(() => {});
@@ -771,7 +873,16 @@ export function startCommandLoop({ getState, persist, ctx }) {
               continue;
             }
             const data = String(cq.data ?? '').trim();
-            if (data) await dispatchCommand(data, state, fullCtx, { chatId });
+            if (!data) continue;
+            // Wizard callbacks edit the originating message in place
+            // instead of posting a new reply.
+            if (data.startsWith('find:')) {
+              await handleFindWizardCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+                warn('find wizard error:', err.message);
+              });
+            } else {
+              await dispatchCommand(data, state, fullCtx, { chatId });
+            }
           }
         }
         state.telegramOffset = maxId;
