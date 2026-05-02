@@ -1,10 +1,24 @@
 import { config } from '../src/config.js';
 
-const marketId = process.argv[2];
-if (!marketId) {
-  console.error('Usage: npm run diagnose <marketId>   (e.g. npm run diagnose 257916)');
+const input = process.argv[2];
+if (!input) {
+  console.error('Usage: npm run diagnose <marketId|slug|url>');
+  console.error('  e.g. npm run diagnose 257916');
+  console.error('  e.g. npm run diagnose bnb-up-or-down-may-2-2026-2am-et');
+  console.error('  e.g. npm run diagnose https://predict.fun/zh-cn/market/<slug>');
   process.exit(1);
 }
+
+// Accept full URLs and pull the slug out of /market/<slug>
+function parseInput(raw) {
+  let s = raw.trim();
+  const urlMatch = s.match(/\/market\/([^/?#]+)/);
+  if (urlMatch) s = urlMatch[1];
+  const isNumeric = /^\d+$/.test(s);
+  return { value: s, kind: isNumeric ? 'id' : 'slug' };
+}
+
+const { value, kind } = parseInput(input);
 
 const PATH_TEMPLATES = [
   '/markets/{key}/orderbook',
@@ -17,8 +31,7 @@ async function postGraphQL(query, variables) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
   });
-  const json = await res.json();
-  return json;
+  return res.json();
 }
 
 function restHeaders() {
@@ -27,59 +40,107 @@ function restHeaders() {
   return headers;
 }
 
-async function introspectQueryRoot() {
+async function introspectRoot() {
   const q = `query QIntrospect {
     __schema {
       queryType {
-        fields { name args { name type { kind name ofType { kind name } } } }
+        fields {
+          name
+          args { name type { kind name ofType { kind name } } }
+        }
       }
     }
   }`;
   const json = await postGraphQL(q);
-  const fields = json?.data?.__schema?.queryType?.fields ?? [];
-  return fields.map((f) => ({
-    name: f.name,
-    args: (f.args ?? []).map((a) => `${a.name}:${a.type?.name ?? a.type?.ofType?.name ?? '?'}`),
-  }));
+  return json?.data?.__schema?.queryType?.fields ?? [];
 }
 
-async function introspectMarket() {
+async function introspectMarketScalars() {
   const q = `query Introspect {
     __type(name: "Market") {
-      name
       fields { name type { kind name ofType { kind name } } }
     }
   }`;
   const json = await postGraphQL(q);
-  const t = json?.data?.__type;
-  if (!t) throw new Error(`Introspection failed: ${JSON.stringify(json)}`);
-  const scalars = (t.fields ?? []).filter((f) => {
+  const fields = json?.data?.__type?.fields ?? [];
+  if (!fields.length) throw new Error(`Market introspection failed: ${JSON.stringify(json)}`);
+  return fields.filter((f) => {
     const k = f.type?.kind ?? f.type?.ofType?.kind;
     const n = f.type?.name ?? f.type?.ofType?.name;
     return k === 'SCALAR' && (n === 'String' || n === 'ID');
   }).map((f) => f.name);
-  return scalars;
 }
 
-async function fetchMarketWithFields(id, fields) {
-  const sel = ['id', ...fields.filter((f) => f !== 'id')].join('\n    ');
-  const q = `query Probe($id: ID!) {
-    market(id: $id) {
-      ${sel}
+function buildSelection(fields) {
+  return ['id', ...fields.filter((f) => f !== 'id')].join('\n      ');
+}
+
+async function tryGraphQLLookups(rootFields, kind, value, marketFields) {
+  const sel = buildSelection(marketFields);
+  const candidates = [];
+
+  // Always try the canonical id lookup
+  candidates.push({
+    label: 'market(id: $v)',
+    query: `query L($v: ID!) { market(id: $v) { ${sel} } }`,
+  });
+
+  // From introspection: any root query whose name matches /market/i and takes
+  // exactly one argument. Try with our value regardless of whether the arg
+  // wants ID/String — try both forms.
+  for (const f of rootFields) {
+    if (!/market/i.test(f.name)) continue;
+    if ((f.args ?? []).length !== 1) continue;
+    const argName = f.args[0].name;
+    if (f.name === 'market' && argName === 'id') continue; // already covered
+    for (const t of ['ID!', 'String!']) {
+      candidates.push({
+        label: `${f.name}(${argName}: $v) [${t}]`,
+        query: `query L($v: ${t}) { ${f.name}(${argName}: $v) { ${sel} } }`,
+      });
     }
-  }`;
-  const json = await postGraphQL(q, { id: String(id) });
-  if (json.errors) {
-    // Drop problematic fields and retry with just the safe ones
-    const bad = new Set();
-    for (const e of json.errors) {
-      const m = e.message?.match(/Cannot query field "(\w+)"/);
-      if (m) bad.add(m[1]);
-    }
-    if (!bad.size) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors)}`);
-    return fetchMarketWithFields(id, fields.filter((f) => !bad.has(f)));
   }
-  return json.data?.market ?? {};
+
+  // Hardcoded fallbacks in case introspection misses something
+  for (const tpl of [
+    'query L($v: String!) { marketBySlug(slug: $v) { __SEL__ } }',
+    'query L($v: String!) { market(slug: $v) { __SEL__ } }',
+  ]) {
+    candidates.push({
+      label: tpl.replace(/{ __SEL__ }/, '').trim(),
+      query: tpl.replace('__SEL__', sel),
+    });
+  }
+
+  for (const c of candidates) {
+    const json = await postGraphQL(c.query, { v: value });
+    if (json.errors) {
+      // Drop unknown fields and retry once
+      const bad = new Set();
+      for (const e of json.errors) {
+        const m = e.message?.match(/Cannot query field "(\w+)"/);
+        if (m) bad.add(m[1]);
+      }
+      if (bad.size) {
+        const fixed = c.query.split('\n').map((line) => {
+          const trimmed = line.trim();
+          if (bad.has(trimmed)) return null;
+          return line;
+        }).filter(Boolean).join('\n');
+        const retry = await postGraphQL(fixed, { v: value });
+        if (!retry.errors) {
+          const data = retry.data ?? {};
+          const market = data[Object.keys(data)[0]];
+          if (market) return { lookup: c.label, market };
+        }
+      }
+      continue;
+    }
+    const data = json.data ?? {};
+    const market = data[Object.keys(data)[0]];
+    if (market) return { lookup: c.label, market };
+  }
+  return null;
 }
 
 async function probe(template, key) {
@@ -96,54 +157,68 @@ async function probe(template, key) {
 }
 
 (async () => {
-  console.log(`> introspecting root Query at ${config.graphqlUrl}`);
-  try {
-    const root = await introspectQueryRoot();
-    const candidates = root.filter((f) => /market/i.test(f.name));
-    if (candidates.length) {
-      console.log('  market-related root queries:');
-      for (const c of candidates) console.log(`    ${c.name}(${c.args.join(', ')})`);
-    } else {
-      console.log('  no market-related root queries found');
+  console.log(`> input parsed as ${kind}: ${value}`);
+  console.log(`> graphql=${config.graphqlUrl}`);
+  console.log(`> rest=${config.restUrl}`);
+
+  console.log(`\n> introspecting root Query`);
+  const root = await introspectRoot();
+  const marketRoots = root.filter((f) => /market/i.test(f.name));
+  if (marketRoots.length) {
+    for (const c of marketRoots) {
+      const argList = (c.args ?? []).map((a) => `${a.name}:${a.type?.name ?? a.type?.ofType?.name ?? '?'}`).join(', ');
+      console.log(`  ${c.name}(${argList})`);
     }
-  } catch (err) {
-    console.log('  introspection failed:', err.message);
+  } else {
+    console.log('  no market-related root queries');
   }
 
-  console.log(`\n> introspecting Market type`);
-  const fields = await introspectMarket();
-  console.log(`  scalar (String|ID) fields: ${fields.join(', ')}`);
+  console.log(`\n> introspecting Market type fields`);
+  const marketFields = await introspectMarketScalars();
+  console.log(`  scalar (String|ID): ${marketFields.join(', ')}`);
 
-  console.log(`\n> fetching market ${marketId}`);
-  const market = await fetchMarketWithFields(marketId, fields);
-  for (const [k, v] of Object.entries(market)) {
+  console.log(`\n> looking up the market`);
+  const result = await tryGraphQLLookups(root, kind, value, marketFields);
+  if (!result) {
+    console.error('No GraphQL lookup returned a market. Try a different id/slug, or paste a different URL.');
+    process.exit(2);
+  }
+  console.log(`  using: ${result.lookup}`);
+  for (const [k, v] of Object.entries(result.market)) {
     if (v == null) continue;
     const display = typeof v === 'string' && v.length > 60 ? v.slice(0, 60) + '...' : v;
     console.log(`  ${k} = ${display}`);
   }
 
-  console.log(`\n> probing orderbook endpoints`);
+  console.log(`\n> probing orderbook endpoints (${Object.keys(result.market).length} fields x ${PATH_TEMPLATES.length} paths)`);
   const wins = [];
-  for (const [field, value] of Object.entries(market)) {
-    if (value == null || value === '') continue;
+  for (const [field, v] of Object.entries(result.market)) {
+    if (v == null || v === '') continue;
     for (const tpl of PATH_TEMPLATES) {
-      const r = await probe(tpl, value);
-      const tag = r.status === 200 ? 'WIN' : `   `;
-      console.log(`  [${tag}] ${r.status}  field=${field}  ${tpl}  -> ${r.url}`);
+      const r = await probe(tpl, v);
+      const tag = r.status === 200 ? 'WIN' : '   ';
+      console.log(`  [${tag}] ${String(r.status).padEnd(3)}  field=${field.padEnd(16)}  ${tpl}  -> ${r.url}`);
       if (r.status === 200) wins.push({ field, tpl });
     }
   }
 
   console.log('');
   if (!wins.length) {
-    console.log('No combination returned 200. The market may be resolved/closed,');
-    console.log('the API key may lack permission, or the path shape changed.');
+    console.log('No combination returned 200.');
+    console.log('Likely causes:');
+    console.log('  - This market resolved/closed (no live orderbook).');
+    console.log('  - API key lacks permission for the orderbook endpoint.');
+    console.log('  - The REST path shape changed (open an issue if so).');
     process.exit(2);
   }
   const w = wins[0];
-  console.log('Set these env vars in Railway / .env:');
+  console.log('Set these in Railway Variables (then redeploy):');
   console.log(`  ORDERBOOK_PATH_TEMPLATE=${w.tpl}`);
   console.log(`  ORDERBOOK_KEY_FIELD=${w.field}`);
+  if (result.market.id) {
+    console.log(`\nIf you want to monitor this market, use the friendly id in MARKET_IDS:`);
+    console.log(`  MARKET_IDS=${result.market.id}`);
+  }
 })().catch((err) => {
   console.error(err);
   process.exit(1);
