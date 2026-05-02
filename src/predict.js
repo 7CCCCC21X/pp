@@ -89,7 +89,12 @@ const MARKETS_PAGE_QUERY = `query AllMarkets($first: Int!, $after: String) {
 // Paginate ALL markets via GraphQL markets(...) using cursor-based
 // MarketConnection pagination. Returns an array of market objects with
 // id / conditionId / title / question / rewardTimings.
-export async function listAllMarkets({ pageSize = 100, maxPages = 100 } = {}) {
+//
+// onProgress: optional callback fired after every page so callers (e.g.
+// the rewards CLI) can stream feedback while the scan runs. On a fetch
+// error the loop returns whatever has been collected so far instead of
+// throwing — partial results are more useful than nothing.
+export async function listAllMarkets({ pageSize = 100, maxPages = 100, onProgress } = {}) {
   const seen = new Map();
   let after = null;
   for (let page = 0; page < maxPages; page++) {
@@ -97,11 +102,11 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100 } = {}) {
     try {
       data = await postGraphQL(MARKETS_PAGE_QUERY, { first: pageSize, after }, 'AllMarkets');
     } catch (err) {
-      throw new Error(`listAllMarkets page ${page}: ${err.message}`);
+      if (onProgress) onProgress({ page, error: err.message, total: seen.size });
+      break;
     }
     const conn = data?.markets;
     const edges = conn?.edges ?? [];
-    if (!edges.length) break;
     let progress = 0;
     for (const e of edges) {
       const node = e?.node;
@@ -109,9 +114,20 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100 } = {}) {
       seen.set(node.id, node);
       progress += 1;
     }
-    if (!progress) break;
     const pageInfo = conn?.pageInfo;
-    if (!pageInfo?.hasNextPage || !pageInfo?.endCursor) break;
+    const hasNext = !!pageInfo?.hasNextPage && !!pageInfo?.endCursor;
+    if (onProgress) {
+      onProgress({
+        page,
+        edges: edges.length,
+        newMarkets: progress,
+        total: seen.size,
+        hasNext,
+      });
+    }
+    if (!edges.length) break;
+    if (!progress) break;
+    if (!hasNext) break;
     after = pageInfo.endCursor;
   }
   return [...seen.values()];
