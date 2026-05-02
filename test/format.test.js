@@ -35,13 +35,13 @@ test('fmtElapsed clamps negative', () => {
 
 test('marketLink: explicit slug wins (real categorySlug from REST)', () => {
   const link = marketLink('210562', 'Draw', 'whatever', 'english-premier-league-winner');
-  assert.match(link, /href="https:\/\/predict\.fun\/market\/english-premier-league-winner"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/english-premier-league-winner"/);
   assert.match(link, />Draw<\/a>/);
 });
 
 test('marketLink: question slugified when no explicit slug', () => {
   const link = marketLink('210562', 'Draw', 'Real Madrid vs Barcelona — Match Result');
-  assert.match(link, /href="https:\/\/predict\.fun\/market\/real-madrid-vs-barcelona-match-result"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/real-madrid-vs-barcelona-match-result"/);
 });
 
 test('marketLink: falls back to title slug when no question or explicit slug', () => {
@@ -51,13 +51,8 @@ test('marketLink: falls back to title slug when no question or explicit slug', (
 
 test('marketLink: id fallback when nothing else', () => {
   const link = marketLink('123', null);
-  assert.match(link, /href="https:\/\/predict\.fun\/market\/123"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/123"/);
   assert.match(link, /Market 123/);
-});
-
-test('marketLink: no /zh-cn/ prefix (matches predict.fun canonical)', () => {
-  const link = marketLink('1', 'Foo', null, 'foo-slug');
-  assert.doesNotMatch(link, /\/zh-cn\//);
 });
 
 test('marketLink escapes title text', () => {

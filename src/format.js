@@ -69,9 +69,9 @@ export function slugifyMarketTitle(title) {
 // Title is what we display (often short — "Draw", "Yes" for outcome
 // markets). The URL slug comes from Predict.fun's REST `categorySlug`
 // when we have it (passed as `slug`); otherwise we slugify question or
-// title as a best-effort fallback. URL pattern matches Predict.fun's
-// canonical /market/<slug> form (no /zh-cn/ prefix — works in any
-// browser locale).
+// title as a best-effort fallback. URL pattern keeps the /zh-cn/
+// prefix the user confirmed works in browsers — predict.fun's no-lang
+// path inconsistently 302s in some clients.
 export function marketLink(marketId, title, question, slug) {
   const display = title || question || `Market ${marketId}`;
   const safeTitle = htmlEscape(shortTitle(display, 72));
@@ -79,8 +79,8 @@ export function marketLink(marketId, title, question, slug) {
     || (question ? slugifyMarketTitle(question) : null)
     || (title ? slugifyMarketTitle(title) : null);
   const url = urlSlug
-    ? `https://predict.fun/market/${urlSlug}`
-    : `https://predict.fun/market/${encodeURIComponent(marketId)}`;
+    ? `https://predict.fun/zh-cn/market/${urlSlug}`
+    : `https://predict.fun/zh-cn/market/${encodeURIComponent(marketId)}`;
   return `<a href="${url}">${safeTitle}</a>`;
 }
 

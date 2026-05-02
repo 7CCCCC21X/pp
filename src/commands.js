@@ -446,16 +446,132 @@ function fmtRemaining(endMs) {
 }
 
 function compactMarketRow(id, slot, extra = '') {
-  // Title is hyperlinked when we have enough info to derive a working
-  // slug (use question for outcome-only titles like "Draw" / "Yes").
-  const linked = slot?.title || slot?.question
-    ? marketLink(id, slot.title, slot.question, slot.slug)
-    : htmlEscape(`Market ${id}`);
+  // Always render as a link — even with no title/question the marketLink
+  // helper falls back to "Market <id>" with a /market/<id> URL, so the
+  // user can still click through.
+  const linked = marketLink(id, slot?.title, slot?.question, slot?.slug);
   const rate = Number.isFinite(slot?.lastHourlyRate)
     ? `${slot.lastHourlyRate.toFixed(0)}/h`
     : '?/h';
   const suffix = extra ? ` · ${htmlEscape(extra)}` : '';
   return `<code>#${htmlEscape(id)}</code> ${linked} — <b>${rate}</b>${suffix}`;
+}
+
+// --- Pagination helpers for /top /gaps /wide /empty /opportunities ---
+const PAGE_SIZE = 10;
+
+function pageKeyboard(cmd, page, totalPages) {
+  if (totalPages <= 1) return undefined;
+  const buttons = [];
+  if (page > 0) buttons.push({ text: '⬅️ 上一页', callback_data: `page:${cmd}:${page - 1}` });
+  buttons.push({ text: `${page + 1} / ${totalPages}`, callback_data: 'page:noop' });
+  if (page < totalPages - 1) buttons.push({ text: '➡️ 下一页', callback_data: `page:${cmd}:${page + 1}` });
+  return { inline_keyboard: [buttons] };
+}
+
+// Edit-in-place callback handler for page:* buttons.
+export async function handlePageCallback(data, { chatId, messageId, state, fullCtx }) {
+  if (!data.startsWith('page:')) return false;
+  const [, cmd, pageStr] = data.split(':');
+  if (cmd === 'noop') return true; // page indicator button
+  const page = Number(pageStr);
+  if (!Number.isFinite(page) || page < 0) return true;
+  // Re-run the list command at the requested page and edit the message.
+  const reply = await renderListPage(cmd, page, state);
+  if (!reply) return true;
+  try {
+    await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+  } catch (err) {
+    if (!/message is not modified/i.test(err.message ?? '')) {
+      warn(`page edit failed for ${cmd}:`, err.message);
+    }
+  }
+  return true;
+}
+
+function paginate(rows, page) {
+  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const start = safePage * PAGE_SIZE;
+  return { items: rows.slice(start, start + PAGE_SIZE), page: safePage, totalPages };
+}
+
+function renderListPage(cmd, page, state) {
+  const allRows = listMarketsSnapshot(state);
+  let rows = [];
+  let header = '';
+  let extraFn = null;
+  switch (cmd) {
+    case 'top':
+      rows = allRows
+        .filter(({ slot }) => !slot.lastError && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
+        .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
+      header = '<b>🔥 PP/h Top</b>';
+      break;
+    case 'gaps':
+      rows = allRows
+        .filter(({ slot }) => !slot.lastError && slot.zoneStatus
+          && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated))
+        .sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
+      header = '<b>🎯 奖励区有空缺（未激活）</b>';
+      extraFn = (slot) => {
+        const sides = [];
+        if (!slot.zoneStatus.bidActivated) sides.push('买✗');
+        if (!slot.zoneStatus.askActivated) sides.push('卖✗');
+        return sides.join(',');
+      };
+      break;
+    case 'wide':
+      rows = allRows
+        .filter(({ slot }) => !slot.lastError)
+        .map(({ id, slot }) => {
+          const bid = slot.baseline?.bidPrice;
+          const ask = slot.baseline?.askPrice;
+          const spread = (Number.isFinite(bid) && Number.isFinite(ask)) ? ask - bid : null;
+          return { id, slot, spread };
+        })
+        .filter((x) => Number.isFinite(x.spread))
+        .sort((a, b) => b.spread - a.spread);
+      header = '<b>📏 价差最大</b>';
+      extraFn = (_slot, row) => `spread ${(row.spread * 100).toFixed(2)}¢`;
+      break;
+    case 'empty':
+      rows = allRows.filter(({ slot }) => !slot.lastError && slot.baseline
+        && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null));
+      header = '<b>🌊 单边/空簿</b>';
+      extraFn = (slot) => {
+        const sides = [];
+        if (slot.baseline?.bidPrice == null) sides.push('无买');
+        if (slot.baseline?.askPrice == null) sides.push('无卖');
+        return sides.join(',');
+      };
+      break;
+    case 'opp':
+    case 'opportunities':
+      rows = allRows
+        .filter(({ slot }) => !slot.lastError)
+        .map(({ id, slot }) => ({ id, slot, score: opportunityScore(slot) }))
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score);
+      header = '<b>💎 机会评分</b> (PP × 缺口 × 价差)';
+      extraFn = (_slot, row) => `score ${row.score.toFixed(0)}`;
+      break;
+    default:
+      return null;
+  }
+  if (!rows.length) {
+    return { text: `${header}\n\n暂无匹配市场。` };
+  }
+  const { items, page: safePage, totalPages } = paginate(rows, page);
+  const lines = [`${header} <i>(${items.length} / ${rows.length})</i>`, ''];
+  for (const row of items) {
+    const extra = extraFn ? extraFn(row.slot, row) : '';
+    lines.push(compactMarketRow(row.id, row.slot, extra));
+  }
+  return {
+    text: lines.join('\n'),
+    replyMarkup: pageKeyboard(cmd, safePage, totalPages),
+  };
 }
 
 async function buildStatusDashboard(state) {
@@ -666,74 +782,18 @@ async function handle(text, state, ctx) {
       return '已触发 24 小时摘要。';
     }
 
-    case '/top': {
-      const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => !slot.lastError && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0);
-      snap.sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
-      const top = snap.slice(0, 20);
-      if (!top.length) {
-        const total = activeMarketIds(state).length;
-        return total === 0
-          ? '当前没有监控的市场。试试 AUTODISCOVER=true 或 /add &lt;id&gt;。'
-          : `所有 ${total} 个监控市场暂无可用 PP 数据（可能全部已 resolve 或 fetch 失败）。/status 看具体原因。`;
-      }
-      return [`<b>PP/h Top ${top.length}</b>`, ...top.map(({ id, slot }) => htmlEscape(fmtMarketLine(id, slot)))].join('\n');
-    }
-
-    case '/gaps': {
-      const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => !slot.lastError && slot.zoneStatus && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated));
-      snap.sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
-      const top = snap.slice(0, 20);
-      if (!top.length) return '当前所有监控市场都在奖励区内。';
-      return [`<b>奖励区有空缺 ${snap.length} 个</b>`, ...top.map(({ id, slot }) => {
-        const sides = [];
-        if (!slot.zoneStatus.bidActivated) sides.push('买✗');
-        if (!slot.zoneStatus.askActivated) sides.push('卖✗');
-        return htmlEscape(fmtMarketLine(id, slot, sides.join(',')));
-      })].join('\n');
-    }
-
-    case '/wide': {
-      const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => !slot.lastError)
-        .map(({ id, slot }) => {
-          const bid = slot.baseline?.bidPrice;
-          const ask = slot.baseline?.askPrice;
-          const spread = (Number.isFinite(bid) && Number.isFinite(ask)) ? ask - bid : null;
-          return { id, slot, spread };
-        })
-        .filter((x) => Number.isFinite(x.spread));
-      snap.sort((a, b) => b.spread - a.spread);
-      const top = snap.slice(0, 20);
-      if (!top.length) return '暂无价差数据。';
-      return [`<b>价差最大的 ${top.length} 个</b>`, ...top.map(({ id, slot, spread }) =>
-        htmlEscape(fmtMarketLine(id, slot, `spread ${(spread * 100).toFixed(2)}¢`)))].join('\n');
-    }
-
-    case '/empty': {
-      const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => !slot.lastError && slot.baseline && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null));
-      if (!snap.length) return '当前没有空簿/单边市场。';
-      return [`<b>单边/空簿 ${snap.length} 个</b>`, ...snap.slice(0, 20).map(({ id, slot }) => {
-        const sides = [];
-        if (slot.baseline?.bidPrice == null) sides.push('无买');
-        if (slot.baseline?.askPrice == null) sides.push('无卖');
-        return htmlEscape(fmtMarketLine(id, slot, sides.join(',')));
-      })].join('\n');
-    }
-
+    case '/top':
+    case '/gaps':
+    case '/wide':
+    case '/empty':
     case '/opportunities':
     case '/opp': {
-      const snap = listMarketsSnapshot(state)
-        .filter(({ slot }) => !slot.lastError)
-        .map(({ id, slot }) => ({ id, slot, score: opportunityScore(slot) }))
-        .filter((x) => x.score > 0);
-      snap.sort((a, b) => b.score - a.score);
-      const top = snap.slice(0, 20);
-      if (!top.length) return '暂无机会数据。/status 看是否所有市场都失败/已 resolve。';
-      return [`<b>机会评分 Top ${top.length}</b> (PP × 缺口 × 价差)`, ...top.map(({ id, slot, score }) =>
-        htmlEscape(fmtMarketLine(id, slot, `score ${score.toFixed(0)}`)))].join('\n');
+      const cmdName = cmd === '/opportunities' ? 'opp' : cmd.slice(1);
+      // Optional integer arg = page number (1-indexed for the user)
+      const page = Math.max(1, Number(arg) || 1) - 1;
+      const reply = renderListPage(cmdName, page, state);
+      if (!reply) return '未知命令';
+      return reply;
     }
 
     case '/snooze': {
@@ -905,11 +965,15 @@ export function startCommandLoop({ getState, persist, ctx }) {
             }
             const data = String(cq.data ?? '').trim();
             if (!data) continue;
-            // Wizard callbacks edit the originating message in place
-            // instead of posting a new reply.
+            // Wizard / pagination callbacks edit the originating message
+            // in place instead of posting a new reply.
             if (data.startsWith('find:')) {
               await handleFindWizardCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
                 warn('find wizard error:', err.message);
+              });
+            } else if (data.startsWith('page:')) {
+              await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+                warn('page callback error:', err.message);
               });
             } else {
               await dispatchCommand(data, state, fullCtx, { chatId });
