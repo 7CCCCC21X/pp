@@ -226,12 +226,21 @@ function statusLine(state, id) {
   const slot = state.markets[id];
   const paused = state.pausedIds.includes(id);
   const watched = (state.watchedIds ?? []).includes(id);
-  const tags = [paused ? 'paused' : '', watched ? 'watch' : ''].filter(Boolean);
+  const snoozeUntil = state.snoozes?.[id];
+  const isSnoozed = snoozeUntil && snoozeUntil > Date.now();
+  const tags = [
+    paused ? 'paused' : '',
+    isSnoozed ? 'snoozed' : '',
+    watched ? 'watch' : '',
+  ].filter(Boolean);
   const tag = tags.length ? ` [${tags.join(',')}]` : '';
-  if (!slot) return `#${id}${tag} — 等待首次抓取`;
-  const since = Date.now() - (slot.lastChangeAt ?? Date.now());
+  const title = slot?.title ? slot.title.slice(0, 40) : `Market ${id}`;
+  if (!slot) return `#${id}${tag} ${title} — 等待首次抓取`;
+  if (slot.lastError) return `#${id}${tag} ${title} — ⚠ ${slot.lastError}`;
+  if (slot.lastSkipReason) return `#${id}${tag} ${title} — ⏭ ${slot.lastSkipReason}`;
+  if (slot.lastChangeAt == null) return `#${id}${tag} ${title} — 等待首次抓取`;
+  const since = Date.now() - slot.lastChangeAt;
   const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
-  const title = slot.title ? slot.title.slice(0, 40) : `Market ${id}`;
   return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · ${rate}/h${zoneTag(slot)}`;
 }
 

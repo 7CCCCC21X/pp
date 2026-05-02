@@ -63,6 +63,19 @@ function ensureSlot(state, marketId, cur, now) {
   return slot;
 }
 
+// Stub slot for markets we can't fully process yet (resolved, fetch failed,
+// no rewards). Lets /status surface a real reason instead of the misleading
+// "等待首次抓取" forever.
+function ensureStubSlot(state, marketId, now) {
+  let slot = state.markets[marketId];
+  if (!slot) {
+    slot = { lastSeenAt: now, title: null };
+    state.markets[marketId] = slot;
+  }
+  slot.lastSeenAt = now;
+  return slot;
+}
+
 async function alert(kind, slot, marketId, message, extra = {}) {
   try {
     await sendTelegramMessage(message, { replyMarkup: alertKeyboard(marketId) });
@@ -92,15 +105,36 @@ const DETECTORS = [
 ];
 
 export async function checkMarket(marketId, state, { isPaused }) {
+  const tickStart = Date.now();
   let rewardSummary = null;
   try {
     rewardSummary = await getMarketRewardSummary(marketId);
   } catch (err) {
     warn(`[${marketId}] reward fetch failed:`, err.message);
+    const stub = ensureStubSlot(state, marketId, tickStart);
+    stub.lastError = `奖励查询失败: ${err.message.slice(0, 100)}`;
+    return;
   }
-  const orderbookKey = rewardSummary?.orderbookKey ?? marketId;
-  const market = rewardSummary?.market ?? null;
+
+  if (!rewardSummary?.market) {
+    const stub = ensureStubSlot(state, marketId, tickStart);
+    stub.lastError = '市场不存在（可能已 resolve 或 id 错误）';
+    return;
+  }
+
+  const orderbookKey = rewardSummary.orderbookKey ?? marketId;
+  const market = rewardSummary.market;
   const cache = state.markets[marketId]?.orderbookCache ?? null;
+
+  const totalHourlyRate = rewardSummary?.totalHourlyRate ?? 0;
+  if (config.skipNoReward && totalHourlyRate <= 0) {
+    const stub = ensureStubSlot(state, marketId, tickStart);
+    stub.title = rewardSummary.title ?? stub.title;
+    stub.lastSkipReason = 'PP/h = 0 (已 resolve 或无奖励)';
+    stub.lastError = null;
+    log(`[${marketId}] skip: no PP reward`);
+    return;
+  }
 
   let orderbook;
   try {
@@ -111,12 +145,10 @@ export async function checkMarket(marketId, state, { isPaused }) {
     });
   } catch (err) {
     warn(`[${marketId}] orderbook fetch failed:`, err.message);
-    return;
-  }
-
-  const totalHourlyRate = rewardSummary?.totalHourlyRate ?? 0;
-  if (config.skipNoReward && totalHourlyRate <= 0) {
-    log(`[${marketId}] skip: no PP reward`);
+    const stub = ensureStubSlot(state, marketId, tickStart);
+    stub.title = rewardSummary.title ?? stub.title;
+    stub.lastError = `订单簿失败: ${err.message.slice(0, 100)}`;
+    stub.lastSkipReason = null;
     return;
   }
 
@@ -138,6 +170,8 @@ export async function checkMarket(marketId, state, { isPaused }) {
     template: orderbook.template,
     key: orderbook.orderbookKey,
   };
+  slot.lastError = null;
+  slot.lastSkipReason = null;
   if (rewardSummary?.title) slot.title = rewardSummary.title;
   slot.lastHourlyRate = totalHourlyRate;
   const lastSeenAt = slot.lastSeenAt ?? now;
