@@ -124,11 +124,16 @@ export const config = {
   graphqlUrl: process.env.GRAPHQL_URL ?? 'https://graphql.predict.fun/graphql',
   restUrl: (process.env.REST_URL ?? 'https://api.predict.fun/v1').replace(/\/$/, ''),
 
-  // Orderbook URL shape. {key} is replaced with the value of the GraphQL
-  // Market field named ORDERBOOK_KEY_FIELD. Run `npm run diagnose <marketId>`
-  // to find the correct combination if you hit 404s.
+  // Orderbook URL shape. {key} is replaced with market[ORDERBOOK_KEY_FIELD].
+  // Default `conditionId` matches predict.fun's REST API. The bot self-heals
+  // by trying alternate (path, field) combinations on 404 and caching the
+  // working combo per market in state.json.
   orderbookPathTemplate: process.env.ORDERBOOK_PATH_TEMPLATE ?? '/markets/{key}/orderbook',
-  orderbookKeyField: process.env.ORDERBOOK_KEY_FIELD ?? 'id',
+  orderbookKeyField: process.env.ORDERBOOK_KEY_FIELD ?? 'conditionId',
+
+  // How long to cache the REST market list (used by both auto-discovery
+  // and per-market reward lookup). Default 10 minutes.
+  marketsCacheTtlMs: num('MARKETS_CACHE_TTL_MS', 10 * 60 * 1000),
 };
 
 export function validateConfig() {

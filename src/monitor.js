@@ -79,10 +79,23 @@ export async function checkMarket(marketId, state, { isPaused }) {
     warn(`[${marketId}] reward fetch failed:`, err.message);
   }
   const orderbookKey = rewardSummary?.orderbookKey ?? marketId;
+  const market = rewardSummary?.market ?? null;
+  const cache = state.markets[marketId]?.orderbookCache ?? null;
 
   let orderbook;
   try {
-    orderbook = await getOrderbook(orderbookKey, { contextMarketId: marketId });
+    orderbook = await getOrderbook(orderbookKey, {
+      contextMarketId: marketId,
+      market,
+      cache,
+    });
+    // Persist the working (template, key) so future ticks skip retries.
+    if (state.markets[marketId]) {
+      state.markets[marketId].orderbookCache = {
+        template: orderbook.template,
+        key: orderbook.orderbookKey,
+      };
+    }
   } catch (err) {
     warn(`[${marketId}] orderbook fetch failed:`, err.message);
     return;
