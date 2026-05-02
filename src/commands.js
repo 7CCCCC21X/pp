@@ -470,6 +470,9 @@ async function buildStatusDashboard(state) {
   const ppRows = rows
     .filter(({ slot }) => slot && !slot.lastError && !slot.lastSkipReason && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
     .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
+  // PP/h sum across all rewarded markets currently in the watchlist —
+  // this is the pool the user is collectively monitoring.
+  const totalRate = ppRows.reduce((acc, { slot }) => acc + slot.lastHourlyRate, 0);
 
   let totalPP24h = null;
   try {
@@ -482,10 +485,19 @@ async function buildStatusDashboard(state) {
 
   const lines = [
     '📡 <b>监控面板</b>',
-    `市场 <b>${ids.length}</b> · 空缺 <b>${gaps.length}</b> · 错误 <b>${errors.length}</b> · 跳过 <b>${skipped.length}</b> · 等待 <b>${waiting.length}</b>`,
-    `暂停 <b>${paused.length}</b> · 追踪 <b>${watched.length}</b>${totalPP24h != null && totalPP24h > 0 ? ` · 24h PP <b>${totalPP24h.toFixed(2)}</b>` : ''}`,
-    '',
+    `💰 <b>${ppRows.length}</b> 个有奖励市场 · 总 <b>${totalRate.toFixed(0)}</b> PP/h`,
+    `🎯 <b>${gaps.length}</b> 个奖励区有空缺（未激活）`,
   ];
+  // Smaller second line for everything else (only show non-zero buckets)
+  const meta = [];
+  if (errors.length) meta.push(`⚠ 错误 ${errors.length}`);
+  if (skipped.length) meta.push(`⏭ 跳过 ${skipped.length}`);
+  if (waiting.length) meta.push(`⏳ 等待 ${waiting.length}`);
+  if (paused.length) meta.push(`⏸ 暂停 ${paused.length}`);
+  if (watched.length) meta.push(`👁 追踪 ${watched.length}`);
+  if (totalPP24h != null && totalPP24h > 0) meta.push(`📈 24h PP ${totalPP24h.toFixed(0)}`);
+  if (meta.length) lines.push(meta.join(' · '));
+  lines.push('');
 
   if (errors.length) {
     lines.push('⚠️ <b>错误</b>');
