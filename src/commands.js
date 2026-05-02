@@ -37,6 +37,8 @@ const COMMAND_MENU = [
   { command: 'setmarket', description: '设置市场专属阈值 (/setmarket <id> staleHours 2)' },
   { command: 'clearmarket', description: '清除市场覆盖 (/clearmarket <id>)' },
   { command: 'discover', description: '立即触发自动发现' },
+  { command: 'find', description: '查询符合筛选的市场 (用法: /find [minRate] [minRem])' },
+  { command: 'scan', description: '查询并替换 watchlist (参数同 /find)' },
   { command: 'digest', description: '发送 24 小时摘要' },
   { command: 'filter', description: '查看当前过滤器' },
   { command: 'setfilter', description: '设置过滤器 (用法: /setfilter name value)' },
@@ -114,6 +116,8 @@ const HELP = [
   '/setmarket &lt;id&gt; &lt;key&gt; &lt;value&gt; — 市场专属阈值',
   '/clearmarket &lt;id&gt; — 清除覆盖',
   '/discover — 立即触发一次自动发现',
+  '/find &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选查询（不改 watchlist）',
+  '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
   '/digest — 立即发送 24 小时摘要',
   '',
   '<b>过滤器</b>（只有满足条件的市场才会触发提醒，支持 1-3 档）',
@@ -455,6 +459,74 @@ async function handle(text, state, ctx) {
     case '/discover': {
       ctx.requestDiscovery();
       return '已触发自动发现，几分钟内完成。';
+    }
+
+    case '/find':
+    case '/scan': {
+      const parts = arg.split(/\s+/).filter(Boolean);
+      const minRate = parts[0] != null ? Number(parts[0]) : 0;
+      const minRem = parts[1] != null ? Number(parts[1]) : (config.minRemainingHours ?? 12);
+      const limit = Math.min(parts[2] != null ? Number(parts[2]) : 50, 200);
+      if (!Number.isFinite(minRate) || !Number.isFinite(minRem) || !Number.isFinite(limit)) {
+        return '用法: /find [minRate] [minRem 小时] [limit]\n例: /find 500 12 30\n  /scan 同样参数，但会替换 watchlist';
+      }
+      const { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } = await import('./predict.js');
+      let all;
+      try {
+        all = await getAllMarketsCached();
+      } catch (err) {
+        return `市场列表获取失败: ${htmlEscape(err.message)}`;
+      }
+      const cutoff = minRem > 0 ? Date.now() + minRem * 3600000 : null;
+      const matches = [];
+      for (const m of all) {
+        if (!isMarketTradeable(m)) continue;
+        const rate = extractHourlyRate(m);
+        if (rate < minRate) continue;
+        if (cutoff) {
+          const endMs = marketEndMs(m);
+          if (endMs != null && endMs < cutoff) continue;
+        }
+        matches.push({
+          id: String(m.id),
+          title: m.title ?? m.question ?? null,
+          rate,
+          endMs: marketEndMs(m),
+        });
+      }
+      matches.sort((a, b) => b.rate - a.rate);
+      const top = matches.slice(0, limit);
+
+      if (cmd === '/scan') {
+        state.autoIds = top.map((x) => x.id);
+        state.lastDiscoveryAt = Date.now();
+        await ctx.persist();
+      }
+
+      if (!matches.length) {
+        return `没有匹配的市场（PP/h ≥ ${minRate}, 剩余 ≥ ${minRem}h）。试试 /find 0 1`;
+      }
+
+      const verb = cmd === '/scan' ? `🔄 已替换 watchlist (${top.length} 个)` : `🔍 找到 ${matches.length} 个`;
+      const note = matches.length > top.length ? `，显示前 ${top.length}` : '';
+      const lines = [
+        `${verb}${note}`,
+        `条件: PP/h ≥ <b>${minRate}</b> · 剩余 ≥ <b>${minRem}h</b>`,
+        '',
+      ];
+      for (const [idx, m] of top.entries()) {
+        const medal = idx < 3 ? ['🥇', '🥈', '🥉'][idx] : `${idx + 1}.`;
+        const title = htmlEscape(shortTitle(m.title ?? `Market ${m.id}`, 42));
+        const remH = m.endMs ? Math.max(0, (m.endMs - Date.now()) / 3600000) : null;
+        const fmtBig = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(0)}k` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : n.toFixed(0);
+        const ext = remH != null ? ` · ${remH < 24 ? remH.toFixed(1) + 'h' : (remH / 24).toFixed(1) + 'd'}≈${fmtBig(m.rate * remH)}PP` : '';
+        lines.push(`${medal} <code>#${m.id}</code> ${title} — <b>${m.rate.toFixed(0)}/h</b>${ext}`);
+      }
+      if (cmd === '/find') {
+        lines.push('');
+        lines.push('用 /add &lt;id&gt; 单独加 · /scan 同参数 = 全部加入 watchlist');
+      }
+      return lines.join('\n');
     }
 
     case '/digest': {

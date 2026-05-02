@@ -77,6 +77,18 @@ function ensureStubSlot(state, marketId, now) {
 }
 
 async function alert(kind, slot, marketId, message, extra = {}) {
+  // Per-market cross-type cooldown to keep one illiquid market from
+  // emitting wide_spread + reward_zone + empty_book back-to-back. Watch
+  // is exempt (its job is per-tick reporting) and so are recovery
+  // notifications (they're terminal "back to normal" pings).
+  const isWatchOrRecovery = kind === 'watch' || kind.endsWith('_recovered');
+  if (!isWatchOrRecovery) {
+    const sinceAny = Date.now() - (slot.lastAnyAlertAt ?? 0);
+    if (sinceAny < config.marketAlertCooldownMs) {
+      log(`[${marketId}] suppress ${kind} (per-market cooldown ${Math.round(sinceAny / 1000)}s)`);
+      return false;
+    }
+  }
   try {
     await sendTelegramMessage(message, { replyMarkup: alertKeyboard(marketId) });
   } catch (err) {
@@ -91,6 +103,9 @@ async function alert(kind, slot, marketId, message, extra = {}) {
     totalHourlyRate: slot.lastHourlyRate,
     ...extra,
   }).catch(() => {});
+  if (!isWatchOrRecovery) {
+    slot.lastAnyAlertAt = Date.now();
+  }
   return true;
 }
 

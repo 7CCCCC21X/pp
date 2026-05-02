@@ -117,6 +117,12 @@ export const config = {
   // to check /status manually.
   alertRecovery: bool('ALERT_RECOVERY', true),
 
+  // Per-market cross-type alert cooldown. After ANY non-watch alert fires
+  // on a market, suppress further alerts on the same market for this
+  // many ms. Stops the same illiquid market from triggering wide_spread +
+  // reward_zone + empty_book back-to-back.
+  marketAlertCooldownMs: num('MARKET_ALERT_COOLDOWN_MS', 10 * 60 * 1000),
+
   skipNoReward: bool('SKIP_NO_REWARD', true),
 
   // Filters: a market only emits alerts when its top-N book passes ALL set
