@@ -59,7 +59,31 @@ function isTimingActive(t, now) {
 
 export function extractHourlyRate(marketOrRewards) {
   if (marketOrRewards == null) return 0;
-  // If passed a market object, prefer the GraphQL `rewardTimings` array.
+  // PRIMARY: REST `rewards.current.hourlyRate` is Predict.fun's authoritative
+  // current rate (already accounts for time windows). Schedule entries
+  // before/after `current` are past/future periods we shouldn't sum.
+  const cur = marketOrRewards?.rewards?.current?.hourlyRate;
+  if (cur != null) {
+    const n = Number(cur);
+    return Number.isFinite(n) ? n : 0;
+  }
+  // SECONDARY: REST `rewards.schedule[]` — pick the entry whose
+  // [startsAt, endsAt] window contains now.
+  if (Array.isArray(marketOrRewards?.rewards?.schedule)) {
+    const now = Date.now();
+    const active = marketOrRewards.rewards.schedule.find((s) => isTimingActive(s, now));
+    if (active != null) {
+      const n = Number(active.hourlyRate);
+      return Number.isFinite(n) ? n : 0;
+    }
+    // No active schedule entry → 0 (e.g. between rewards or post-event).
+    return 0;
+  }
+  // FALLBACK: GraphQL `rewardTimings` array. Predict.fun's GraphQL doesn't
+  // expose start/end on these entries, so we apply isTimingActive
+  // permissively (treats no-bound entries as active). Sum may overcount
+  // for markets with multiple historical timings — REST is the safer
+  // source when both are present.
   if (Array.isArray(marketOrRewards?.rewardTimings)) {
     const now = Date.now();
     return marketOrRewards.rewardTimings
@@ -68,11 +92,11 @@ export function extractHourlyRate(marketOrRewards) {
       .filter(Number.isFinite)
       .reduce((a, b) => a + b, 0);
   }
-  // If passed a market object with a `rewards` field, recurse into it.
+  // If passed a market object with a generic `rewards` field, recurse.
   if (marketOrRewards && typeof marketOrRewards === 'object' && 'rewards' in marketOrRewards) {
     return sumHourlyRateRecursive(marketOrRewards.rewards);
   }
-  // If passed a raw value, recurse directly.
+  // Raw value.
   return sumHourlyRateRecursive(marketOrRewards);
 }
 
@@ -531,6 +555,24 @@ export async function getMarketRewardSummary(marketId) {
       orderbookKey: String(marketId),
       market: null,
     };
+  }
+  // Merge REST single-market data when available — Predict.fun's REST
+  // exposes `rewards.current.hourlyRate` (the authoritative current
+  // rate) and `tradingStatus`, neither of which GraphQL surfaces.
+  // Cached per-market in getMarketRestById so the extra fetch is O(1)
+  // after the first hit per cache TTL.
+  try {
+    const rest = await getMarketRestById(marketId);
+    if (rest) {
+      const merged = { ...market };
+      if (rest.rewards != null) merged.rewards = rest.rewards;
+      if (rest.tradingStatus != null) merged.tradingStatus = rest.tradingStatus;
+      if (rest.isResolved != null) merged.isResolved = rest.isResolved;
+      if (rest.endsAt != null) merged.endsAt = rest.endsAt;
+      market = merged;
+    }
+  } catch {
+    // Non-fatal — fall back to GraphQL-only data.
   }
   const totalHourlyRate = extractHourlyRate(market);
   const preferredKey = market[config.orderbookKeyField];

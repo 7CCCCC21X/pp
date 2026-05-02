@@ -68,6 +68,53 @@ test('extractHourlyRate: all expired -> 0 (resolved market case)', () => {
   }), 0);
 });
 
+test('extractHourlyRate: REST rewards.current wins over GraphQL rewardTimings', () => {
+  // 76ers vs Celtics case: GraphQL returns [1200, 9000] (sums to 10200)
+  // but REST current.hourlyRate = 1200 is the only one actually paying now.
+  assert.equal(extractHourlyRate({
+    rewards: {
+      current: { hourlyRate: 1200, startsAt: '2026-01-01T00:00:00Z', endsAt: '2030-01-01T00:00:00Z' },
+      schedule: [
+        { hourlyRate: 1200, startsAt: '2026-01-01T00:00:00Z', endsAt: '2030-01-01T00:00:00Z' },
+        { hourlyRate: 9000, startsAt: '2030-01-01T00:00:00Z', endsAt: '2031-01-01T00:00:00Z' },
+      ],
+    },
+    rewardTimings: [{ hourlyRate: 1200 }, { hourlyRate: 9000 }],
+  }), 1200);
+});
+
+test('extractHourlyRate: rewards.current null with active schedule entry', () => {
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  const past = new Date(Date.now() - 3600_000).toISOString();
+  assert.equal(extractHourlyRate({
+    rewards: {
+      current: null,
+      schedule: [
+        { hourlyRate: 1000, startsAt: past, endsAt: future },  // active
+        { hourlyRate: 5000, startsAt: future, endsAt: future },  // future
+      ],
+    },
+  }), 1000);
+});
+
+test('extractHourlyRate: schedule with no active entry -> 0', () => {
+  const past = new Date(Date.now() - 3600_000).toISOString();
+  assert.equal(extractHourlyRate({
+    rewards: {
+      current: null,
+      schedule: [
+        { hourlyRate: 1000, startsAt: past, endsAt: past },
+      ],
+    },
+  }), 0);
+});
+
+test('extractHourlyRate: falls back to GraphQL when REST rewards absent', () => {
+  assert.equal(extractHourlyRate({
+    rewardTimings: [{ hourlyRate: 500 }],
+  }), 500);
+});
+
 test('marketEndMs accepts ISO string', () => {
   const iso = '2030-01-01T00:00:00.000Z';
   const ts = Date.parse(iso);
