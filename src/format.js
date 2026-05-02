@@ -15,9 +15,29 @@ export function fmtElapsed(ms) {
   return `${m} 分`;
 }
 
+// Mirrors predict.fun's title -> URL slug derivation: lowercase, strip
+// diacritics + smart quotes, collapse non-alphanumerics into single dashes.
+// Used by marketLink so the alert title actually opens the market page
+// (predict.fun routes by slug, not numeric id).
+export function slugify(s) {
+  return String(s ?? '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[‘’'"`]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 export function marketLink(marketId, title) {
   const safeTitle = title ? htmlEscape(title) : `Market ${marketId}`;
-  return `<a href="https://predict.fun/market/${encodeURIComponent(marketId)}">${safeTitle}</a>`;
+  const slug = title ? slugify(title) : '';
+  // predict.fun uses /market/<slug>. Fall back to id-based URL if we
+  // haven't seen the title yet (the page should still resolve).
+  const url = slug
+    ? `https://predict.fun/market/${slug}`
+    : `https://predict.fun/market/${encodeURIComponent(marketId)}`;
+  return `<a href="${url}">${safeTitle}</a>`;
 }
 
 // Reward-zone evaluation. Predict.fun gives PP rewards to limit orders

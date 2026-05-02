@@ -8,6 +8,7 @@ import {
   midOf,
   spreadOf,
   rewardZoneStatus,
+  slugify,
 } from '../src/format.js';
 
 test('fmtSide handles null', () => {
@@ -32,10 +33,26 @@ test('fmtElapsed clamps negative', () => {
   assert.equal(fmtElapsed(-1000), '0 分');
 });
 
-test('marketLink escapes title', () => {
-  const link = marketLink('123', '<bad>');
+test('marketLink uses slug from title', () => {
+  const link = marketLink('123', 'BNB up or down (May 2 2026 2am ET)');
+  assert.match(link, /href="https:\/\/predict\.fun\/market\/bnb-up-or-down-may-2-2026-2am-et"/);
+});
+
+test('marketLink falls back to id when no title', () => {
+  const link = marketLink('123', null);
   assert.match(link, /href="https:\/\/predict\.fun\/market\/123"/);
+  assert.match(link, /Market 123/);
+});
+
+test('marketLink escapes title text', () => {
+  const link = marketLink('123', '<bad>');
   assert.match(link, /&lt;bad&gt;/);
+});
+
+test('slugify handles diacritics and quotes', () => {
+  assert.equal(slugify("Bayer 04 Leverkusen"), 'bayer-04-leverkusen');
+  assert.equal(slugify("Pistons vs. Magic"), 'pistons-vs-magic');
+  assert.equal(slugify("Match Winner — 76ers vs Celtics"), 'match-winner-76ers-vs-celtics');
 });
 
 test('midOf and spreadOf', () => {
