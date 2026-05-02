@@ -63,6 +63,17 @@ export async function fetchJson(url, {
         throw err;
       }
     } catch (err) {
+      // Friendlier message when a header/URL contains a fullwidth char.
+      if (/cannot convert argument to a bytestring/i.test(err.message)) {
+        const m = err.message.match(/value of (\d+)/);
+        const code = m ? Number(m[1]) : 0;
+        const ch = code ? String.fromCodePoint(code) : '?';
+        const friendly = new Error(
+          `Request blocked: a header or URL contains non-ASCII character "${ch}" (U+${code.toString(16).toUpperCase().padStart(4, '0')}). Check PREDICT_API_KEY / TELEGRAM_BOT_TOKEN for fullwidth Chinese punctuation. URL: ${url}`,
+        );
+        friendly.cause = err;
+        throw friendly;
+      }
       lastErr = err;
       // External cancellation (e.g. SIGINT) -> don't retry
       if (externalSignal?.aborted) break;

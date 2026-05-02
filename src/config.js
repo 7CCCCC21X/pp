@@ -171,11 +171,35 @@ export const config = {
   orderbookTimeoutMs: num('ORDERBOOK_TIMEOUT_MS', 10_000),
 };
 
+// HTTP headers + URLs are ASCII-only. If the user pasted a token with
+// fullwidth Chinese punctuation (e.g. （ instead of ( ) the resulting
+// fetch throws a cryptic "Cannot convert argument to a ByteString" per
+// request. Catch it at startup with a clear message instead.
+function ensureAsciiOnly(name, value) {
+  if (!value) return null;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code > 127) {
+      const ch = value[i];
+      return `${name} contains non-ASCII character "${ch}" (U+${code.toString(16).toUpperCase().padStart(4, '0')}) at position ${i}. Most likely a fullwidth Chinese punctuation - re-paste the value from the original source (not from a chat app).`;
+    }
+  }
+  return null;
+}
+
 export function validateConfig() {
   const errors = [];
   const warnings = [];
   if (!config.telegramBotToken) errors.push('TELEGRAM_BOT_TOKEN is required');
   if (!config.telegramChatId) errors.push('TELEGRAM_CHAT_ID is required');
+  for (const [name, value] of [
+    ['TELEGRAM_BOT_TOKEN', config.telegramBotToken],
+    ['TELEGRAM_CHAT_ID', String(config.telegramChatId ?? '')],
+    ['PREDICT_API_KEY', config.predictApiKey],
+  ]) {
+    const issue = ensureAsciiOnly(name, value);
+    if (issue) errors.push(issue);
+  }
   if (!config.marketIds.length && !config.autodiscover) {
     // Soft warning — bot can still serve /add and other commands.
     warnings.push('No MARKET_IDS and AUTODISCOVER=false. Bot will idle until you /add a market or set AUTODISCOVER=true.');
