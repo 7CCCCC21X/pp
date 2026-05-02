@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
-import { loadState, saveState, activeMarketIds } from './state.js';
+import { loadState, saveState, activeMarketIds, isSnoozed } from './state.js';
 import { checkMarket } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
@@ -102,7 +102,7 @@ async function tick(state) {
   await maybeDiscover(state);
   const ids = activeMarketIds(state);
   for (const id of ids) {
-    const isPaused = state.pausedIds.includes(id);
+    const isPaused = state.pausedIds.includes(id) || isSnoozed(state, id);
     try {
       await checkMarket(id, state, { isPaused });
     } catch (err) {

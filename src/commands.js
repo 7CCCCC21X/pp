@@ -20,6 +20,11 @@ const COMMAND_MENU = [
   { command: 'menu', description: '快捷菜单' },
   { command: 'status', description: '所有监控市场概览' },
   { command: 'list', description: '简要列出活跃市场' },
+  { command: 'top', description: '当前 PP/h 最高的市场' },
+  { command: 'gaps', description: '奖励区有空缺的市场' },
+  { command: 'wide', description: '当前价差最大的市场' },
+  { command: 'empty', description: '当前单边/空簿的市场' },
+  { command: 'opportunities', description: '机会评分排序（PP × 缺口 × 时间）' },
   { command: 'probe', description: '查看单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'unwatch', description: '取消密集追踪' },
@@ -27,6 +32,9 @@ const COMMAND_MENU = [
   { command: 'remove', description: '永久移除' },
   { command: 'pause', description: '静音指定市场' },
   { command: 'resume', description: '恢复监控' },
+  { command: 'snooze', description: '临时静音 (用法: /snooze <id> 1h)' },
+  { command: 'setmarket', description: '设置市场专属阈值 (/setmarket <id> staleHours 2)' },
+  { command: 'clearmarket', description: '清除市场覆盖 (/clearmarket <id>)' },
   { command: 'discover', description: '立即触发自动发现' },
   { command: 'digest', description: '发送 24 小时摘要' },
   { command: 'filter', description: '查看当前过滤器' },
@@ -42,7 +50,13 @@ function menuKeyboard() {
     inline_keyboard: [
       [
         { text: '状态', callback_data: '/status' },
-        { text: '列表', callback_data: '/list' },
+        { text: 'PP/h 榜', callback_data: '/top' },
+        { text: '机会榜', callback_data: '/opportunities' },
+      ],
+      [
+        { text: '空缺', callback_data: '/gaps' },
+        { text: '阔差', callback_data: '/wide' },
+        { text: '空簿', callback_data: '/empty' },
       ],
       [
         { text: '立即发现', callback_data: '/discover' },
@@ -74,13 +88,21 @@ const HELP = [
   '/menu — 快捷按钮菜单',
   '/status — 概览所有监控市场',
   '/list — 简要列出活跃市场',
-  '/probe &lt;id&gt; — 单个市场快照（订单簿 + 奖励区）',
-  '/watch &lt;id&gt; — 密集追踪（每次买1卖1变动就提醒）',
+  '/top — PP/h 最高的市场',
+  '/gaps — 奖励区有空缺（可挂单赚 PP）的市场',
+  '/wide — 当前价差最大的市场',
+  '/empty — 当前单边/空簿的市场',
+  '/opportunities — 机会评分排序',
+  '/probe &lt;id&gt; — 单个市场快照',
+  '/watch &lt;id&gt; — 密集追踪（每次变动都提醒）',
   '/unwatch &lt;id|all&gt; — 取消密集追踪',
   '/add &lt;id&gt; — 加入监控',
   '/remove &lt;id&gt; — 永久移除（含自动发现）',
   '/pause &lt;id&gt; — 静音该市场提醒',
   '/resume &lt;id&gt; — 取消静音',
+  '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 临时静音',
+  '/setmarket &lt;id&gt; &lt;key&gt; &lt;value&gt; — 市场专属阈值',
+  '/clearmarket &lt;id&gt; — 清除覆盖',
   '/discover — 立即触发一次自动发现',
   '/digest — 立即发送 24 小时摘要',
   '',
@@ -96,6 +118,55 @@ const HELP = [
 
 function uniq(arr) {
   return [...new Set(arr.map(String))];
+}
+
+// Parse a duration like "30m", "2h", "1d" into milliseconds.
+function parseDuration(s) {
+  if (!s) return null;
+  const m = String(s).trim().match(/^(\d+(?:\.\d+)?)\s*([smhd])?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? 'm').toLowerCase();
+  const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit];
+  if (!mult) return null;
+  return n * mult;
+}
+
+// Snapshot helpers — these read from state.markets which is updated each
+// tick, so list/* commands return whatever the last poll captured.
+function listMarketsSnapshot(state) {
+  const ids = activeMarketIds(state);
+  return ids
+    .map((id) => ({ id, slot: state.markets[id] }))
+    .filter((x) => !!x.slot);
+}
+
+function fmtMarketLine(id, slot, extra) {
+  const title = slot.title ? slot.title.slice(0, 50) : `Market ${id}`;
+  const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
+  const e = extra ? ` · ${extra}` : '';
+  return `#${id} ${title} — ${rate}/h${e}`;
+}
+
+// Opportunity score = PP/h × zone-gap-multiplier × spread-friendliness.
+// Higher = better target to make markets on.
+function opportunityScore(slot) {
+  const rate = slot.lastHourlyRate ?? 0;
+  if (!rate) return 0;
+  const z = slot.zoneStatus;
+  let mult = 1;
+  if (z) {
+    if (!z.bidActivated) mult += 1;
+    if (!z.askActivated) mult += 1;
+  }
+  // Tighter spread = more attractive (closer to picking up rewards).
+  const bid = slot.baseline?.bidPrice;
+  const ask = slot.baseline?.askPrice;
+  if (Number.isFinite(bid) && Number.isFinite(ask)) {
+    const spread = ask - bid;
+    if (spread > 0 && spread < 0.5) mult *= (1 + (0.5 - spread));
+  }
+  return rate * mult;
 }
 
 async function buildProbeMessage(marketId) {
@@ -241,6 +312,100 @@ async function handle(text, state, ctx) {
     case '/digest': {
       ctx.requestDigest();
       return '已触发 24 小时摘要。';
+    }
+
+    case '/top': {
+      const snap = listMarketsSnapshot(state);
+      snap.sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
+      const top = snap.slice(0, 20);
+      if (!top.length) return '暂无数据，等待第一轮抓取。';
+      return [`<b>PP/h Top ${top.length}</b>`, ...top.map(({ id, slot }) => htmlEscape(fmtMarketLine(id, slot)))].join('\n');
+    }
+
+    case '/gaps': {
+      const snap = listMarketsSnapshot(state)
+        .filter(({ slot }) => slot.zoneStatus && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated));
+      snap.sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
+      const top = snap.slice(0, 20);
+      if (!top.length) return '当前所有监控市场都在奖励区内。';
+      return [`<b>奖励区有空缺 ${snap.length} 个</b>`, ...top.map(({ id, slot }) => {
+        const sides = [];
+        if (!slot.zoneStatus.bidActivated) sides.push('买✗');
+        if (!slot.zoneStatus.askActivated) sides.push('卖✗');
+        return htmlEscape(fmtMarketLine(id, slot, sides.join(',')));
+      })].join('\n');
+    }
+
+    case '/wide': {
+      const snap = listMarketsSnapshot(state)
+        .map(({ id, slot }) => {
+          const bid = slot.baseline?.bidPrice;
+          const ask = slot.baseline?.askPrice;
+          const spread = (Number.isFinite(bid) && Number.isFinite(ask)) ? ask - bid : null;
+          return { id, slot, spread };
+        })
+        .filter((x) => Number.isFinite(x.spread));
+      snap.sort((a, b) => b.spread - a.spread);
+      const top = snap.slice(0, 20);
+      if (!top.length) return '暂无价差数据。';
+      return [`<b>价差最大的 ${top.length} 个</b>`, ...top.map(({ id, slot, spread }) =>
+        htmlEscape(fmtMarketLine(id, slot, `spread ${(spread * 100).toFixed(2)}¢`)))].join('\n');
+    }
+
+    case '/empty': {
+      const snap = listMarketsSnapshot(state)
+        .filter(({ slot }) => slot.baseline?.bidPrice == null || slot.baseline?.askPrice == null);
+      if (!snap.length) return '当前没有空簿/单边市场。';
+      return [`<b>单边/空簿 ${snap.length} 个</b>`, ...snap.slice(0, 20).map(({ id, slot }) => {
+        const sides = [];
+        if (slot.baseline?.bidPrice == null) sides.push('无买');
+        if (slot.baseline?.askPrice == null) sides.push('无卖');
+        return htmlEscape(fmtMarketLine(id, slot, sides.join(',')));
+      })].join('\n');
+    }
+
+    case '/opportunities':
+    case '/opp': {
+      const snap = listMarketsSnapshot(state)
+        .map(({ id, slot }) => ({ id, slot, score: opportunityScore(slot) }))
+        .filter((x) => x.score > 0);
+      snap.sort((a, b) => b.score - a.score);
+      const top = snap.slice(0, 20);
+      if (!top.length) return '暂无机会数据。';
+      return [`<b>机会评分 Top ${top.length}</b> (PP × 缺口 × 价差)`, ...top.map(({ id, slot, score }) =>
+        htmlEscape(fmtMarketLine(id, slot, `score ${score.toFixed(0)}`)))].join('\n');
+    }
+
+    case '/snooze': {
+      const [id, durStr] = arg.split(/\s+/);
+      if (!id || !durStr) return '用法：/snooze &lt;id&gt; &lt;duration&gt;\n例：/snooze 257916 1h, /snooze 257916 30m';
+      const ms = parseDuration(durStr);
+      if (!ms) return `无法解析时长 "${htmlEscape(durStr)}"，支持 30m / 2h / 1d`;
+      state.snoozes = { ...(state.snoozes ?? {}), [id]: Date.now() + ms };
+      await ctx.persist();
+      return `已临时静音 #${htmlEscape(id)} ${htmlEscape(durStr)}（到 ${new Date(state.snoozes[id]).toISOString()}）`;
+    }
+
+    case '/setmarket': {
+      const [id, key, value] = arg.split(/\s+/);
+      if (!id || !key || value == null || value === '') {
+        return '用法：/setmarket &lt;id&gt; &lt;key&gt; &lt;value&gt;\n可用 key: staleHours, maxSpread, midJumpThreshold, rewardZoneMaxDistance, rewardZoneMinSize';
+      }
+      const allowed = new Set(['staleHours', 'maxSpread', 'midJumpThreshold', 'rewardZoneMaxDistance', 'rewardZoneMinSize']);
+      if (!allowed.has(key)) return `未知 key "${htmlEscape(key)}"，可用: ${[...allowed].join(', ')}`;
+      const v = Number(value);
+      if (!Number.isFinite(v) || v <= 0) return `值必须是正数，收到 "${htmlEscape(value)}"`;
+      state.overrides = { ...(state.overrides ?? {}) };
+      state.overrides[id] = { ...(state.overrides[id] ?? {}), [key]: v };
+      await ctx.persist();
+      return `已为 #${htmlEscape(id)} 设置 ${htmlEscape(key)}=${v}`;
+    }
+
+    case '/clearmarket': {
+      if (!arg) return '用法：/clearmarket &lt;id&gt;';
+      if (state.overrides) delete state.overrides[arg];
+      await ctx.persist();
+      return `已清除 #${htmlEscape(arg)} 的所有覆盖`;
     }
 
     case '/filter': {

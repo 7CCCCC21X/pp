@@ -9,6 +9,8 @@ function emptyState() {
     removedIds: [],
     autoIds: [],
     watchedIds: [],
+    snoozes: {},          // marketId -> unix ms when snooze ends
+    overrides: {},        // marketId -> partial config override
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -32,6 +34,8 @@ export async function loadState() {
       removedIds: json.removedIds ?? [],
       autoIds: json.autoIds ?? [],
       watchedIds: json.watchedIds ?? [],
+      snoozes: json.snoozes ?? {},
+      overrides: json.overrides ?? {},
       filters: json.filters ?? {},
     };
   } catch (err) {
@@ -44,6 +48,25 @@ export async function saveState(state) {
   const tmp = `${config.stateFile}.tmp`;
   await fs.writeFile(tmp, JSON.stringify(state, null, 2));
   await fs.rename(tmp, config.stateFile);
+}
+
+// Returns true if the market is currently snoozed (paused with an end time
+// that hasn't elapsed). Cleans up the entry if it has expired.
+export function isSnoozed(state, marketId) {
+  const until = state.snoozes?.[marketId];
+  if (!until) return false;
+  if (Date.now() >= until) {
+    delete state.snoozes[marketId];
+    return false;
+  }
+  return true;
+}
+
+// Per-market threshold override. Returns the effective value for a knob,
+// preferring the per-market override if set, otherwise the global default.
+export function effectiveOverride(state, marketId, key, fallback) {
+  const v = state.overrides?.[marketId]?.[key];
+  return v != null && Number.isFinite(v) ? v : fallback;
 }
 
 export function activeMarketIds(state) {

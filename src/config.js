@@ -112,6 +112,11 @@ export const config = {
   rewardZoneMinSize: num('REWARD_ZONE_MIN_SIZE', 100),
   rewardZoneMinMinutes: num('REWARD_ZONE_MIN_MINUTES', 15),
 
+  // Recovery alerts: when a previously-alerted condition clears, send a
+  // short "back to normal" message so you know it resolved without having
+  // to check /status manually.
+  alertRecovery: bool('ALERT_RECOVERY', true),
+
   skipNoReward: bool('SKIP_NO_REWARD', true),
 
   // Filters: a market only emits alerts when its top-N book passes ALL set

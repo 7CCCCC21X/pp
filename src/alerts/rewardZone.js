@@ -7,9 +7,22 @@ export async function detectRewardZone(ctx) {
   if (!config.alertRewardZone || isPaused || filtered || totalHourlyRate <= 0) return;
   const unstaffed = !zone.bidActivated || !zone.askActivated;
   if (!unstaffed) {
+    if (config.alertRecovery && slot.rewardZoneAlertedAt > 0 && !slot.rewardZoneRecovered) {
+      const msg = [
+        `<b>奖励区已重新激活</b>`,
+        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
+        `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
+        `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
+        `规则: 离 mid ≤ ±${(zone.maxDistance * 100).toFixed(1)}¢，量 ≥ ${zone.minSize}`,
+      ].join('\n');
+      if (await alert('reward_zone_recovered', slot, marketId, msg, {})) {
+        slot.rewardZoneRecovered = true;
+      }
+    }
     slot.rewardZoneSince = null;
     return;
   }
+  slot.rewardZoneRecovered = false;
   if (!slot.rewardZoneSince) slot.rewardZoneSince = now;
   const elapsed = now - slot.rewardZoneSince;
   const need = config.rewardZoneMinMinutes * 60 * 1000;

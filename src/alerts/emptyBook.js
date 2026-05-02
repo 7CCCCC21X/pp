@@ -7,9 +7,21 @@ export async function detectEmptyBook(ctx) {
   if (!config.alertEmptyBook || isPaused || filtered) return;
   const empty = orderbook.bestBid == null || orderbook.bestAsk == null;
   if (!empty) {
+    if (config.alertRecovery && slot.emptyBookAlertedAt > 0 && !slot.emptyBookRecovered) {
+      const msg = [
+        `<b>订单簿恢复双边</b>`,
+        `${marketLink(marketId, slot.title)} (#${htmlEscape(marketId)})`,
+        `买1: ${htmlEscape(fmtSide(orderbook.bestBid))}`,
+        `卖1: ${htmlEscape(fmtSide(orderbook.bestAsk))}`,
+      ].join('\n');
+      if (await alert('empty_book_recovered', slot, marketId, msg, {})) {
+        slot.emptyBookRecovered = true;
+      }
+    }
     slot.emptyBookSince = null;
     return;
   }
+  slot.emptyBookRecovered = false;
   if (!slot.emptyBookSince) slot.emptyBookSince = now;
   const elapsed = now - slot.emptyBookSince;
   const need = config.emptyBookMinMinutes * 60 * 1000;
