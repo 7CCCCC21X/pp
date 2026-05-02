@@ -203,13 +203,29 @@ function extractMarketsArray(data) {
   return [];
 }
 
+function slugify(s) {
+  return String(s ?? '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '') // strip combining diacritics
+    .replace(/[‘’'"`]/g, '') // strip smart/straight quotes
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function looksLikeMatch(market, slug) {
+  if (!market) return false;
+  if (market.slug === slug) return true;
+  const titleSlug = slugify(market.title);
+  const questionSlug = slugify(market.question);
+  return titleSlug === slug || questionSlug === slug;
+}
+
 async function lookupBySlugREST(slug) {
-  // 1. Try direct REST paths
+  // 1. A couple of direct paths (kept as best-effort; they 400/404 today
+  //    but might exist on other deployments).
   const directPaths = [
-    `/markets/${encodeURIComponent(slug)}`,
     `/markets/by-slug/${encodeURIComponent(slug)}`,
-    `/markets?slug=${encodeURIComponent(slug)}`,
-    `/markets?slug=${encodeURIComponent(slug)}&first=10`,
   ];
   for (const p of directPaths) {
     const url = `${config.restUrl}${p}`;
@@ -219,23 +235,20 @@ async function lookupBySlugREST(slug) {
       if (!res.ok) continue;
       const json = await res.json();
       const data = json?.data ?? json;
-      console.log(`     keys=${Object.keys(data ?? {}).join(',')}`);
       const arr = extractMarketsArray(data);
-      console.log(`     extracted ${arr.length} market(s)`);
-      if (!arr.length) continue;
-      const exact = arr.find((x) => x?.slug === slug);
-      if (exact) return exact;
-      // Filter endpoints with ?slug= should only return 1 -> trust it
-      if (arr.length === 1 && arr[0]?.id) return arr[0];
+      const m = arr.find((x) => looksLikeMatch(x, slug)) ?? (arr.length === 1 ? arr[0] : null);
+      if (m) return m;
     } catch (err) {
       console.log(`  ERR  ${url}: ${err.message}`);
     }
   }
 
-  // 2. Paginated scan fallback
-  console.log('  scanning paginated /markets ...');
+  // 2. Paginated scan with slugify(title) matching. Predict.fun does not
+  //    expose a slug field on Market; the URL slug is derived from title.
+  console.log('  scanning paginated /markets and slugifying titles ...');
   let cursor = null;
-  for (let page = 0; page < 40; page++) {
+  let scanned = 0;
+  for (let page = 0; page < 80; page++) {
     const params = new URLSearchParams({ first: '50' });
     if (cursor) params.set('after', cursor);
     const url = `${config.restUrl}/markets?${params}`;
@@ -247,12 +260,15 @@ async function lookupBySlugREST(slug) {
     const json = await res.json();
     const data = json?.data ?? json;
     const arr = extractMarketsArray(data);
+    scanned += arr.length;
     if (page === 0) {
-      console.log(`     page 0 sample keys: ${arr[0] ? Object.keys(arr[0]).join(',') : '(empty)'}`);
+      const sample = arr[0];
+      if (sample) console.log(`     sample keys: ${Object.keys(sample).join(',')}`);
+      if (sample?.title) console.log(`     sample title->slug: "${sample.title}" -> "${slugify(sample.title)}"`);
     }
     for (const m of arr) {
-      if (m?.slug === slug) {
-        console.log(`  found on page ${page}`);
+      if (looksLikeMatch(m, slug)) {
+        console.log(`  found on page ${page} after ${scanned} markets (matched on ${m.slug ? 'slug' : slugify(m.title) === slug ? 'title' : 'question'})`);
         return m;
       }
     }
@@ -260,6 +276,7 @@ async function lookupBySlugREST(slug) {
     cursor = pageInfo?.endCursor ?? data?.nextCursor ?? null;
     if (!cursor || pageInfo?.hasNextPage === false) break;
   }
+  console.log(`  scanned ${scanned} markets, no match`);
   return null;
 }
 
