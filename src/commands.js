@@ -18,33 +18,30 @@ const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
 
 // Commands shown in Telegram's blue "/" menu next to the input box.
+// Main menu — kept tight (~18 commands) so the "/" autocomplete in
+// Telegram is scannable. Advanced commands (setfilter / setmarket /
+// scan / opportunities / list) still work but aren't surfaced here;
+// /help lists everything.
 const COMMAND_MENU = [
   { command: 'menu', description: '快捷菜单' },
-  { command: 'status', description: '所有监控市场概览' },
-  { command: 'list', description: '简要列出活跃市场' },
-  { command: 'top', description: '当前 PP/h 最高的市场' },
-  { command: 'gaps', description: '奖励区有空缺的市场' },
+  { command: 'status', description: '监控面板（市场数 + 总 PP/h + 空缺数）' },
+  { command: 'find', description: '自定义筛选查询（卡片向导）' },
+  { command: 'top', description: '当前所有有 PP 的市场（按 PP/h 排序）' },
+  { command: 'gaps', description: '奖励区可激活（PP 待捡）' },
+  { command: 'thin', description: '薄盘市场（买1+卖1 总额 < 阈值）' },
   { command: 'wide', description: '当前价差最大的市场' },
   { command: 'empty', description: '当前单边/空簿的市场' },
-  { command: 'opportunities', description: '机会评分排序（PP × 缺口 × 时间）' },
-  { command: 'probe', description: '查看单个市场快照 (用法: /probe <id>)' },
+  { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'unwatch', description: '取消密集追踪' },
-  { command: 'add', description: '加入监控 (用法: /add <id>)' },
+  { command: 'add', description: '加入监控 (用法: /add <id|slug|url>)' },
   { command: 'remove', description: '永久移除' },
   { command: 'pause', description: '静音指定市场' },
   { command: 'resume', description: '恢复监控' },
   { command: 'snooze', description: '临时静音 (用法: /snooze <id> 1h)' },
-  { command: 'setmarket', description: '设置市场专属阈值 (/setmarket <id> staleHours 2)' },
-  { command: 'clearmarket', description: '清除市场覆盖 (/clearmarket <id>)' },
   { command: 'discover', description: '立即触发自动发现' },
-  { command: 'find', description: '查询符合筛选的市场 (用法: /find [minRate] [minRem])' },
-  { command: 'scan', description: '查询并替换 watchlist (参数同 /find)' },
   { command: 'digest', description: '发送 24 小时摘要' },
-  { command: 'filter', description: '查看当前过滤器' },
-  { command: 'setfilter', description: '设置过滤器 (用法: /setfilter name value)' },
-  { command: 'clearfilter', description: '清除过滤器' },
-  { command: 'help', description: '显示帮助' },
+  { command: 'help', description: '显示帮助（含进阶命令）' },
 ];
 
 // Inline keyboard for /menu — quick-tap buttons that issue commands via
@@ -53,22 +50,26 @@ function menuKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: '状态', callback_data: '/status' },
-        { text: 'PP/h 榜', callback_data: '/top' },
-        { text: '机会榜', callback_data: '/opportunities' },
+        { text: '📡 状态', callback_data: '/status' },
+        { text: '🔥 PP/h 榜', callback_data: '/top' },
       ],
       [
-        { text: '空缺', callback_data: '/gaps' },
-        { text: '阔差', callback_data: '/wide' },
-        { text: '空簿', callback_data: '/empty' },
+        { text: '🎯 空缺榜', callback_data: '/gaps' },
+        { text: '💧 薄盘榜', callback_data: '/thin' },
       ],
       [
-        { text: '立即发现', callback_data: '/discover' },
-        { text: '24h 摘要', callback_data: '/digest' },
+        { text: '📏 价差榜', callback_data: '/wide' },
+        { text: '🌊 空簿榜', callback_data: '/empty' },
       ],
       [
-        { text: '过滤器', callback_data: '/filter' },
-        { text: '帮助', callback_data: '/help' },
+        { text: '🔍 自定义筛选', callback_data: '/find' },
+      ],
+      [
+        { text: '🔄 立即发现', callback_data: '/discover' },
+        { text: '📈 24h 摘要', callback_data: '/digest' },
+      ],
+      [
+        { text: '❓ 帮助', callback_data: '/help' },
       ],
     ],
   };
@@ -251,36 +252,41 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 }
 
 const HELP = [
-  '<b>命令列表</b>',
+  '<b>核心</b>',
   '/menu — 快捷按钮菜单',
-  '/status — 概览所有监控市场',
-  '/list — 简要列出活跃市场',
-  '/top — PP/h 最高的市场',
-  '/gaps — 奖励区有空缺（可挂单赚 PP）的市场',
-  '/wide — 当前价差最大的市场',
-  '/empty — 当前单边/空簿的市场',
-  '/opportunities — 机会评分排序',
+  '/status — 监控面板（市场数 + 总 PP/h + 空缺数）',
+  '/find — 自定义筛选（卡片向导）',
   '/probe &lt;id&gt; — 单个市场快照',
-  '/watch &lt;id&gt; — 密集追踪（每次变动都提醒）',
-  '/unwatch &lt;id|all&gt; — 取消密集追踪',
-  '/add &lt;id&gt; — 加入监控',
-  '/remove &lt;id&gt; — 永久移除（含自动发现）',
-  '/pause &lt;id&gt; — 静音该市场提醒',
+  '',
+  '<b>排行榜</b>（支持翻页）',
+  '/top — 所有有 PP 的市场（按 PP/h 排序）',
+  '/gaps — 奖励区可激活（PP 待捡）',
+  '/thin — 薄盘市场（买1+卖1 总额 &lt; 阈值）',
+  '/wide — 当前价差最大',
+  '/empty — 单边/空簿',
+  '',
+  '<b>市场管理</b>',
+  '/add &lt;id|slug|url&gt; — 加入监控',
+  '/remove &lt;id&gt; — 永久移除',
+  '/pause &lt;id&gt; — 静音',
   '/resume &lt;id&gt; — 取消静音',
   '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 临时静音',
+  '/watch &lt;id&gt; — 密集追踪',
+  '/unwatch &lt;id|all&gt; — 取消密集追踪',
+  '',
+  '<b>批量 / 维护</b>',
+  '/discover — 立即触发自动发现',
+  '/digest — 立即发送 24h 摘要',
+  '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
+  '',
+  '<b>进阶</b>',
+  '/opportunities — 机会评分（实验）',
   '/setmarket &lt;id&gt; &lt;key&gt; &lt;value&gt; — 市场专属阈值',
   '/clearmarket &lt;id&gt; — 清除覆盖',
-  '/discover — 立即触发一次自动发现',
-  '/find &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选查询（不改 watchlist）',
-  '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
-  '/digest — 立即发送 24 小时摘要',
-  '',
-  '<b>过滤器</b>（只有满足条件的市场才会触发提醒，支持 1-3 档）',
   '/filter — 查看当前过滤器',
-  '/setfilter &lt;name&gt; &lt;value&gt; — 设置（如 /setfilter minBid1Price 0.05）',
-  '/clearfilter &lt;name|all&gt; — 清除单项或全部覆盖',
-  '字段命名: min/max + Bid/Ask + 1/2/3 + Price/Size',
-  '示例: minBid1Price, maxBid1Price, minBid1Size, minAsk2Price ...',
+  '/setfilter &lt;name&gt; &lt;value&gt; — 设置过滤器（如 minBid1Price 0.05）',
+  '/clearfilter &lt;name|all&gt; — 清除过滤器',
+  '过滤器字段: min/max + Bid/Ask + 1/2/3 + Price/Size',
   '',
   '/help — 本帮助',
 ].join('\n');
@@ -546,6 +552,27 @@ function renderListPage(cmd, page, state) {
         return sides.join(',');
       };
       break;
+    case 'thin': {
+      // Markets where best-bid + best-ask top-of-book total $ value is
+      // ≤ LOW_DEPTH_THRESHOLD. Sort thinnest first so the lowest-effort
+      // opportunities float to the top of the list.
+      const threshold = config.lowDepthThreshold;
+      rows = allRows
+        .filter(({ slot }) => !slot.lastError && slot.baseline
+          && Number.isFinite(slot.baseline.bidPrice) && Number.isFinite(slot.baseline.bidSize)
+          && Number.isFinite(slot.baseline.askPrice) && Number.isFinite(slot.baseline.askSize))
+        .map(({ id, slot }) => {
+          const bidVal = slot.baseline.bidPrice * slot.baseline.bidSize;
+          const askVal = slot.baseline.askPrice * slot.baseline.askSize;
+          const total = bidVal + askVal;
+          return { id, slot, total, bidVal, askVal };
+        })
+        .filter((r) => r.total <= threshold)
+        .sort((a, b) => a.total - b.total);
+      header = `<b>💧 薄盘 (买1+卖1 总额 ≤ $${threshold})</b>`;
+      extraFn = (_slot, row) => `$${row.total.toFixed(0)} (买$${row.bidVal.toFixed(0)} + 卖$${row.askVal.toFixed(0)})`;
+      break;
+    }
     case 'opp':
     case 'opportunities':
       rows = allRows
@@ -710,12 +737,6 @@ async function handle(text, state, ctx) {
     case '/status':
       return await buildStatusDashboard(state);
 
-    case '/list': {
-      const ids = activeMarketIds(state);
-      if (!ids.length) return '空。';
-      return ids.map((id) => `#${id}${state.pausedIds.includes(id) ? ' (paused)' : ''}`).join('\n');
-    }
-
     case '/add': {
       if (!arg) return '用法：/add &lt;marketId | slug | URL&gt;\n例：/add 241373\n或：/add will-jesus-christ-return-before-2027\n或：/add https://predict.fun/zh-cn/market/...';
       const resolved = await resolveMarketInput(arg);
@@ -784,6 +805,7 @@ async function handle(text, state, ctx) {
 
     case '/top':
     case '/gaps':
+    case '/thin':
     case '/wide':
     case '/empty':
     case '/opportunities':

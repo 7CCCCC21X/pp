@@ -123,6 +123,11 @@ export const config = {
   // reward_zone + empty_book back-to-back.
   marketAlertCooldownMs: num('MARKET_ALERT_COOLDOWN_MS', 10 * 60 * 1000),
 
+  // /thin command: list markets where best bid + best ask total $ value
+  // is at or below this threshold. "Thin" = nobody has serious money on
+  // top of book, easy to dominate by placing your own orders. USD.
+  lowDepthThreshold: num('LOW_DEPTH_THRESHOLD', 100),
+
   skipNoReward: bool('SKIP_NO_REWARD', true),
 
   // Filters: a market only emits alerts when its top-N book passes ALL set
