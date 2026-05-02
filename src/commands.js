@@ -7,8 +7,9 @@ import {
   answerCallbackQuery,
 } from './telegram.js';
 import { activeMarketIds } from './state.js';
-import { fmtElapsed } from './format.js';
+import { fmtElapsed, rewardZoneStatus, midOf, spreadOf } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
+import { getMarketRewardSummary, getOrderbook } from './predict.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
@@ -18,6 +19,9 @@ const COMMAND_MENU = [
   { command: 'menu', description: '快捷菜单' },
   { command: 'status', description: '所有监控市场概览' },
   { command: 'list', description: '简要列出活跃市场' },
+  { command: 'probe', description: '查看单个市场快照 (用法: /probe <id>)' },
+  { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
+  { command: 'unwatch', description: '取消密集追踪' },
   { command: 'add', description: '加入监控 (用法: /add <id>)' },
   { command: 'remove', description: '永久移除' },
   { command: 'pause', description: '静音指定市场' },
@@ -69,6 +73,9 @@ const HELP = [
   '/menu — 快捷按钮菜单',
   '/status — 概览所有监控市场',
   '/list — 简要列出活跃市场',
+  '/probe &lt;id&gt; — 单个市场快照（订单簿 + 奖励区）',
+  '/watch &lt;id&gt; — 密集追踪（每次买1卖1变动就提醒）',
+  '/unwatch &lt;id|all&gt; — 取消密集追踪',
   '/add &lt;id&gt; — 加入监控',
   '/remove &lt;id&gt; — 永久移除（含自动发现）',
   '/pause &lt;id&gt; — 静音该市场提醒',
@@ -90,6 +97,49 @@ function uniq(arr) {
   return [...new Set(arr.map(String))];
 }
 
+async function buildProbeMessage(marketId) {
+  const summary = await getMarketRewardSummary(marketId);
+  if (!summary.market) {
+    return `未找到市场 #${htmlEscape(marketId)}（不在 REST 列表里，可能 id 错了或已 resolve）。`;
+  }
+  const m = summary.market;
+  let ob;
+  try {
+    ob = await getOrderbook(summary.orderbookKey, { contextMarketId: marketId, market: m });
+  } catch (err) {
+    return `订单簿抓取失败: ${htmlEscape(err.message)}`;
+  }
+  const mid = midOf(ob);
+  const spread = spreadOf(ob);
+  const zone = rewardZoneStatus(ob, m, {
+    maxDistance: config.rewardZoneMaxDistance,
+    minSize: config.rewardZoneMinSize,
+  });
+  const lines = [
+    `<b>${htmlEscape((m.title ?? m.question ?? '').slice(0, 60))}</b> (#${htmlEscape(marketId)})`,
+    `PP/h: ${summary.totalHourlyRate.toFixed(2)}  ·  status: ${htmlEscape(String(m.status ?? m.tradingStatus ?? '?'))}`,
+  ];
+  lines.push('');
+  lines.push('<b>买盘</b>');
+  if (!ob.bids.length) lines.push('  (空)');
+  for (let i = 0; i < ob.bids.length; i++) {
+    const b = ob.bids[i];
+    lines.push(`  买${i + 1}: ${b.price.toFixed(4)} × ${b.size}`);
+  }
+  lines.push('<b>卖盘</b>');
+  if (!ob.asks.length) lines.push('  (空)');
+  for (let i = 0; i < ob.asks.length; i++) {
+    const a = ob.asks[i];
+    lines.push(`  卖${i + 1}: ${a.price.toFixed(4)} × ${a.size}`);
+  }
+  lines.push('');
+  lines.push(`mid: ${mid != null ? mid.toFixed(4) : 'n/a'}  ·  spread: ${spread != null ? `${(spread * 100).toFixed(2)}¢` : 'n/a'}`);
+  lines.push(`奖励区: ±${(zone.maxDistance * 100).toFixed(1)}¢ / size ≥ ${zone.minSize}`);
+  lines.push(`  买侧: ${zone.bidActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.bidReason ?? '未激活')}`}`);
+  lines.push(`  卖侧: ${zone.askActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.askReason ?? '未激活')}`}`);
+  return lines.join('\n');
+}
+
 function zoneTag(slot) {
   const z = slot?.zoneStatus;
   if (!z) return '';
@@ -103,7 +153,9 @@ function zoneTag(slot) {
 function statusLine(state, id) {
   const slot = state.markets[id];
   const paused = state.pausedIds.includes(id);
-  const tag = paused ? ' [paused]' : '';
+  const watched = (state.watchedIds ?? []).includes(id);
+  const tags = [paused ? 'paused' : '', watched ? 'watch' : ''].filter(Boolean);
+  const tag = tags.length ? ` [${tags.join(',')}]` : '';
   if (!slot) return `#${id}${tag} — 等待首次抓取`;
   const since = Date.now() - (slot.lastChangeAt ?? Date.now());
   const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
@@ -209,6 +261,30 @@ async function handle(text, state, ctx) {
       state.filters = { ...(state.filters ?? {}), [name]: v };
       await ctx.persist();
       return `已设置 ${FILTER_LABELS[name]} ${v}`;
+    }
+
+    case '/probe': {
+      if (!arg) return '用法：/probe &lt;marketId&gt;';
+      return await buildProbeMessage(arg);
+    }
+
+    case '/watch': {
+      if (!arg) return '用法：/watch &lt;marketId&gt;\n密集追踪：每次 tick 检测到买1卖1变动就立刻提醒（1 分钟冷却）。';
+      state.watchedIds = uniq([...(state.watchedIds ?? []), arg]);
+      state.removedIds = state.removedIds.filter((x) => x !== arg);
+      await ctx.persist();
+      return `已开启密集追踪 #${htmlEscape(arg)}（每次变动都会推送）。/unwatch 取消。`;
+    }
+
+    case '/unwatch': {
+      if (!arg) return '用法：/unwatch &lt;marketId|all&gt;';
+      if (arg === 'all') {
+        state.watchedIds = [];
+      } else {
+        state.watchedIds = (state.watchedIds ?? []).filter((x) => x !== arg);
+      }
+      await ctx.persist();
+      return arg === 'all' ? '已取消全部密集追踪。' : `已取消密集追踪 #${htmlEscape(arg)}。`;
     }
 
     case '/clearfilter': {

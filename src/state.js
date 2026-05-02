@@ -8,6 +8,7 @@ function emptyState() {
     pausedIds: [],
     removedIds: [],
     autoIds: [],
+    watchedIds: [],
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     telegramOffset: 0,
@@ -29,6 +30,7 @@ export async function loadState() {
       pausedIds: json.pausedIds ?? [],
       removedIds: json.removedIds ?? [],
       autoIds: json.autoIds ?? [],
+      watchedIds: json.watchedIds ?? [],
       filters: json.filters ?? {},
     };
   } catch (err) {
@@ -48,6 +50,7 @@ export function activeMarketIds(state) {
   for (const id of config.marketIds) set.add(String(id));
   for (const id of state.manualIds) set.add(String(id));
   for (const id of state.autoIds) set.add(String(id));
+  for (const id of (state.watchedIds ?? [])) set.add(String(id));
   for (const id of state.removedIds) set.delete(String(id));
   return [...set];
 }
