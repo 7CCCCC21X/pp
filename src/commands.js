@@ -118,83 +118,203 @@ export function alertKeyboard(marketId) {
 const WIZARD_RATES = [0, 100, 500, 1000, 3000];
 const WIZARD_REMS = [1, 4, 12, 24, 72];
 const WIZARD_LIMITS = [20, 50, 100, 200];
+const WIZARD_TYPES = [
+  ['any',   '不限'],
+  ['gap',   '空缺'],
+  ['thin',  '薄盘'],
+  ['wide',  '宽差'],
+  ['empty', '空簿'],
+];
+const WIZARD_MIDS = [
+  ['any',  '不限'],
+  ['low',  '低价'],   // mid < 0.20
+  ['mid',  '中间'],   // 0.20 ≤ mid ≤ 0.80
+  ['high', '高价'],   // mid > 0.80
+];
+const WIZARD_SORTS = [
+  ['rate',   'PP/h'],
+  ['total',  '总PP'],
+  ['score',  '机会分'],
+  ['spread', 'spread'],
+  ['thin',   '薄盘'],
+];
 
 function fmtRateShort(r) {
   if (r >= 1000) return `${(r / 1000).toFixed(0)}k`;
   return String(r);
 }
 
-function findWizardText(rate, rem, limit) {
+const WIZARD_DEFAULT = { rate: 0, rem: 12, limit: 50, type: 'any', mid: 'any', sort: 'rate' };
+
+// Type/mid/sort other than the simple defaults need live slot data
+// (zone, spread, depth) which is only available for monitored markets.
+// Pure rate+rem+limit queries can still reach the GraphQL discovery
+// pool — the function is called "advanced" otherwise.
+function isAdvancedQuery(s) {
+  return s.type !== 'any' || s.mid !== 'any' || (s.sort !== 'rate' && s.sort !== 'total');
+}
+
+function labelOf(pairs, key) {
+  return (pairs.find((p) => p[0] === key) ?? [key, key])[1];
+}
+
+function findWizardText(s) {
+  const advanced = isAdvancedQuery(s);
   return [
     '🔍 <b>自定义筛选</b>',
     '',
-    `📊 PP/h ≥ <b>${rate}</b>`,
-    `⏱ 剩余 ≥ <b>${rem}h</b>`,
-    `📦 上限 <b>${limit}</b>`,
+    `📊 PP/h ≥ <b>${s.rate}</b>`,
+    `⏱ 剩余 ≥ <b>${s.rem}h</b>`,
+    `🎯 类型: <b>${labelOf(WIZARD_TYPES, s.type)}</b>`,
+    `💲 中价: <b>${labelOf(WIZARD_MIDS, s.mid)}</b>`,
+    `↕️ 排序: <b>${labelOf(WIZARD_SORTS, s.sort)}</b>`,
+    `📦 上限 <b>${s.limit}</b>`,
     '',
-    '点按钮调整 → 🚀 查询（不改 watchlist）',
-    '或 🔄 应用监控（替换 watchlist）',
+    advanced
+      ? '⚠️ 高级筛选只看已监控市场（GraphQL 池没有盘口）。'
+      : '点按钮调整 → 🚀 查询（不改 watchlist） / 🔄 应用监控',
   ].join('\n');
 }
 
-function findWizardKeyboard(rate, rem, limit) {
+// Encode the full 6-dim wizard state into a callback string. Each
+// button replaces ONE knob with the new value, leaving others as-is.
+// Format: find:<action>:R:M:L:T:Mi:S
+function encodeState(action, s) {
+  return `find:${action}:${s.rate}:${s.rem}:${s.limit}:${s.type}:${s.mid}:${s.sort}`;
+}
+
+function findWizardKeyboard(s) {
   const mark = (active, label) => active ? `✅ ${label}` : label;
   return {
     inline_keyboard: [
-      // PP/h row — short numeric labels (row context shown in message body)
       WIZARD_RATES.map((r) => ({
-        text: mark(r === rate, fmtRateShort(r)),
-        callback_data: `find:set:${r}:${rem}:${limit}`,
+        text: mark(r === s.rate, fmtRateShort(r)),
+        callback_data: encodeState('set', { ...s, rate: r }),
       })),
-      // Remaining hours row
       WIZARD_REMS.map((m) => ({
-        text: mark(m === rem, `${m}h`),
-        callback_data: `find:set:${rate}:${m}:${limit}`,
+        text: mark(m === s.rem, `${m}h`),
+        callback_data: encodeState('set', { ...s, rem: m }),
       })),
-      // Limit row
+      WIZARD_TYPES.map(([k, label]) => ({
+        text: mark(k === s.type, label),
+        callback_data: encodeState('set', { ...s, type: k }),
+      })),
+      WIZARD_MIDS.map(([k, label]) => ({
+        text: mark(k === s.mid, label),
+        callback_data: encodeState('set', { ...s, mid: k }),
+      })),
+      WIZARD_SORTS.map(([k, label]) => ({
+        text: mark(k === s.sort, label),
+        callback_data: encodeState('set', { ...s, sort: k }),
+      })),
       WIZARD_LIMITS.map((l) => ({
-        text: mark(l === limit, String(l)),
-        callback_data: `find:set:${rate}:${rem}:${l}`,
+        text: mark(l === s.limit, String(l)),
+        callback_data: encodeState('set', { ...s, limit: l }),
       })),
-      // Action row
       [
-        { text: '🚀 查询', callback_data: `find:run:${rate}:${rem}:${limit}` },
-        { text: '🔄 应用监控', callback_data: `find:scan:${rate}:${rem}:${limit}` },
+        { text: '🚀 查询', callback_data: encodeState('run', s) },
+        { text: '🔄 应用监控', callback_data: encodeState('scan', s) },
       ],
     ],
   };
 }
 
-// Run the actual filter query against the cached market list. Used by
-// both the /find wizard's "Run" button and the /find <args> CLI form.
-async function runFilterQuery(minRate, minRem, limit, mode, state, ctx) {
+function midBucket(mid) {
+  if (!Number.isFinite(mid)) return null;
+  if (mid < 0.20) return 'low';
+  if (mid > 0.80) return 'high';
+  return 'mid';
+}
+
+// Apply the wizard's type/mid filters against a slot-derived row. Returns
+// true if the row passes ALL set filters.
+function passesAdvanced(row, s) {
+  if (s.type !== 'any') {
+    const z = row.slot?.zoneStatus;
+    const hasGap = z && (!z.bidActivated || !z.askActivated);
+    const isThin = Number.isFinite(row.slot?.lastTopUsd) && row.slot.lastTopUsd < (config.lowDepthThreshold ?? 100);
+    const isWide = Number.isFinite(row.slot?.lastSpread) && row.slot.lastSpread > config.maxSpread;
+    const isEmpty = row.slot?.baseline
+      && (row.slot.baseline.bidPrice == null || row.slot.baseline.askPrice == null);
+    if (s.type === 'gap'   && !hasGap)   return false;
+    if (s.type === 'thin'  && !isThin)   return false;
+    if (s.type === 'wide'  && !isWide)   return false;
+    if (s.type === 'empty' && !isEmpty)  return false;
+  }
+  if (s.mid !== 'any') {
+    const bid = row.slot?.baseline?.bidPrice;
+    const ask = row.slot?.baseline?.askPrice;
+    const mid = (Number.isFinite(bid) && Number.isFinite(ask)) ? (bid + ask) / 2 : null;
+    if (midBucket(mid) !== s.mid) return false;
+  }
+  return true;
+}
+
+function sortRowsBy(rows, sortKey) {
+  const key = (r) => {
+    const rate = Number.isFinite(r.rate) ? r.rate : (r.slot?.lastHourlyRate ?? 0);
+    const remH = (Number.isFinite(r.endMs) && r.endMs > Date.now())
+      ? (r.endMs - Date.now()) / 3600000
+      : null;
+    if (sortKey === 'total')  return remH != null ? rate * remH : rate;
+    if (sortKey === 'score')  return opportunityScore(r.slot ?? {});
+    if (sortKey === 'spread') return Number.isFinite(r.slot?.lastSpread) ? r.slot.lastSpread : 0;
+    if (sortKey === 'thin')   return -(Number.isFinite(r.slot?.lastTopUsd) ? r.slot.lastTopUsd : Infinity);
+    return rate; // 'rate' default
+  };
+  return rows.sort((a, b) => key(b) - key(a));
+}
+
+// Run the actual filter query. Mode controls whether matches replace
+// the watchlist (scan) or just print (run). When the wizard sets any
+// advanced knob, source from state.markets (live monitored set);
+// otherwise fall back to GraphQL discovery for the simple PP/h+rem path.
+async function runFilterQuery(s, mode, state, ctx) {
   const { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } =
     await import('./predict.js');
-  let all;
-  try {
-    all = await getAllMarketsCached();
-  } catch (err) {
-    return { text: `市场列表获取失败: ${htmlEscape(err.message)}` };
-  }
-  const cutoff = minRem > 0 ? Date.now() + minRem * 3600000 : null;
-  const matches = [];
-  for (const m of all) {
-    if (!isMarketTradeable(m)) continue;
-    const rate = extractHourlyRate(m);
-    if (rate < minRate) continue;
-    if (cutoff) {
-      const endMs = marketEndMs(m);
-      if (endMs != null && endMs < cutoff) continue;
+  const advanced = isAdvancedQuery(s);
+  const cutoff = s.rem > 0 ? Date.now() + s.rem * 3600000 : null;
+
+  let rows = [];
+  if (advanced) {
+    // Live slot data — only markets we've actually polled.
+    for (const id of activeMarketIds(state)) {
+      const slot = state.markets[id];
+      if (!slot || slot.lastError || slot.lastSkipReason) continue;
+      const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate : 0;
+      if (rate < s.rate) continue;
+      if (cutoff && Number.isFinite(slot.endMs) && slot.endMs < cutoff) continue;
+      const row = {
+        id, slot, rate,
+        title: slot.title ?? slot.question ?? null,
+        endMs: slot.endMs ?? null,
+      };
+      if (!passesAdvanced(row, s)) continue;
+      rows.push(row);
     }
-    matches.push({
-      id: String(m.id),
-      title: m.title ?? m.question ?? null,
-      rate,
-      endMs: marketEndMs(m),
-    });
+  } else {
+    // Discovery via GraphQL — works for markets we don't yet monitor.
+    let all;
+    try { all = await getAllMarketsCached(); }
+    catch (err) { return { text: `市场列表获取失败: ${htmlEscape(err.message)}` }; }
+    for (const m of all) {
+      if (!isMarketTradeable(m)) continue;
+      const rate = extractHourlyRate(m);
+      if (rate < s.rate) continue;
+      const endMs = marketEndMs(m);
+      if (cutoff && endMs != null && endMs < cutoff) continue;
+      rows.push({
+        id: String(m.id),
+        slot: state.markets[String(m.id)] ?? null,  // for sortBy(score) etc
+        rate,
+        title: m.title ?? m.question ?? null,
+        endMs,
+      });
+    }
   }
-  matches.sort((a, b) => b.rate - a.rate);
-  const top = matches.slice(0, limit);
+
+  rows = sortRowsBy(rows, s.sort);
+  const top = rows.slice(0, s.limit);
 
   if (mode === 'scan') {
     state.autoIds = top.map((x) => x.id);
@@ -202,27 +322,37 @@ async function runFilterQuery(minRate, minRem, limit, mode, state, ctx) {
     if (ctx?.persist) await ctx.persist();
   }
 
-  if (!matches.length) {
-    return { text: `没有匹配的市场（PP/h ≥ ${minRate}, 剩余 ≥ ${minRem}h）。试试 /find 0 1` };
+  if (!rows.length) {
+    const hint = advanced ? '（高级筛选只看已监控市场，看 /status）' : '试试 /find 0 1';
+    return { text: `没有匹配的市场（PP/h ≥ ${s.rate}, 剩余 ≥ ${s.rem}h, 类型 ${s.type}）。${hint}` };
   }
 
   const verb = mode === 'scan'
     ? `🔄 已替换 watchlist (${top.length} 个)`
-    : `🔍 找到 ${matches.length} 个`;
-  const note = matches.length > top.length ? `，显示前 ${top.length}` : '';
+    : `🔍 找到 ${rows.length} 个`;
+  const note = rows.length > top.length ? `，显示前 ${top.length}` : '';
+  const condParts = [
+    `PP/h ≥ <b>${s.rate}</b>`,
+    `剩余 ≥ <b>${s.rem}h</b>`,
+  ];
+  if (s.type !== 'any') condParts.push(`类型 <b>${labelOf(WIZARD_TYPES, s.type)}</b>`);
+  if (s.mid !== 'any')  condParts.push(`中价 <b>${labelOf(WIZARD_MIDS, s.mid)}</b>`);
+  condParts.push(`排序 <b>${labelOf(WIZARD_SORTS, s.sort)}</b>`);
   const lines = [
     `${verb}${note}`,
-    `条件: PP/h ≥ <b>${minRate}</b> · 剩余 ≥ <b>${minRem}h</b>`,
+    `条件: ${condParts.join(' · ')}`,
     '',
   ];
-  for (const [idx, m] of top.entries()) {
+  for (const [idx, r] of top.entries()) {
     const medal = idx < 3 ? ['🥇', '🥈', '🥉'][idx] : `${idx + 1}.`;
-    const title = htmlEscape(shortTitle(m.title ?? `Market ${m.id}`, 42));
-    const remH = m.endMs ? Math.max(0, (m.endMs - Date.now()) / 3600000) : null;
+    const title = htmlEscape(shortTitle(r.title ?? `Market ${r.id}`, 42));
+    const remH = (Number.isFinite(r.endMs) && r.endMs > Date.now())
+      ? (r.endMs - Date.now()) / 3600000
+      : null;
     const ext = remH != null
-      ? ` · ${remH < 24 ? remH.toFixed(1) + 'h' : (remH / 24).toFixed(1) + 'd'}≈${fmtBig(m.rate * remH)}PP`
+      ? ` · ${remH < 24 ? remH.toFixed(1) + 'h' : (remH / 24).toFixed(1) + 'd'}≈${fmtBig(r.rate * remH)}PP`
       : '';
-    lines.push(`${medal} <code>#${m.id}</code> ${title} — <b>${m.rate.toFixed(0)}/h</b>${ext}`);
+    lines.push(`${medal} <code>#${r.id}</code> ${title} — <b>${r.rate.toFixed(0)}/h</b>${ext}`);
   }
   if (mode === 'find') {
     lines.push('');
@@ -234,14 +364,19 @@ async function runFilterQuery(minRate, minRem, limit, mode, state, ctx) {
 // Handle find:set / find:run / find:scan callback_data from the wizard.
 // Returns true if handled (so the dispatcher skips normal command routing).
 export async function handleFindWizardCallback(data, { chatId, messageId, state, fullCtx }) {
-  // data shape: find:<action>:<rate>:<rem>:<limit>
+  // data shape: find:<action>:R:M:L:T:Mi:S
   const parts = data.split(':');
   if (parts[0] !== 'find') return false;
-  const [, action, rateStr, remStr, limitStr] = parts;
-  const rate = Number(rateStr ?? 0);
-  const rem = Number(remStr ?? 12);
-  const limit = Math.min(Number(limitStr ?? 50), 200);
-  if (!Number.isFinite(rate) || !Number.isFinite(rem) || !Number.isFinite(limit)) return true;
+  const [, action, rateStr, remStr, limitStr, type, mid, sort] = parts;
+  const s = {
+    rate: Number(rateStr ?? 0),
+    rem: Number(remStr ?? 12),
+    limit: Math.min(Number(limitStr ?? 50), 200),
+    type: type ?? 'any',
+    mid: mid ?? 'any',
+    sort: sort ?? 'rate',
+  };
+  if (!Number.isFinite(s.rate) || !Number.isFinite(s.rem) || !Number.isFinite(s.limit)) return true;
 
   if (action === 'set') {
     // Re-render the wizard with updated highlight
@@ -249,8 +384,8 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
       await editTelegramMessage(
         chatId,
         messageId,
-        findWizardText(rate, rem, limit),
-        findWizardKeyboard(rate, rem, limit),
+        findWizardText(s),
+        findWizardKeyboard(s),
       );
     } catch (err) {
       // Telegram returns 400 if the new content is identical; safe to ignore.
@@ -261,7 +396,7 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
     return true;
   }
   if (action === 'run' || action === 'scan') {
-    const result = await runFilterQuery(rate, rem, limit, action, state, fullCtx);
+    const result = await runFilterQuery(s, action, state, fullCtx);
     await sendLongTelegramMessage(result.text, { chatId });
     return true;
   }
@@ -1015,18 +1150,23 @@ async function handle(text, state, ctx, chatId, fromId) {
       // No args + /find -> show interactive wizard with default state
       if (cmd === '/find' && parts.length === 0) {
         const defaultRem = Math.min(72, Math.max(1, config.minRemainingHours ?? 12));
+        const initial = { ...WIZARD_DEFAULT, rem: defaultRem };
         return {
-          text: findWizardText(0, defaultRem, 50),
-          replyMarkup: findWizardKeyboard(0, defaultRem, 50),
+          text: findWizardText(initial),
+          replyMarkup: findWizardKeyboard(initial),
         };
       }
       const minRate = parts[0] != null ? Number(parts[0]) : 0;
       const minRem = parts[1] != null ? Number(parts[1]) : (config.minRemainingHours ?? 12);
       const limit = Math.min(parts[2] != null ? Number(parts[2]) : 50, 200);
       if (!Number.isFinite(minRate) || !Number.isFinite(minRem) || !Number.isFinite(limit)) {
-        return '用法: /find [minRate] [minRem 小时] [limit]\n例: /find 500 12 30\n  /scan 同样参数，但会替换 watchlist\n  /find （无参数）= 交互式向导';
+        return '用法: /find [minRate] [minRem 小时] [limit]\n例: /find 500 12 30\n  /scan 同样参数，但会替换 watchlist\n  /find （无参数）= 交互式向导（含类型/中价/排序）';
       }
-      const result = await runFilterQuery(minRate, minRem, limit, cmd === '/scan' ? 'scan' : 'find', state, ctx);
+      const result = await runFilterQuery(
+        { rate: minRate, rem: minRem, limit, type: 'any', mid: 'any', sort: 'rate' },
+        cmd === '/scan' ? 'scan' : 'find',
+        state, ctx,
+      );
       return result.text;
     }
 
