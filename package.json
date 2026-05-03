@@ -16,6 +16,7 @@
     "probe": "node scripts/probe.js",
     "url-check": "node scripts/url-check.js",
     "reward-check": "node scripts/reward-check.js",
+    "zones": "node scripts/zones.js",
     "prune-history": "node scripts/prune-history.js",
     "test": "node --test test/*.test.js",
     "check": "node --check src/*.js src/alerts/*.js scripts/*.js"
