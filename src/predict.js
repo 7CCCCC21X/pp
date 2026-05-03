@@ -487,6 +487,66 @@ export async function resolveSlugToId(slug, slugifier) {
   return null;
 }
 
+// Resolve a slug to ALL matching markets — single-market URLs return one
+// hit, event-level URLs (multiple sub-markets share categorySlug + the
+// event-level question text) return many. Sorted by PP/h descending.
+// Each match: { id, title, question, rate, endMs }. Empty if no match.
+export async function resolveUrlSlugToMarkets(slug, slugifier) {
+  const all = await getAllMarketsCached();
+  const seen = new Set();
+  const matches = [];
+  // Title slug — wins for single-market URLs where title ≈ URL.
+  for (const m of all) {
+    const titleSlug = slugifier(m.title ?? '');
+    if (titleSlug === slug && !seen.has(String(m.id))) {
+      seen.add(String(m.id));
+      matches.push({
+        id: String(m.id),
+        title: m.title ?? null,
+        question: m.question ?? null,
+        rate: extractHourlyRate(m),
+        endMs: marketEndMs(m),
+      });
+    }
+  }
+  // Question slug — event-level URLs whose sub-markets share the question
+  // text but have bucket-specific titles ($200M / $400M / …).
+  for (const m of all) {
+    if (seen.has(String(m.id))) continue;
+    const qSlug = slugifier(m.question ?? '');
+    if (qSlug === slug) {
+      seen.add(String(m.id));
+      matches.push({
+        id: String(m.id),
+        title: m.title ?? null,
+        question: m.question ?? null,
+        rate: extractHourlyRate(m),
+        endMs: marketEndMs(m),
+      });
+    }
+  }
+  // Last resort: REST categorySlug map (capped at ~100 markets).
+  if (matches.length === 0) {
+    try {
+      const slugMap = await getSlugMapCached();
+      for (const [id, mappedSlug] of slugMap.entries()) {
+        if (mappedSlug !== slug || seen.has(id)) continue;
+        const m = all.find((x) => String(x.id) === id);
+        seen.add(id);
+        matches.push({
+          id,
+          title: m?.title ?? null,
+          question: m?.question ?? null,
+          rate: m ? extractHourlyRate(m) : 0,
+          endMs: m ? marketEndMs(m) : null,
+        });
+      }
+    } catch { /* slug map fetch failed — best-effort */ }
+  }
+  matches.sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0));
+  return matches;
+}
+
 const CLOSED_STATUSES = new Set([
   'CLOSED', 'RESOLVED', 'PAUSED', 'CANCELLED', 'CANCELED',
   'ARCHIVED', 'EXPIRED', 'SETTLED', 'INACTIVE',

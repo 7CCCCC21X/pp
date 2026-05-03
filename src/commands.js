@@ -117,6 +117,186 @@ export function alertKeyboard(marketId) {
   };
 }
 
+// --- URL paste flow: admin pastes a Predict.fun URL → bot resolves and
+//     offers a card-style picker (multi-outcome events) or an action
+//     menu (single market) for /watch / /snapshot / /add. ---
+
+const PREDICT_URL_RE = /https?:\/\/predict\.fun\/[^\s]+/i;
+function extractPredictFunUrl(text) {
+  const m = text?.match?.(PREDICT_URL_RE);
+  return m ? m[0] : null;
+}
+
+function slugFromPredictUrl(url) {
+  // /<lang>/market/<slug>[?...] or /market/<slug>
+  const m = url.match(/\/market\/([^/?#]+)/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Card-style picker: one button per matching market, showing the
+// bucket title + PP/h to make the choice obvious. Telegram caps
+// inline_keyboard buttons per row; we use 1 per row so titles like
+// "$200M" / "100-200 推特" stay readable on mobile.
+function pickerKeyboard(matches) {
+  const rows = matches.slice(0, 12).map((m) => [{
+    text: `${shortTitle(m.title || `Market ${m.id}`, 28)} · ${(m.rate ?? 0).toFixed(0)}/h`,
+    callback_data: `pick:${m.id}`,
+  }]);
+  rows.push([{ text: '✖️ 取消', callback_data: 'do:cancel' }]);
+  return { inline_keyboard: rows };
+}
+
+function pickerText(matches, slug) {
+  const lines = [
+    `🔍 <b>找到 ${matches.length} 个匹配市场</b>`,
+    `slug: <code>${htmlEscape(slug)}</code>`,
+    '',
+    '点一个进入操作菜单（追踪 / 快照 / 加监控）。',
+  ];
+  if (matches.length > 12) {
+    lines.push('');
+    lines.push(`(只显示前 12 个，按 PP/h 排序)`);
+  }
+  return lines.join('\n');
+}
+
+function actionKeyboard(id) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '👁 追踪', callback_data: `do:watch:${id}` },
+        { text: '➕ 加入监控', callback_data: `do:add:${id}` },
+      ],
+      [
+        { text: '📸 5min 快照', callback_data: `do:snap:${id}:5m` },
+        { text: '📸 15min 快照', callback_data: `do:snap:${id}:15m` },
+      ],
+      [
+        { text: '📊 当前盘口', callback_data: `do:probe:${id}` },
+        { text: '✖️ 取消', callback_data: 'do:cancel' },
+      ],
+    ],
+  };
+}
+
+function actionText(market) {
+  const title = htmlEscape(shortTitle(market.title || `Market ${market.id}`, 50));
+  const remH = (Number.isFinite(market.endMs) && market.endMs > Date.now())
+    ? (market.endMs - Date.now()) / 3600000
+    : null;
+  const totalPp = remH != null ? (market.rate ?? 0) * remH : null;
+  const lines = [
+    `📌 <code>#${htmlEscape(market.id)}</code> ${title}`,
+    `<b>${(market.rate ?? 0).toFixed(0)}</b> PP/h${remH != null ? ` · 剩余 ${remH.toFixed(1)}h ≈ ${totalPp.toFixed(0)} PP` : ''}`,
+    '',
+    '想做什么？',
+  ];
+  return lines.join('\n');
+}
+
+async function handleUrlPaste(url, state, ctx, { chatId }) {
+  const slug = slugFromPredictUrl(url);
+  if (!slug) {
+    await sendTelegramMessage(`未能从 URL 提取 slug:\n<code>${htmlEscape(url)}</code>`, { chatId });
+    return;
+  }
+  const { resolveUrlSlugToMarkets } = await import('./predict.js');
+  let matches = [];
+  try {
+    matches = await resolveUrlSlugToMarkets(slug, slugifyMarketTitle);
+  } catch (err) {
+    await sendTelegramMessage(`解析失败: ${htmlEscape(err.message)}`, { chatId });
+    return;
+  }
+  if (matches.length === 0) {
+    await sendLongTelegramMessage(
+      [
+        '⚠️ 没在 PP-rewarded 列表里找到匹配市场。',
+        `slug: <code>${htmlEscape(slug)}</code>`,
+        '',
+        '可能：',
+        '• 这个市场不奖励 PP（autodiscover 不会抓）',
+        '• 已经 resolve',
+        '• Slug 不在已缓存的市场里',
+        '',
+        '手动方案：在浏览器 DevTools → Network 找 /v1/markets/&lt;数字&gt;，然后用 /add &lt;数字&gt;。',
+      ].join('\n'),
+      { chatId },
+    );
+    return;
+  }
+  if (matches.length === 1) {
+    await sendTelegramMessage(actionText(matches[0]), {
+      chatId,
+      replyMarkup: actionKeyboard(matches[0].id),
+    });
+    return;
+  }
+  await sendTelegramMessage(pickerText(matches, slug), {
+    chatId,
+    replyMarkup: pickerKeyboard(matches),
+  });
+}
+
+// Callback handler for both pick:<id> (user picked from event list) and
+// do:<action>:<id>[:<arg>] (user chose what to do with the picked market).
+export async function handlePickCallback(data, { chatId, messageId, state, fullCtx }) {
+  if (data.startsWith('pick:')) {
+    const id = data.slice('pick:'.length);
+    if (!id) return;
+    // Look up market metadata for the action card.
+    const { getMarketRewardSummary } = await import('./predict.js');
+    let market = { id };
+    try {
+      const summary = await getMarketRewardSummary(id);
+      const m = summary?.market;
+      if (m) {
+        market = {
+          id,
+          title: m.title ?? m.question ?? null,
+          rate: summary.totalHourlyRate ?? 0,
+          endMs: (await import('./predict.js')).marketEndMs(m),
+        };
+      }
+    } catch { /* fall back to id-only display */ }
+    await editTelegramMessage(chatId, messageId, actionText(market), actionKeyboard(id))
+      .catch((err) => { if (!/message is not modified/i.test(err.message)) throw err; });
+    return;
+  }
+
+  if (!data.startsWith('do:')) return;
+  const parts = data.slice('do:'.length).split(':');
+  const action = parts[0];
+  const id = parts[1];
+
+  if (action === 'cancel') {
+    await editTelegramMessage(chatId, messageId, '已取消。', undefined).catch(() => {});
+    return;
+  }
+  if (!id) return;
+
+  // All do:* actions write to state and persist; piggyback on existing
+  // handle() logic by synthesizing the equivalent text command. Keeps
+  // the response copy / validation / persist behavior consistent.
+  let cmd = null;
+  if (action === 'watch') cmd = `/watch ${id}`;
+  else if (action === 'add') cmd = `/add ${id}`;
+  else if (action === 'probe') cmd = `/probe ${id}`;
+  else if (action === 'snap') {
+    const interval = parts[2] ?? '5m';
+    cmd = `/snapshot ${id} ${interval}`;
+  }
+  if (!cmd) return;
+  await dispatchCommand(cmd, state, fullCtx, { chatId, fromId: chatId });
+  // Replace the picker card with a confirmation footer so the chat
+  // doesn't accumulate stale "want to do X?" cards.
+  await editTelegramMessage(
+    chatId, messageId,
+    `✅ 已执行: <code>${htmlEscape(cmd)}</code>`,
+    undefined,
+  ).catch(() => {});
+}
+
 // --- /find wizard: card-style filter picker ---
 const WIZARD_RATES = [0, 100, 500, 1000, 3000];
 const WIZARD_REMS = [1, 4, 12, 24, 72];
@@ -1695,6 +1875,19 @@ export function startCommandLoop({ getState, persist, ctx }) {
               }
               continue;
             }
+            // URL paste shortcut: in admin DM, paste a Predict.fun URL
+            // and get the picker card / action menu without typing /add.
+            // Group chats keep going through the command parser to avoid
+            // accidental link expansion.
+            const url = !text.startsWith('/') && isAdminUser(fromId)
+              ? extractPredictFunUrl(text)
+              : null;
+            if (url) {
+              await handleUrlPaste(url, state, fullCtx, { chatId }).catch((err) => {
+                warn('url paste error:', err.message);
+              });
+              continue;
+            }
             await dispatchCommand(text, state, fullCtx, { chatId, fromId });
           } else if (u.callback_query) {
             const cq = u.callback_query;
@@ -1719,6 +1912,10 @@ export function startCommandLoop({ getState, persist, ctx }) {
             } else if (data.startsWith('page:')) {
               await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
                 warn('page callback error:', err.message);
+              });
+            } else if (data.startsWith('pick:') || data.startsWith('do:')) {
+              await handlePickCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+                warn('pick callback error:', err.message);
               });
             } else {
               await dispatchCommand(data, state, fullCtx, { chatId, fromId });
