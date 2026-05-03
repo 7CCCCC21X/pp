@@ -86,6 +86,21 @@ function ensureStubSlot(state, marketId, now) {
 const PRIORITY_RANK = { all: 0, low: 1, medium: 2, high: 3 };
 const PRIORITY_BADGE = { high: '🔥', medium: '⭐', low: '' };
 
+// Per-kind chat routing. "Per-market follow-the-action" alerts land
+// only in admin's private chat — they're noise for groups since the
+// market is something the admin specifically picked (e.g. /watch).
+// Broad "is the market interesting" alerts broadcast to admin + every
+// whitelisted group so multiple chats can watch the opportunity flow.
+const ADMIN_ONLY_KINDS = new Set(['watch', 'snapshot']);
+
+function chatsForKind(state, kind) {
+  const baseKind = kind.replace(/_recovered$/, '');
+  if (ADMIN_ONLY_KINDS.has(baseKind)) {
+    return config.telegramChatId ? [String(config.telegramChatId)] : [];
+  }
+  return broadcastChats(state);
+}
+
 async function alert(state, kind, slot, marketId, message, extra = {}) {
   const isWatchOrRecovery = kind === 'watch' || kind.endsWith('_recovered');
 
@@ -144,7 +159,11 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
   const decorated = badge ? `${badge} ${message}` : message;
   const tagged = `${decorated}\n\n#${kind} #market_${marketId}${badge ? ` #${priority}` : ''}`;
   try {
-    const chatIds = broadcastChats(state);
+    const chatIds = chatsForKind(state, kind);
+    if (chatIds.length === 0) {
+      log(`[${marketId}] suppress ${kind} (no eligible chats — admin chat unset?)`);
+      return false;
+    }
     await broadcastTelegramMessage(tagged, { chatIds, replyMarkup: alertKeyboard(marketId) });
   } catch (err) {
     warn(`[${marketId}] telegram send (${kind}) failed:`, err.message);
