@@ -698,8 +698,8 @@ const HELP = [
   '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 单市场临时静',
   '/pause &lt;id&gt; · /resume &lt;id&gt; — 单市场静音 / 恢复',
   '/quiet [duration | off] — 全局临时静音（默认 2h）',
-  '/alerts [on|off &lt;kind&gt;|reset] — 全局类型开关',
-  '/route [on|off &lt;kind&gt;|reset] — 当前 chat 独立路由',
+  '/alerts [on|off|only &lt;kind&gt;|reset] — 全局类型开关（only = 只看这一种）',
+  '/route [on|off|only &lt;kind&gt;|reset] — 当前 chat 独立路由',
   '/digest-mode [interval | off] — 当前 chat 改批量摘要',
   '<i>kind: stall / mid_jump / wide_spread / reward_zone / empty_book</i>',
   '',
@@ -1679,8 +1679,19 @@ async function handle(text, state, ctx, chatId, fromId) {
         }
         return '当前 chat 没有自定义路由。';
       }
+      // Shortcut: /route only <kind>  →  exclude every other kind
+      // from this chat. Mirrors /alerts only but per-chat scoped.
+      if (action === 'only') {
+        if (!kindArg || !KINDS.includes(kindArg)) {
+          return `用法：/route only &lt;kind&gt;\n可用 kind: ${KINDS.join(', ')}`;
+        }
+        state.chatRouting = { ...(state.chatRouting ?? {}) };
+        state.chatRouting[cid] = { exclude: KINDS.filter((k) => k !== kindArg) };
+        await ctx.persist();
+        return `🎯 当前 chat 设为只看 <code>${kindArg}</code>（其它 ${KINDS.length - 1} 类已 mute）。`;
+      }
       if (action !== 'on' && action !== 'off') {
-        return `用法：/route [list|on &lt;kind&gt;|off &lt;kind&gt;|reset]\n可用 kind: ${KINDS.join(', ')}`;
+        return `用法：/route [list|on &lt;kind&gt;|off &lt;kind&gt;|only &lt;kind&gt;|reset]\n可用 kind: ${KINDS.join(', ')}`;
       }
       if (!kindArg || !KINDS.includes(kindArg)) {
         return `未知 kind "${htmlEscape(kindArg ?? '')}"。可用: ${KINDS.join(', ')}`;
@@ -1728,8 +1739,21 @@ async function handle(text, state, ctx, chatId, fromId) {
         await ctx.persist();
         return '已清除全部 per-kind 覆盖（恢复 env 默认）。';
       }
+      // Shortcut: /alerts only <kind>  →  enable that kind, disable
+      // every other. Saves typing 4 separate `off` commands when the
+      // user wants e.g. "just stall alerts, nothing else".
+      if (action === 'only') {
+        if (!kind || !KINDS.includes(kind)) {
+          return `用法：/alerts only &lt;kind&gt;\n可用 kind: ${KINDS.join(', ')}`;
+        }
+        const next = {};
+        for (const k of KINDS) next[k] = (k === kind);
+        state.alertKinds = next;
+        await ctx.persist();
+        return `🎯 已设为只看 <code>${kind}</code>（其它 ${KINDS.length - 1} 类已关）。`;
+      }
       if (action !== 'on' && action !== 'off') {
-        return `用法：/alerts [list|on &lt;kind&gt;|off &lt;kind&gt;|reset]\n可用 kind: ${KINDS.join(', ')}`;
+        return `用法：/alerts [list|on &lt;kind&gt;|off &lt;kind&gt;|only &lt;kind&gt;|reset]\n可用 kind: ${KINDS.join(', ')}`;
       }
       if (!kind || !KINDS.includes(kind)) {
         return `未知 kind "${htmlEscape(kind ?? '')}"。可用: ${KINDS.join(', ')}`;
