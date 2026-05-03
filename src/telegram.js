@@ -59,10 +59,44 @@ export async function sendTelegramMessage(text, { chatId, replyMarkup } = {}) {
   return tgApi('sendMessage', payload);
 }
 
+// Tags Telegram's HTML parse_mode rejects when split mid-content.
+// Order matters for repair: close inner tags before outer.
+const HTML_TAGS_TO_BALANCE = ['code', 'pre', 'b', 'i', 'u', 's'];
+
+// Counts unmatched <tag>...</tag> pairs in `text`. Positive = N open
+// tags still dangling at the end. Negative would mean malformed source
+// (close before open) — treated as 0 so we don't prepend gibberish.
+function openTagBalance(text, tag) {
+  const opens = text.match(new RegExp(`<${tag}(?:\\s[^>]*)?>`, 'g'));
+  const closes = text.match(new RegExp(`</${tag}>`, 'g'));
+  return Math.max(0, (opens?.length ?? 0) - (closes?.length ?? 0));
+}
+
+// Mutates: walks adjacent chunk pairs, closes any tag left dangling
+// at the end of chunk[i] and re-opens it at the start of chunk[i+1]
+// so neither chunk presents Telegram with unbalanced HTML. Critical
+// for messages with a long <pre> orderbook block that happens to
+// straddle the TELEGRAM_MAX boundary.
+export function rebalanceHtmlChunks(chunks) {
+  for (let i = 0; i < chunks.length - 1; i++) {
+    for (const tag of HTML_TAGS_TO_BALANCE) {
+      const bal = openTagBalance(chunks[i], tag);
+      if (bal > 0) {
+        chunks[i] = chunks[i] + `</${tag}>`.repeat(bal);
+        chunks[i + 1] = `<${tag}>`.repeat(bal) + chunks[i + 1];
+      }
+    }
+  }
+  return chunks;
+}
+
 // Splits long text on line boundaries into chunks ≤ TELEGRAM_MAX. Sends them
 // sequentially with a small delay so we don't hit Telegram's per-chat rate
 // limit. Only the LAST chunk gets the reply_markup (keyboard) so action
-// buttons appear once at the bottom.
+// buttons appear once at the bottom. Re-balances HTML tags across chunk
+// boundaries — Telegram's parser rejects "<pre>foo" without a close tag
+// in the same message, so a long orderbook block straddling the cut would
+// otherwise fail to send.
 export async function sendLongTelegramMessage(text, opts = {}) {
   if (text.length <= TELEGRAM_MAX) {
     return [await sendTelegramMessage(text, opts)];
@@ -85,6 +119,8 @@ export async function sendLongTelegramMessage(text, opts = {}) {
     }
   }
   if (cur) chunks.push(cur);
+
+  rebalanceHtmlChunks(chunks);
 
   const results = [];
   for (let i = 0; i < chunks.length; i++) {
