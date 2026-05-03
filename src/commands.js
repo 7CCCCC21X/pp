@@ -577,16 +577,20 @@ function renderListPage(cmd, page, state) {
   let rows = [];
   let header = '';
   let extraFn = null;
+  // Live = the last tick actually fetched + processed this market. Skip-stub
+  // slots (expired 15-min markets, no-reward, etc.) keep their slot record
+  // for /status reporting but must not appear in opportunity lists.
+  const isLive = (slot) => slot && !slot.lastError && !slot.lastSkipReason;
   switch (cmd) {
     case 'top':
       rows = allRows
-        .filter(({ slot }) => !slot.lastError && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
+        .filter(({ slot }) => isLive(slot) && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
         .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
       header = '<b>🔥 PP/h Top</b>';
       break;
     case 'gaps':
       rows = allRows
-        .filter(({ slot }) => !slot.lastError && slot.zoneStatus
+        .filter(({ slot }) => isLive(slot) && slot.zoneStatus
           && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated))
         .sort((a, b) => (b.slot.lastHourlyRate ?? 0) - (a.slot.lastHourlyRate ?? 0));
       header = '<b>🎯 奖励区有空缺（未激活）</b>';
@@ -599,7 +603,7 @@ function renderListPage(cmd, page, state) {
       break;
     case 'wide':
       rows = allRows
-        .filter(({ slot }) => !slot.lastError)
+        .filter(({ slot }) => isLive(slot))
         .map(({ id, slot }) => {
           const bid = slot.baseline?.bidPrice;
           const ask = slot.baseline?.askPrice;
@@ -612,7 +616,7 @@ function renderListPage(cmd, page, state) {
       extraFn = (_slot, row) => `spread ${(row.spread * 100).toFixed(2)}¢`;
       break;
     case 'empty':
-      rows = allRows.filter(({ slot }) => !slot.lastError && slot.baseline
+      rows = allRows.filter(({ slot }) => isLive(slot) && slot.baseline
         && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null));
       header = '<b>🌊 单边/空簿</b>';
       extraFn = (slot) => {
@@ -628,7 +632,7 @@ function renderListPage(cmd, page, state) {
       // opportunities float to the top of the list.
       const threshold = config.lowDepthThreshold;
       rows = allRows
-        .filter(({ slot }) => !slot.lastError && slot.baseline
+        .filter(({ slot }) => isLive(slot) && slot.baseline
           && Number.isFinite(slot.baseline.bidPrice) && Number.isFinite(slot.baseline.bidSize)
           && Number.isFinite(slot.baseline.askPrice) && Number.isFinite(slot.baseline.askSize))
         .map(({ id, slot }) => {
@@ -646,7 +650,7 @@ function renderListPage(cmd, page, state) {
     case 'opp':
     case 'opportunities':
       rows = allRows
-        .filter(({ slot }) => !slot.lastError)
+        .filter(({ slot }) => isLive(slot))
         .map(({ id, slot }) => ({ id, slot, score: opportunityScore(slot) }))
         .filter((x) => x.score > 0)
         .sort((a, b) => b.score - a.score);

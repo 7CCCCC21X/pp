@@ -66,7 +66,9 @@ function ensureSlot(state, marketId, cur, now) {
 
 // Stub slot for markets we can't fully process yet (resolved, fetch failed,
 // no rewards). Lets /status surface a real reason instead of the misleading
-// "等待首次抓取" forever.
+// "等待首次抓取" forever. Also clears stale rate/zone snapshots from a
+// previous successful tick — otherwise /top, /gaps, /opp keep listing
+// expired 15-min markets at their last-known PP/h.
 function ensureStubSlot(state, marketId, now) {
   let slot = state.markets[marketId];
   if (!slot) {
@@ -74,6 +76,8 @@ function ensureStubSlot(state, marketId, now) {
     state.markets[marketId] = slot;
   }
   slot.lastSeenAt = now;
+  slot.lastHourlyRate = 0;
+  slot.zoneStatus = null;
   return slot;
 }
 
