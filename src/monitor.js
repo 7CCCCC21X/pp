@@ -243,6 +243,19 @@ export async function checkMarket(marketId, state, { isPaused }) {
     }
   }
   slot.lastHourlyRate = totalHourlyRate;
+  // Per-tick book metrics for the unified row format used by every list
+  // command (/top, /gaps, /thin, /wide, /empty, /opp). Computing once
+  // here costs nothing and lets renderListPage skip recomputation.
+  slot.lastSpread = (Number.isFinite(orderbook.bestBid?.price) && Number.isFinite(orderbook.bestAsk?.price))
+    ? orderbook.bestAsk.price - orderbook.bestBid.price
+    : null;
+  const bidUsd = orderbook.bestBid ? orderbook.bestBid.price * orderbook.bestBid.size : 0;
+  const askUsd = orderbook.bestAsk ? orderbook.bestAsk.price * orderbook.bestAsk.size : 0;
+  slot.lastTopUsd = bidUsd + askUsd;
+  const sumSide = (rows) => Array.isArray(rows)
+    ? rows.reduce((acc, r) => acc + ((r?.price ?? 0) * (r?.size ?? 0)), 0)
+    : 0;
+  slot.lastTotalUsd = sumSide(orderbook.bids) + sumSide(orderbook.asks);
   const lastSeenAt = slot.lastSeenAt ?? now;
   slot.lastSeenAt = now;
 

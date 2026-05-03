@@ -547,16 +547,35 @@ function freshnessLines(state, { compact = false } = {}) {
   return lines;
 }
 
-function compactMarketRow(id, slot, extra = '') {
-  // Always render as a link — even with no title/question the marketLink
-  // helper falls back to "Market <id>" with a /market/<id> URL, so the
-  // user can still click through.
+// Two-line opportunity row used by every list command. Top line is
+// the comparable metric strip (PP/h, remaining, gap, spread, depth,
+// per-list extra); second line is the clickable title. extra is an
+// optional suffix appended to the metric strip — typically a list-
+// specific value like "spread 5.20¢" for /wide.
+function compactOpportunityRow(id, slot, extra = '') {
   const linked = marketLink(id, slot?.title, slot?.question, slot?.slug);
-  const rate = Number.isFinite(slot?.lastHourlyRate)
-    ? `${slot.lastHourlyRate.toFixed(0)}/h`
-    : '?/h';
-  const suffix = extra ? ` · ${htmlEscape(extra)}` : '';
-  return `<code>#${htmlEscape(id)}</code> ${linked} — <b>${rate}</b>${suffix}`;
+  const rate = Number.isFinite(slot?.lastHourlyRate) ? slot.lastHourlyRate : 0;
+
+  const remainH = (Number.isFinite(slot?.endMs) && slot.endMs > Date.now())
+    ? (slot.endMs - Date.now()) / 3600000
+    : null;
+  const totalPp = (remainH != null && rate > 0) ? rate * remainH : null;
+
+  const z = slot?.zoneStatus;
+  const gaps = [];
+  if (z) {
+    if (!z.bidActivated) gaps.push('买');
+    if (!z.askActivated) gaps.push('卖');
+  }
+
+  const parts = [`<code>#${htmlEscape(id)}</code>`, `<b>${rate.toFixed(0)}/h</b>`];
+  if (totalPp != null) parts.push(`${remainH.toFixed(1)}h≈${totalPp.toFixed(0)}PP`);
+  if (gaps.length) parts.push(`gap:${gaps.join('/')}`);
+  if (Number.isFinite(slot?.lastSpread)) parts.push(`spr ${(slot.lastSpread * 100).toFixed(1)}¢`);
+  if (Number.isFinite(slot?.lastTopUsd) && slot.lastTopUsd > 0) parts.push(`top $${slot.lastTopUsd.toFixed(0)}`);
+  if (extra) parts.push(htmlEscape(extra));
+
+  return `${parts.join(' · ')}\n   ${linked}`;
 }
 
 // --- Pagination helpers for /top /gaps /wide /empty /opportunities ---
@@ -693,7 +712,7 @@ function renderListPage(cmd, page, state) {
   const lines = [`${header} <i>(${items.length} / ${rows.length})</i>`, ''];
   for (const row of items) {
     const extra = extraFn ? extraFn(row.slot, row) : '';
-    lines.push(compactMarketRow(row.id, row.slot, extra));
+    lines.push(compactOpportunityRow(row.id, row.slot, extra));
   }
   // Compact freshness footer so the user knows how stale the data is.
   const fresh = freshnessLines(state, { compact: true });
@@ -759,7 +778,7 @@ async function buildStatusDashboard(state) {
   if (errors.length) {
     lines.push('⚠️ <b>错误</b>');
     for (const { id, slot } of errors.slice(0, 8)) {
-      lines.push(compactMarketRow(id, slot, slot.lastError));
+      lines.push(compactOpportunityRow(id, slot, slot.lastError));
     }
     if (errors.length > 8) lines.push(`……还有 ${errors.length - 8} 个错误市场`);
     lines.push('');
@@ -772,7 +791,7 @@ async function buildStatusDashboard(state) {
       const sides = [];
       if (!slot.zoneStatus.bidActivated) sides.push('买✗');
       if (!slot.zoneStatus.askActivated) sides.push('卖✗');
-      lines.push(compactMarketRow(id, slot, sides.join(',')));
+      lines.push(compactOpportunityRow(id, slot, sides.join(',')));
     }
     if (gaps.length > 10) lines.push(`……还有 ${gaps.length - 10} 个空缺市场`);
     lines.push('');
@@ -782,7 +801,7 @@ async function buildStatusDashboard(state) {
     lines.push('🔥 <b>PP/h Top</b>');
     for (const { id, slot } of ppRows.slice(0, 10)) {
       const since = slot.lastChangeAt ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}` : '';
-      lines.push(compactMarketRow(id, slot, since));
+      lines.push(compactOpportunityRow(id, slot, since));
     }
   }
 
