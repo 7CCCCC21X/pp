@@ -45,6 +45,17 @@ test('state.alertKinds reset clears overrides', () => {
   assert.deepEqual(state.alertKinds, {});
 });
 
+test('state.chatRouting: per-chat exclude list shape', () => {
+  // Documents the routing shape used by chatsForKind in monitor.js.
+  // Each chat keeps its own exclude list; missing chat = no exclusions.
+  const state = { chatRouting: {} };
+  state.chatRouting['-100123'] = { exclude: ['mid_jump'] };
+  state.chatRouting['-100456'] = { exclude: ['stall', 'wide_spread'] };
+  assert.ok(state.chatRouting['-100123'].exclude.includes('mid_jump'));
+  assert.equal(state.chatRouting['-100123'].exclude.includes('stall'), false);
+  assert.equal(state.chatRouting['-100789'], undefined);  // missing chat = undefined
+});
+
 test('state shape sanity: addAllowedChat still works alongside new fields', () => {
   // Regression: confirm the new emptyState fields don't break existing helpers.
   const state = { allowedChats: [], quietUntil: 0, alertKinds: {} };

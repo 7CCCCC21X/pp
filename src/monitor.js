@@ -96,10 +96,21 @@ const ADMIN_ONLY_KINDS = new Set(['watch', 'snapshot']);
 
 function chatsForKind(state, kind) {
   const baseKind = kind.replace(/_recovered$/, '');
+  // Layer 1: kind-based default routing.
+  let candidates;
   if (ADMIN_ONLY_KINDS.has(baseKind)) {
-    return config.telegramChatId ? [String(config.telegramChatId)] : [];
+    candidates = config.telegramChatId ? [String(config.telegramChatId)] : [];
+  } else {
+    candidates = broadcastChats(state);
   }
-  return broadcastChats(state);
+  // Layer 2: per-chat exclude. /route off <kind> in a specific chat
+  // takes that chat off the candidate list for this kind. Useful when
+  // a group only wants reward_zone alerts but not noisy stall pings.
+  const routing = state.chatRouting ?? {};
+  return candidates.filter((cid) => {
+    const route = routing[String(cid)];
+    return !route?.exclude?.includes(baseKind);
+  });
 }
 
 async function alert(state, kind, slot, marketId, message, extra = {}) {

@@ -53,6 +53,7 @@ const PRIVATE_MENU = [
   { command: 'snapshot', description: '定时盘口快照（admin 私聊，用法: /snapshot <id> 5m）' },
   { command: 'quiet', description: '全局静音所有提醒 (用法: /quiet 2h | /quiet off)' },
   { command: 'alerts', description: '按类型开关提醒（停滞/跳变/阔差/奖励区/空簿）' },
+  { command: 'route', description: '当前 chat 的路由（每个 chat 独立排除某些 kind）' },
   { command: 'discover', description: '立即触发自动发现' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
@@ -689,7 +690,8 @@ const HELP = [
   '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 临时静音单市场',
   '/snapshot [id interval | id off | (无参列表)] — 定时盘口快照（仅 admin 私聊收）',
   '/quiet [duration] — 全局静音所有提醒（默认 2h，/quiet off 取消）',
-  '/alerts [on|off &lt;kind&gt;|reset] — 按类型开关：stall / mid_jump / wide_spread / reward_zone / empty_book',
+  '/alerts [on|off &lt;kind&gt;|reset] — 全局按类型开关：stall / mid_jump / wide_spread / reward_zone / empty_book',
+  '/route [on|off &lt;kind&gt;|reset] — 当前 chat 独立路由（每个群可只看自己关心的 kind）',
   '/watch &lt;id&gt; — 密集追踪',
   '/watched — 列出当前所有 /watch 追踪的市场',
   '/unwatch &lt;id|all&gt; — 取消密集追踪',
@@ -1583,6 +1585,65 @@ async function handle(text, state, ctx, chatId, fromId) {
     // detector still runs and updates baselines / history.
     //   /alerts                    → list current state
     //   /alerts off <kind>         → disable
+    // Per-CHAT alert routing (vs /alerts which is global). Each chat
+    // can independently exclude alert kinds — admin DM keeps all,
+    // group A only takes reward_zone, group B only stall etc.
+    //   /route                  → list current chat's exclusions
+    //   /route off <kind>       → exclude this kind from this chat
+    //   /route on <kind>        → re-include
+    //   /route reset            → drop chat-specific routing (back to default)
+    case '/route': {
+      const KINDS = ['stall', 'mid_jump', 'wide_spread', 'reward_zone', 'empty_book'];
+      const cid = String(chatId ?? '');
+      if (!cid) return '无法识别当前 chat。';
+      const [sub, kindArg] = arg.split(/\s+/);
+      const action = (sub ?? '').toLowerCase();
+      if (!action || action === 'list' || action === 'ls') {
+        const route = state.chatRouting?.[cid];
+        const excluded = route?.exclude ?? [];
+        const lines = [
+          `🚦 <b>当前 chat 路由</b>`,
+          `chat: <code>${htmlEscape(cid)}</code>`,
+          '',
+        ];
+        for (const k of KINDS) {
+          const off = excluded.includes(k);
+          lines.push(`  ${off ? '🚫' : '✅'} ${k}`);
+        }
+        if (excluded.length === 0) {
+          lines.push('');
+          lines.push('<i>(默认 — 所有 kind 都会送达此 chat)</i>');
+        }
+        lines.push('');
+        lines.push('用法：/route off &lt;kind&gt; · /route on &lt;kind&gt; · /route reset');
+        return lines.join('\n');
+      }
+      if (action === 'reset') {
+        if (state.chatRouting?.[cid]) {
+          const next = { ...state.chatRouting };
+          delete next[cid];
+          state.chatRouting = next;
+          await ctx.persist();
+          return `已重置 <code>${htmlEscape(cid)}</code> 的路由（恢复默认）。`;
+        }
+        return '当前 chat 没有自定义路由。';
+      }
+      if (action !== 'on' && action !== 'off') {
+        return `用法：/route [list|on &lt;kind&gt;|off &lt;kind&gt;|reset]\n可用 kind: ${KINDS.join(', ')}`;
+      }
+      if (!kindArg || !KINDS.includes(kindArg)) {
+        return `未知 kind "${htmlEscape(kindArg ?? '')}"。可用: ${KINDS.join(', ')}`;
+      }
+      state.chatRouting = { ...(state.chatRouting ?? {}) };
+      const cur = state.chatRouting[cid] ?? {};
+      const exclude = new Set(cur.exclude ?? []);
+      if (action === 'off') exclude.add(kindArg);
+      else exclude.delete(kindArg);
+      state.chatRouting[cid] = { ...cur, exclude: [...exclude] };
+      await ctx.persist();
+      return `${action === 'off' ? '🚫' : '✅'} 当前 chat 的 <code>${kindArg}</code> 已${action === 'off' ? '关闭' : '开启'}。`;
+    }
+
     //   /alerts on  <kind>         → re-enable
     //   /alerts reset              → clear all overrides (back to env)
     case '/alerts': {

@@ -15,6 +15,7 @@ function emptyState() {
     quietUntil: 0,        // global silence until this unix ms (0 = off)
     alertKinds: {},       // per-kind on/off override; missing = use config default
     snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
+    chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -44,6 +45,7 @@ export async function loadState() {
       quietUntil: json.quietUntil ?? 0,
       alertKinds: json.alertKinds ?? {},
       snapshots: json.snapshots ?? {},
+      chatRouting: json.chatRouting ?? {},
       filters: json.filters ?? {},
     };
   } catch (err) {
