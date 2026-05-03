@@ -63,36 +63,82 @@ const PRIVATE_MENU = [
 
 const GROUP_MENU = PRIVATE_MENU.filter((c) => c.command !== 'whitelist');
 
-// Inline keyboard for /menu — quick-tap buttons that issue commands via
-// callback_data. Each button label is short to fit on mobile.
-function menuKeyboard() {
+// Inline keyboard for /menu. Two layouts:
+//   - private: full grouped layout (机会找寻 / 监控管理 / 单市场 / 设置)
+//   - group:   top-row reads only — group members rarely need /refresh
+//              / /digest / /alerts which are admin-flavored
+function menuKeyboard({ isPrivate = true } = {}) {
+  if (!isPrivate) {
+    return {
+      inline_keyboard: [
+        [
+          { text: '📡 状态', callback_data: '/status' },
+          { text: '🔥 PP/h 榜', callback_data: '/top' },
+        ],
+        [
+          { text: '🎯 空缺榜', callback_data: '/gaps' },
+          { text: '💧 薄盘榜', callback_data: '/thin' },
+        ],
+        [
+          { text: '📏 价差榜', callback_data: '/wide' },
+          { text: '🌊 空簿榜', callback_data: '/empty' },
+        ],
+        [
+          { text: '❓ 帮助', callback_data: '/help' },
+        ],
+      ],
+    };
+  }
   return {
     inline_keyboard: [
+      // 🔍 机会找寻
       [
-        { text: '📡 状态', callback_data: '/status' },
         { text: '🔥 PP/h 榜', callback_data: '/top' },
-      ],
-      [
         { text: '🎯 空缺榜', callback_data: '/gaps' },
         { text: '💧 薄盘榜', callback_data: '/thin' },
       ],
       [
         { text: '📏 价差榜', callback_data: '/wide' },
         { text: '🌊 空簿榜', callback_data: '/empty' },
+        { text: '🔍 自定义筛', callback_data: '/find' },
       ],
+      // 👁 监控管理
       [
-        { text: '🔍 自定义筛选', callback_data: '/find' },
+        { text: '📡 状态', callback_data: '/status' },
+        { text: '⚡ 刷新缓存', callback_data: '/refresh' },
+        { text: '🔄 自动发现', callback_data: '/discover' },
       ],
+      // 📸 单市场（粘 URL / id 也直接吃）
       [
-        { text: '⚡ 刷新 PP', callback_data: '/refresh' },
-        { text: '🔄 立即发现', callback_data: '/discover' },
+        { text: '📸 快照列表', callback_data: '/snapshot' },
         { text: '📈 24h 摘要', callback_data: '/digest' },
       ],
+      // ⚙️ 设置
       [
+        { text: '🔔 提醒类型', callback_data: '/alerts' },
+        { text: '🎚 过滤器', callback_data: '/filter' },
+      ],
+      [
+        { text: '📋 当前配置', callback_data: '/config' },
         { text: '❓ 帮助', callback_data: '/help' },
       ],
     ],
   };
+}
+
+// Header text for /menu — labels each button group so the layout is
+// scannable. Embedded URL/id paste hint reduces friction for the
+// most common admin flow.
+function menuText({ isPrivate = true } = {}) {
+  if (!isPrivate) return '<b>快捷菜单</b> — 点按钮或输入 /command';
+  return [
+    '<b>快捷菜单</b>',
+    '',
+    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 自定义筛',
+    '👁 <b>监控管理</b>: 状态 / 刷新 / 自动发现',
+    '📸 <b>单市场</b>: 直接粘 URL 或 #id 进来 → 出操作菜单',
+    '⚙️ <b>设置</b>: 提醒类型 / 过滤器 / 配置',
+  ].join('\n');
 }
 
 // Inline keyboard attached to alert messages so the user can act
@@ -192,6 +238,40 @@ function actionText(market) {
     '想做什么？',
   ];
   return lines.join('\n');
+}
+
+// Detects "<digits>" or "#<digits>" sent as a bare message — admin-DM
+// paste shortcut equivalent to /probe <id> + the action card. Returns
+// the id string or null. Length check (≥4) avoids triggering on plain
+// numbers like "5" that the user might be typing for an interval.
+function extractBareMarketId(text) {
+  const t = String(text ?? '').trim();
+  const m = t.match(/^#?(\d{4,})$/);
+  return m ? m[1] : null;
+}
+
+// Looks up a single market id and shows the action card. Used by both
+// the bare-id paste flow and the singleton URL match path.
+async function showActionCardForId(id, state, ctx, chatId) {
+  const { getMarketRewardSummary, marketEndMs } = await import('./predict.js');
+  let summary;
+  try {
+    summary = await getMarketRewardSummary(id);
+  } catch (err) {
+    await sendTelegramMessage(`查询失败: ${htmlEscape(err.message)}`, { chatId });
+    return;
+  }
+  if (!summary?.market) {
+    await sendTelegramMessage(`未找到市场 #${htmlEscape(id)}（不在 PP 列表里、id 错了或已 resolve）。`, { chatId });
+    return;
+  }
+  const market = {
+    id: String(id),
+    title: summary.market.title ?? summary.market.question ?? null,
+    rate: summary.totalHourlyRate ?? 0,
+    endMs: marketEndMs(summary.market),
+  };
+  await sendTelegramMessage(actionText(market), { chatId, replyMarkup: actionKeyboard(market.id) });
 }
 
 async function handleUrlPaste(url, state, ctx, { chatId }) {
@@ -779,7 +859,9 @@ async function buildProbeMessage(marketId, state) {
   lines.push(`奖励区: ±${(zone.maxDistance * 100).toFixed(1)}¢ / size ≥ ${zone.minSize}  (距离: ${srcLabel(zone.maxSource)}, size: ${srcLabel(zone.sizeSource)})`);
   lines.push(`  买侧: ${zone.bidActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.bidReason ?? '未激活')}`}`);
   lines.push(`  卖侧: ${zone.askActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.askReason ?? '未激活')}`}`);
-  return lines.join('\n');
+  // Same action menu shown after URL paste — one tap to /watch /
+  // /snapshot / /add this market.
+  return { text: lines.join('\n'), replyMarkup: actionKeyboard(marketId) };
 }
 
 function zoneTag(slot) {
@@ -1294,8 +1376,12 @@ async function handle(text, state, ctx, chatId, fromId) {
 
   switch (cmd) {
     case '/start':
-    case '/menu':
-      return { text: '<b>快捷菜单</b> — 点按钮或直接输入命令', replyMarkup: menuKeyboard() };
+    case '/menu': {
+      // Private chat = admin DM (chatId === fromId for personal accounts).
+      // Group chats see the trimmed menu without the admin-flavored buttons.
+      const isPrivate = isAdminUser(fromId);
+      return { text: menuText({ isPrivate }), replyMarkup: menuKeyboard({ isPrivate }) };
+    }
 
     case '/help':
       return HELP;
@@ -1875,18 +1961,25 @@ export function startCommandLoop({ getState, persist, ctx }) {
               }
               continue;
             }
-            // URL paste shortcut: in admin DM, paste a Predict.fun URL
-            // and get the picker card / action menu without typing /add.
-            // Group chats keep going through the command parser to avoid
-            // accidental link expansion.
-            const url = !text.startsWith('/') && isAdminUser(fromId)
-              ? extractPredictFunUrl(text)
-              : null;
-            if (url) {
-              await handleUrlPaste(url, state, fullCtx, { chatId }).catch((err) => {
-                warn('url paste error:', err.message);
-              });
-              continue;
+            // Smart paste shortcut for admin DM: bare URLs / market ids
+            // skip /command parsing and go straight to the action card.
+            // Group chats are excluded so member-shared URLs don't expand
+            // unintentionally.
+            if (!text.startsWith('/') && isAdminUser(fromId)) {
+              const url = extractPredictFunUrl(text);
+              if (url) {
+                await handleUrlPaste(url, state, fullCtx, { chatId }).catch((err) => {
+                  warn('url paste error:', err.message);
+                });
+                continue;
+              }
+              const bareId = extractBareMarketId(text);
+              if (bareId) {
+                await showActionCardForId(bareId, state, fullCtx, chatId).catch((err) => {
+                  warn('bare-id paste error:', err.message);
+                });
+                continue;
+              }
             }
             await dispatchCommand(text, state, fullCtx, { chatId, fromId });
           } else if (u.callback_query) {

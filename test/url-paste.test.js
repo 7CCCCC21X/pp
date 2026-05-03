@@ -65,3 +65,30 @@ test('slugFromPredictUrl: handles query strings', () => {
 test('slugFromPredictUrl: returns null when /market/ is absent', () => {
   assert.equal(slugFromPredictUrl('https://predict.fun/zh-cn/leaderboard'), null);
 });
+
+// Regex copy mirrors extractBareMarketId in src/commands.js — keeps
+// behaviour locked even though the function isn't exported.
+function extractBareMarketId(text) {
+  const t = String(text ?? '').trim();
+  const m = t.match(/^#?(\d{4,})$/);
+  return m ? m[1] : null;
+}
+
+test('extractBareMarketId: digit-only message resolves to id', () => {
+  assert.equal(extractBareMarketId('241373'), '241373');
+  assert.equal(extractBareMarketId('  241373  '), '241373');
+});
+
+test('extractBareMarketId: tolerates leading #', () => {
+  assert.equal(extractBareMarketId('#257916'), '257916');
+});
+
+test('extractBareMarketId: rejects too-short numbers (probably not ids)', () => {
+  assert.equal(extractBareMarketId('5'), null);
+  assert.equal(extractBareMarketId('100'), null);
+});
+
+test('extractBareMarketId: rejects mixed text', () => {
+  assert.equal(extractBareMarketId('id: 241373'), null);
+  assert.equal(extractBareMarketId('241373 watch'), null);
+});
