@@ -2,7 +2,7 @@ import { config } from './config.js';
 import { getMarketRewardSummary, getOrderbook, marketEndMs, getSlugMapCached, getMarketRestById } from './predict.js';
 import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
-import { fmtElapsed, midOf, spreadOf, rewardZoneStatus } from './format.js';
+import { fmtElapsed, midOf, spreadOf, rewardZoneStatus, scoreSlot, priorityOf } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
 import { effectiveOverride, broadcastChats } from './state.js';
 import { alertKeyboard } from './commands.js';
@@ -81,6 +81,11 @@ function ensureStubSlot(state, marketId, now) {
   return slot;
 }
 
+// Priority gate ordering: 'all' lets every priority through, 'high'
+// only allows 🔥. Numeric ranks let comparisons stay readable.
+const PRIORITY_RANK = { all: 0, low: 1, medium: 2, high: 3 };
+const PRIORITY_BADGE = { high: '🔥', medium: '⭐', low: '' };
+
 async function alert(state, kind, slot, marketId, message, extra = {}) {
   const isWatchOrRecovery = kind === 'watch' || kind.endsWith('_recovered');
 
@@ -107,6 +112,23 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
     }
   }
 
+  // Compute priority once — used both for the badge and the gate.
+  // Watch/recovery skip the gate but still get a badge for visual
+  // consistency in the chat history.
+  const score = scoreSlot(slot);
+  const priority = priorityOf(score, {
+    highThreshold: config.alertPriorityHigh,
+    mediumThreshold: config.alertPriorityMedium,
+  });
+  if (!isWatchOrRecovery) {
+    const minRank = PRIORITY_RANK[config.alertPriorityMin] ?? 0;
+    const myRank = PRIORITY_RANK[priority] ?? 1;
+    if (myRank < minRank) {
+      log(`[${marketId}] suppress ${kind} (priority ${priority} < min ${config.alertPriorityMin})`);
+      return false;
+    }
+  }
+
   // 4) Per-market cross-type cooldown to keep one illiquid market from
   //    emitting wide_spread + reward_zone + empty_book back-to-back.
   if (!isWatchOrRecovery) {
@@ -116,8 +138,11 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
       return false;
     }
   }
-  // 5) Hashtag footer for in-app search ("#stall" pulls every stall alert).
-  const tagged = `${message}\n\n#${kind} #market_${marketId}`;
+  // 5) Decorate: priority badge prepended to the title line, hashtag
+  //    footer (#kind #market_id #priority) for in-app search.
+  const badge = PRIORITY_BADGE[priority];
+  const decorated = badge ? `${badge} ${message}` : message;
+  const tagged = `${decorated}\n\n#${kind} #market_${marketId}${badge ? ` #${priority}` : ''}`;
   try {
     const chatIds = broadcastChats(state);
     await broadcastTelegramMessage(tagged, { chatIds, replyMarkup: alertKeyboard(marketId) });
@@ -131,6 +156,8 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
     marketId,
     title: slot.title ?? null,
     totalHourlyRate: slot.lastHourlyRate,
+    priority,
+    score: Math.round(score),
     ...extra,
   }).catch(() => {});
   if (!isWatchOrRecovery) {

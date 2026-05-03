@@ -161,6 +161,14 @@ export const config = {
   // PP/h still get monitored and show in /top, but no proactive alert is
   // sent. Default 0 = match the discovery threshold (everything alerts).
   alertMinHourlyRate: num('ALERT_MIN_HOURLY_RATE', 0),
+  // Priority tiering — opportunityScore (PP/h × gap_mult × spread_mult)
+  // gets bucketed into low / medium / high. Badge prepended to the alert
+  // title; low-priority alerts can be globally suppressed via the gate.
+  alertPriorityHigh: num('ALERT_PRIORITY_HIGH', 2000),
+  alertPriorityMedium: num('ALERT_PRIORITY_MEDIUM', 500),
+  // Minimum priority required for an alert to actually send. One of:
+  //   'all' | 'low' | 'medium' | 'high' (default 'all' = no gating)
+  alertPriorityMin: (process.env.ALERT_PRIORITY_MIN ?? 'all').trim().toLowerCase(),
   // Skip auto-discovered markets ending within this many hours from now.
   // Useful for filtering out 15-min Bitcoin Up/Down markets that resolve
   // before STALE_HOURS could ever fire. Default = STALE_HOURS so a stall
@@ -254,6 +262,12 @@ export function validateConfig() {
   if (config.graphqlTimeoutMs < 1_000) errors.push('GRAPHQL_TIMEOUT_MS must be >= 1000');
   if (config.orderbookTimeoutMs < 1_000) errors.push('ORDERBOOK_TIMEOUT_MS must be >= 1000');
   if (config.minHourlyRate < 0) errors.push('MIN_HOURLY_RATE must be >= 0');
+  if (!['all', 'low', 'medium', 'high'].includes(config.alertPriorityMin)) {
+    errors.push(`ALERT_PRIORITY_MIN must be one of all/low/medium/high (got "${config.alertPriorityMin}")`);
+  }
+  if (config.alertPriorityHigh <= config.alertPriorityMedium) {
+    errors.push('ALERT_PRIORITY_HIGH must be > ALERT_PRIORITY_MEDIUM');
+  }
   if (config.minRemainingHours < 0) errors.push('MIN_REMAINING_HOURS must be >= 0');
   if (config.historyKeepDays < 0) errors.push('HISTORY_KEEP_DAYS must be >= 0');
   for (const k of Object.keys(config.filters)) {

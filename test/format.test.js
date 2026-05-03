@@ -10,6 +10,8 @@ import {
   rewardZoneStatus,
   slugify,
   formatOpportunitySummary,
+  scoreSlot,
+  priorityOf,
 } from '../src/format.js';
 
 test('fmtSide handles null', () => {
@@ -170,4 +172,44 @@ test('formatOpportunitySummary: skips totalPP when endMs is past', () => {
     endMs: Date.now() - 1000,
   });
   assert.ok(!text.includes('剩余'));
+});
+
+test('scoreSlot: zero rate → zero score', () => {
+  assert.equal(scoreSlot({ lastHourlyRate: 0 }), 0);
+  assert.equal(scoreSlot({}), 0);
+  assert.equal(scoreSlot(null), 0);
+});
+
+test('scoreSlot: gap multiplier doubles per missing side', () => {
+  // No gap, no spread info → score = rate × 1
+  assert.equal(scoreSlot({ lastHourlyRate: 100 }), 100);
+  // Single-side gap → +1 mult (×2)
+  assert.equal(scoreSlot({
+    lastHourlyRate: 100,
+    zoneStatus: { bidActivated: false, askActivated: true },
+  }), 200);
+  // Both sides gap → ×3
+  assert.equal(scoreSlot({
+    lastHourlyRate: 100,
+    zoneStatus: { bidActivated: false, askActivated: false },
+  }), 300);
+});
+
+test('scoreSlot: tighter spread bumps score', () => {
+  // 0.05 spread → mult ≈ 1 + (0.5 - 0.05) = 1.45
+  const score = scoreSlot({
+    lastHourlyRate: 1000,
+    baseline: { bidPrice: 0.50, askPrice: 0.55 },
+  });
+  assert.ok(score > 1000 * 1.4 && score < 1000 * 1.5);
+});
+
+test('priorityOf: bucketing with explicit thresholds', () => {
+  const t = { highThreshold: 2000, mediumThreshold: 500 };
+  assert.equal(priorityOf(0, t), 'low');
+  assert.equal(priorityOf(499, t), 'low');
+  assert.equal(priorityOf(500, t), 'medium');
+  assert.equal(priorityOf(1999, t), 'medium');
+  assert.equal(priorityOf(2000, t), 'high');
+  assert.equal(priorityOf(99999, t), 'high');
 });

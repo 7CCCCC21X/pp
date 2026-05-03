@@ -245,3 +245,34 @@ export function formatOpportunitySummary({ orderbook, zone, totalHourlyRate, end
 
   return [oppParts.join(' · '), earn.join(' · ')].join('\n');
 }
+
+// Single source of truth for "how attractive is this market right now".
+// Used by /opp ranking AND by alert priority tiering. Higher = better.
+//   rate × gap_mult (1 / 2 / 3)
+//        × spread_mult (1..1.5; tighter spread = more friendly)
+export function scoreSlot(slot) {
+  const rate = slot?.lastHourlyRate ?? 0;
+  if (!rate) return 0;
+  const z = slot?.zoneStatus;
+  let mult = 1;
+  if (z) {
+    if (!z.bidActivated) mult += 1;
+    if (!z.askActivated) mult += 1;
+  }
+  const bid = slot?.baseline?.bidPrice;
+  const ask = slot?.baseline?.askPrice;
+  if (Number.isFinite(bid) && Number.isFinite(ask)) {
+    const spread = ask - bid;
+    if (spread > 0 && spread < 0.5) mult *= (1 + (0.5 - spread));
+  }
+  return rate * mult;
+}
+
+// Bucket a score into 'low' | 'medium' | 'high'. highThreshold and
+// mediumThreshold come from config so users can shift the cutoffs
+// via env without code changes.
+export function priorityOf(score, { highThreshold, mediumThreshold }) {
+  if (score >= highThreshold) return 'high';
+  if (score >= mediumThreshold) return 'medium';
+  return 'low';
+}
