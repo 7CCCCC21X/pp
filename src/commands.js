@@ -16,6 +16,7 @@ import {
   addAllowedChat,
   removeAllowedChat,
   broadcastChats,
+  effectiveOverride,
 } from './state.js';
 import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
@@ -41,6 +42,7 @@ const PRIVATE_MENU = [
   { command: 'thin', description: '薄盘市场（买1+卖1 总额 < 阈值）' },
   { command: 'wide', description: '当前价差最大的市场' },
   { command: 'empty', description: '当前单边/空簿的市场' },
+  { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -102,6 +104,9 @@ function menuKeyboard({ isPrivate = true } = {}) {
       [
         { text: '📏 价差榜', callback_data: '/wide' },
         { text: '🌊 空簿榜', callback_data: '/empty' },
+        { text: '⏱ 停滞榜', callback_data: '/stale' },
+      ],
+      [
         { text: '🔍 自定义筛', callback_data: '/find' },
       ],
       // 👁 监控管理
@@ -136,7 +141,7 @@ function menuText({ isPrivate = true } = {}) {
   return [
     '<b>快捷菜单</b>',
     '',
-    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 自定义筛',
+    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 自定义筛',
     '👁 <b>监控管理</b>: 状态 / 刷新 / 自动发现',
     '📸 <b>单市场</b>: 直接粘 URL 或 #id 进来 → 出操作菜单',
     '⚙️ <b>设置</b>: 提醒类型 / 过滤器 / 配置',
@@ -682,6 +687,7 @@ const HELP = [
   '/thin — 薄盘市场（买1+卖1 总额 &lt; 阈值）',
   '/wide — 当前价差最大',
   '/empty — 单边/空簿',
+  '/stale — 停滞时长排名（含未到 staleHours 阈值的）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -1121,6 +1127,28 @@ function renderListPage(cmd, page, state) {
       header = '<b>💎 机会评分</b> (PP × 缺口 × 价差)';
       extraFn = (_slot, row) => `score ${row.score.toFixed(0)}`;
       break;
+    case 'stale': {
+      // Stall-duration leaderboard. Includes markets that haven't yet
+      // crossed the (per-market) staleHours alert threshold so the user
+      // can see what's "approaching alert" alongside what's already fired.
+      rows = allRows
+        .filter(({ slot }) => isLive(slot) && Number.isFinite(slot.lastChangeAt))
+        .map(({ id, slot }) => {
+          const sinceMs = Date.now() - slot.lastChangeAt;
+          const thresholdH = effectiveOverride(state, id, 'staleHours', config.staleHours);
+          return { id, slot, sinceMs, thresholdH };
+        })
+        .sort((a, b) => b.sinceMs - a.sinceMs);
+      header = '<b>⏱ 停滞时长排名</b>';
+      extraFn = (slot, row) => {
+        const elapsed = fmtElapsed(row.sinceMs);
+        const thresholdMs = row.thresholdH * 3600 * 1000;
+        if (slot.alerted) return `${elapsed} · 🟡 已告警 (≥${row.thresholdH}h)`;
+        if (row.sinceMs >= thresholdMs) return `${elapsed} · 🟡 待告警 (≥${row.thresholdH}h)`;
+        return `${elapsed} / ${row.thresholdH}h`;
+      };
+      break;
+    }
     default:
       return null;
   }
@@ -1490,6 +1518,7 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/thin':
     case '/wide':
     case '/empty':
+    case '/stale':
     case '/opportunities':
     case '/opp': {
       const cmdName = cmd === '/opportunities' ? 'opp' : cmd.slice(1);
