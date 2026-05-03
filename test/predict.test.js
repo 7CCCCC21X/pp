@@ -115,6 +115,33 @@ test('extractHourlyRate: falls back to GraphQL when REST rewards absent', () => 
   }), 500);
 });
 
+test('extractHourlyRate: GraphQL rewardTimings ignored when title parses to past end', () => {
+  // 15-min Bitcoin markets: Predict.fun's GraphQL exposes hourlyRate but
+  // not endsAt on RewardTiming, so without parseEndFromTitle backup the
+  // bound-less entry would sum to 3000 even after the market ended.
+  assert.equal(extractHourlyRate({
+    title: 'Bitcoin Up or Down - Jan 1, 2020, 12AM-1AM ET',
+    rewardTimings: [{ hourlyRate: 3000 }],
+  }), 0);
+});
+
+test('extractHourlyRate: GraphQL rewardTimings still counted for future markets', () => {
+  assert.equal(extractHourlyRate({
+    title: 'Bitcoin Up or Down - Dec 31, 2099, 11AM-12PM ET',
+    rewardTimings: [{ hourlyRate: 3000 }],
+  }), 3000);
+});
+
+test('extractHourlyRate: REST current still wins when title parses to past', () => {
+  // The parsed-title guard only kicks in for the GraphQL fallback path —
+  // if REST explicitly says current is paying, that's the source of truth.
+  assert.equal(extractHourlyRate({
+    title: 'Bitcoin Up or Down - Jan 1, 2020, 12AM-1AM ET',
+    rewards: { current: { hourlyRate: 1500 } },
+    rewardTimings: [{ hourlyRate: 3000 }],
+  }), 1500);
+});
+
 test('marketEndMs accepts ISO string', () => {
   const iso = '2030-01-01T00:00:00.000Z';
   const ts = Date.parse(iso);

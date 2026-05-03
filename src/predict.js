@@ -86,6 +86,13 @@ export function extractHourlyRate(marketOrRewards) {
   // source when both are present.
   if (Array.isArray(marketOrRewards?.rewardTimings)) {
     const now = Date.now();
+    // Belt to REST's suspenders: if the market itself has a parseable
+    // end time in the past (from endsAt field or "Bitcoin Up or Down -
+    // May 3, 5AM-5:15AM ET" style titles), the bound-less rewardTimings
+    // are stale even if Predict.fun still returns them. Stops a
+    // GraphQL-only fallback from hallucinating 3000/h on ended markets.
+    const endMs = marketEndMs(marketOrRewards);
+    if (endMs != null && endMs <= now) return 0;
     return marketOrRewards.rewardTimings
       .filter((r) => isTimingActive(r, now))
       .map((r) => Number(r?.hourlyRate))
