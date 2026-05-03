@@ -868,7 +868,10 @@ async function buildStatusDashboard(state) {
   }
   const rows = ids.map((id) => ({ id, slot: state.markets[id] }));
   const errors = rows.filter(({ slot }) => slot?.lastError);
-  const skipped = rows.filter(({ slot }) => slot?.lastSkipReason);
+  const filterBlocked = rows.filter(({ slot }) => slot?.lastSkipReason?.startsWith('过滤器:'));
+  const otherSkipped = rows.filter(({ slot }) =>
+    slot?.lastSkipReason && !slot.lastSkipReason.startsWith('过滤器:')
+  );
   const waiting = rows.filter(({ slot }) => !slot);
   const paused = rows.filter(({ id }) => state.pausedIds.includes(id));
   const watched = rows.filter(({ id }) => (state.watchedIds ?? []).includes(id));
@@ -881,9 +884,23 @@ async function buildStatusDashboard(state) {
   const ppRows = rows
     .filter(({ slot }) => slot && !slot.lastError && !slot.lastSkipReason && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
     .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
-  // PP/h sum across all rewarded markets currently in the watchlist —
-  // this is the pool the user is collectively monitoring.
   const totalRate = ppRows.reduce((acc, { slot }) => acc + slot.lastHourlyRate, 0);
+  const topRate = ppRows[0]?.slot?.lastHourlyRate ?? 0;
+  // Live opportunity counts derived from per-tick slot metrics (set in
+  // monitor.js). Same definitions as the /thin /wide /empty list filters.
+  const thinCount = rows.filter(({ slot }) =>
+    slot && !slot.lastError && !slot.lastSkipReason
+    && Number.isFinite(slot.lastTopUsd) && slot.lastTopUsd > 0
+    && slot.lastTopUsd <= (config.lowDepthThreshold ?? 100)
+  ).length;
+  const wideCount = rows.filter(({ slot }) =>
+    slot && !slot.lastError && !slot.lastSkipReason
+    && Number.isFinite(slot.lastSpread) && slot.lastSpread > config.maxSpread
+  ).length;
+  const emptyCount = rows.filter(({ slot }) =>
+    slot && !slot.lastError && !slot.lastSkipReason && slot.baseline
+    && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)
+  ).length;
 
   let totalPP24h = null;
   try {
@@ -894,20 +911,24 @@ async function buildStatusDashboard(state) {
     totalPP24h = summary.reduce((a, m) => a + (m.ppEarned ?? 0), 0);
   } catch {}
 
-  const lines = [
-    '📡 <b>监控面板</b>',
-    `💰 <b>${ppRows.length}</b> 个有奖励市场 · 总 <b>${totalRate.toFixed(0)}</b> PP/h`,
-    `🎯 <b>${gaps.length}</b> 个奖励区有空缺（未激活）`,
-  ];
-  // Smaller second line for everything else (only show non-zero buckets)
-  const meta = [];
-  if (errors.length) meta.push(`⚠ 错误 ${errors.length}`);
-  if (skipped.length) meta.push(`⏭ 跳过 ${skipped.length}`);
-  if (waiting.length) meta.push(`⏳ 等待 ${waiting.length}`);
-  if (paused.length) meta.push(`⏸ 暂停 ${paused.length}`);
-  if (watched.length) meta.push(`👁 追踪 ${watched.length}`);
-  if (totalPP24h != null && totalPP24h > 0) meta.push(`📈 24h PP ${totalPP24h.toFixed(0)}`);
-  if (meta.length) lines.push(meta.join(' · '));
+  // Top dashboard panel — at-a-glance "is everything working + what's
+  // going on" without scrolling. Three grouped lines: market census,
+  // PP throughput, opportunity census.
+  const lines = ['📡 <b>监控看板</b>'];
+  const census = [`市场 <b>${ids.length}</b>`, `有效 <b>${ppRows.length}</b>`];
+  if (errors.length) census.push(`报错 ${errors.length}`);
+  if (filterBlocked.length) census.push(`过滤 ${filterBlocked.length}`);
+  if (otherSkipped.length) census.push(`跳过 ${otherSkipped.length}`);
+  if (waiting.length) census.push(`等待 ${waiting.length}`);
+  if (paused.length) census.push(`暂停 ${paused.length}`);
+  lines.push(census.join(' · '));
+  lines.push(`💰 总 <b>${totalRate.toFixed(0)}</b> PP/h · 顶 <b>${topRate.toFixed(0)}</b>/h${totalPP24h != null && totalPP24h > 0 ? ` · 24h <b>${totalPP24h.toFixed(0)} PP</b>` : ''}`);
+  const oppParts = [`奖励区空缺 <b>${gaps.length}</b>`];
+  if (thinCount > 0) oppParts.push(`薄盘 ${thinCount}`);
+  if (wideCount > 0) oppParts.push(`宽差 ${wideCount}`);
+  if (emptyCount > 0) oppParts.push(`空簿 ${emptyCount}`);
+  if (watched.length) oppParts.push(`👁 追踪 ${watched.length}`);
+  lines.push(`🎯 ${oppParts.join(' · ')}`);
   lines.push('');
 
   if (errors.length) {
@@ -1233,7 +1254,42 @@ async function handle(text, state, ctx, chatId, fromId) {
 
     case '/filter': {
       const eff = effectiveFilters(state);
-      return `<b>当前过滤器</b>\n${formatFilters(eff, state)}`;
+      // Pass/block census across the live monitored set, plus a few
+      // recent rejections so the user can see whether thresholds are
+      // sane. Pulls from slot.lastSkipReason (set in monitor.js when
+      // checkFilter returns a reason).
+      const ids = activeMarketIds(state);
+      let pass = 0, blocked = 0, noBook = 0;
+      const rejections = [];
+      for (const id of ids) {
+        const slot = state.markets[id];
+        if (!slot || slot.lastError || !slot.baseline) { noBook++; continue; }
+        if (slot.lastSkipReason?.startsWith('过滤器:')) {
+          blocked++;
+          if (rejections.length < 5) {
+            const reason = slot.lastSkipReason.replace(/^过滤器:\s*/, '');
+            rejections.push({ id, slot, reason });
+          }
+        } else {
+          pass++;
+        }
+      }
+      const lines = [
+        '🎚 <b>当前过滤器</b>',
+        formatFilters(eff, state),
+        '',
+        '<b>效果</b>',
+        `通过 <b>${pass}</b> / ${pass + blocked} · 被挡 <b>${blocked}</b>${noBook ? ` · 无盘口 ${noBook}` : ''}`,
+      ];
+      if (rejections.length) {
+        lines.push('');
+        lines.push('<b>最近被挡</b>');
+        for (const r of rejections) {
+          const title = htmlEscape(shortTitle(r.slot.title ?? r.slot.question ?? `Market ${r.id}`, 36));
+          lines.push(`<code>#${htmlEscape(r.id)}</code> ${title} — ${htmlEscape(r.reason)}`);
+        }
+      }
+      return lines.join('\n');
     }
 
     case '/setfilter': {
