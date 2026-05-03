@@ -82,11 +82,33 @@ function ensureStubSlot(state, marketId, now) {
 }
 
 async function alert(state, kind, slot, marketId, message, extra = {}) {
-  // Per-market cross-type cooldown to keep one illiquid market from
-  // emitting wide_spread + reward_zone + empty_book back-to-back. Watch
-  // is exempt (its job is per-tick reporting) and so are recovery
-  // notifications (they're terminal "back to normal" pings).
   const isWatchOrRecovery = kind === 'watch' || kind.endsWith('_recovered');
+
+  // 1) Global temporary mute — /quiet sets state.quietUntil.
+  //    Recoveries still land (they're "back to normal" pings, not noise).
+  if (!isWatchOrRecovery) {
+    if (state.quietUntil && Date.now() < state.quietUntil) {
+      log(`[${marketId}] suppress ${kind} (quiet until ${new Date(state.quietUntil).toISOString()})`);
+      return false;
+    }
+    // 2) Per-kind off-switch — /alerts off <kind>. Recovery uses its
+    //    base kind's setting so disabling stall also disables stall_recovered.
+    const baseKind = kind.replace(/_recovered$/, '');
+    if (state.alertKinds && state.alertKinds[baseKind] === false) {
+      log(`[${marketId}] suppress ${kind} (kind ${baseKind} disabled)`);
+      return false;
+    }
+    // 3) PP/h alert floor — /find / /top still see low-rate markets,
+    //    but proactive alerts only fire above ALERT_MIN_HOURLY_RATE.
+    if (config.alertMinHourlyRate > 0
+        && (slot.lastHourlyRate ?? 0) < config.alertMinHourlyRate) {
+      log(`[${marketId}] suppress ${kind} (rate ${slot.lastHourlyRate ?? 0} < ${config.alertMinHourlyRate})`);
+      return false;
+    }
+  }
+
+  // 4) Per-market cross-type cooldown to keep one illiquid market from
+  //    emitting wide_spread + reward_zone + empty_book back-to-back.
   if (!isWatchOrRecovery) {
     const sinceAny = Date.now() - (slot.lastAnyAlertAt ?? 0);
     if (sinceAny < config.marketAlertCooldownMs) {
@@ -94,9 +116,11 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
       return false;
     }
   }
+  // 5) Hashtag footer for in-app search ("#stall" pulls every stall alert).
+  const tagged = `${message}\n\n#${kind} #market_${marketId}`;
   try {
     const chatIds = broadcastChats(state);
-    await broadcastTelegramMessage(message, { chatIds, replyMarkup: alertKeyboard(marketId) });
+    await broadcastTelegramMessage(tagged, { chatIds, replyMarkup: alertKeyboard(marketId) });
   } catch (err) {
     warn(`[${marketId}] telegram send (${kind}) failed:`, err.message);
     return false;

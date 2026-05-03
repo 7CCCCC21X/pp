@@ -12,6 +12,8 @@ function emptyState() {
     snoozes: {},          // marketId -> unix ms when snooze ends
     overrides: {},        // marketId -> partial config override
     allowedChats: [],     // runtime-managed whitelist (private chats / groups)
+    quietUntil: 0,        // global silence until this unix ms (0 = off)
+    alertKinds: {},       // per-kind on/off override; missing = use config default
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -38,6 +40,8 @@ export async function loadState() {
       snoozes: json.snoozes ?? {},
       overrides: json.overrides ?? {},
       allowedChats: json.allowedChats ?? [],
+      quietUntil: json.quietUntil ?? 0,
+      alertKinds: json.alertKinds ?? {},
       filters: json.filters ?? {},
     };
   } catch (err) {

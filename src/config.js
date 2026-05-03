@@ -157,6 +157,10 @@ export const config = {
   // for filtering out short-lived high-frequency markets (like 15-min Bitcoin
   // up/down) that clutter the watchlist but never trigger stall alerts.
   minHourlyRate: num('MIN_HOURLY_RATE', 0),
+  // Floor for ALERT delivery (independent of discovery). Markets below this
+  // PP/h still get monitored and show in /top, but no proactive alert is
+  // sent. Default 0 = match the discovery threshold (everything alerts).
+  alertMinHourlyRate: num('ALERT_MIN_HOURLY_RATE', 0),
   // Skip auto-discovered markets ending within this many hours from now.
   // Useful for filtering out 15-min Bitcoin Up/Down markets that resolve
   // before STALE_HOURS could ever fire. Default = STALE_HOURS so a stall

@@ -48,7 +48,9 @@ const PRIVATE_MENU = [
   { command: 'remove', description: '永久移除' },
   { command: 'pause', description: '静音指定市场' },
   { command: 'resume', description: '恢复监控' },
-  { command: 'snooze', description: '临时静音 (用法: /snooze <id> 1h)' },
+  { command: 'snooze', description: '临时静音单市场 (用法: /snooze <id> 1h)' },
+  { command: 'quiet', description: '全局静音所有提醒 (用法: /quiet 2h | /quiet off)' },
+  { command: 'alerts', description: '按类型开关提醒（停滞/跳变/阔差/奖励区/空簿）' },
   { command: 'discover', description: '立即触发自动发现' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
@@ -422,7 +424,9 @@ const HELP = [
   '/remove &lt;id&gt; — 永久移除',
   '/pause &lt;id&gt; — 静音',
   '/resume &lt;id&gt; — 取消静音',
-  '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 临时静音',
+  '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 临时静音单市场',
+  '/quiet [duration] — 全局静音所有提醒（默认 2h，/quiet off 取消）',
+  '/alerts [on|off &lt;kind&gt;|reset] — 按类型开关：stall / mid_jump / wide_spread / reward_zone / empty_book',
   '/watch &lt;id&gt; — 密集追踪',
   '/unwatch &lt;id|all&gt; — 取消密集追踪',
   '',
@@ -1219,6 +1223,73 @@ async function handle(text, state, ctx, chatId, fromId) {
       state.snoozes = { ...(state.snoozes ?? {}), [id]: Date.now() + ms };
       await ctx.persist();
       return `已临时静音 #${htmlEscape(id)} ${htmlEscape(durStr)}（到 ${new Date(state.snoozes[id]).toISOString()}）`;
+    }
+
+    // Global mute — silences ALL non-recovery alerts for a duration.
+    // /quiet         → 2h default
+    // /quiet 30m|1d  → custom
+    // /quiet off|0   → cancel
+    case '/quiet': {
+      if (arg === 'off' || arg === '0' || arg === 'cancel') {
+        state.quietUntil = 0;
+        await ctx.persist();
+        return '🔔 静音已取消，正常发送提醒。';
+      }
+      const ms = arg ? parseDuration(arg) : 2 * 3600 * 1000;
+      if (!ms) return '用法：/quiet [duration]\n例：/quiet 30m / /quiet 2h / /quiet 1d / /quiet off';
+      state.quietUntil = Date.now() + ms;
+      await ctx.persist();
+      const until = new Date(state.quietUntil);
+      return `🔕 已全局静音 ${htmlEscape(arg || '2h')}\n恢复时间: ${until.toISOString()}\n（恢复提醒不受影响）`;
+    }
+
+    // Per-kind alert toggle — long-term "I never want to see midJump"
+    // type silencing. State key controls only the alert delivery; the
+    // detector still runs and updates baselines / history.
+    //   /alerts                    → list current state
+    //   /alerts off <kind>         → disable
+    //   /alerts on  <kind>         → re-enable
+    //   /alerts reset              → clear all overrides (back to env)
+    case '/alerts': {
+      const KINDS = ['stall', 'mid_jump', 'wide_spread', 'reward_zone', 'empty_book'];
+      const [sub, kind] = arg.split(/\s+/);
+      const action = (sub ?? '').toLowerCase();
+      const cfgDefault = (k) => ({
+        stall: config.alertStall,
+        mid_jump: config.alertMidJump,
+        wide_spread: config.alertWideSpread,
+        reward_zone: config.alertRewardZone,
+        empty_book: config.alertEmptyBook,
+      })[k];
+      if (!action || action === 'list' || action === 'ls') {
+        const lines = ['🔔 <b>提醒类型开关</b>'];
+        for (const k of KINDS) {
+          const override = state.alertKinds?.[k];
+          const enabled = override == null ? cfgDefault(k) : override;
+          const tag = override == null ? '(env)' : '(live)';
+          lines.push(`  ${enabled ? '🔔' : '🔕'} <code>${k}</code> ${tag}`);
+        }
+        const quietLeft = state.quietUntil > Date.now()
+          ? Math.round((state.quietUntil - Date.now()) / 60000)
+          : 0;
+        if (quietLeft > 0) lines.push(`\n⏸ 全局静音剩余 ${quietLeft} 分钟（/quiet off 取消）`);
+        lines.push('\n用法: /alerts [on|off] &lt;kind&gt; / /alerts reset');
+        return lines.join('\n');
+      }
+      if (action === 'reset') {
+        state.alertKinds = {};
+        await ctx.persist();
+        return '已清除全部 per-kind 覆盖（恢复 env 默认）。';
+      }
+      if (action !== 'on' && action !== 'off') {
+        return `用法：/alerts [list|on &lt;kind&gt;|off &lt;kind&gt;|reset]\n可用 kind: ${KINDS.join(', ')}`;
+      }
+      if (!kind || !KINDS.includes(kind)) {
+        return `未知 kind "${htmlEscape(kind ?? '')}"。可用: ${KINDS.join(', ')}`;
+      }
+      state.alertKinds = { ...(state.alertKinds ?? {}), [kind]: action === 'on' };
+      await ctx.persist();
+      return `${action === 'on' ? '🔔' : '🔕'} ${kind} 已${action === 'on' ? '开启' : '关闭'}。`;
     }
 
     case '/setmarket': {
