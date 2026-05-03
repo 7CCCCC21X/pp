@@ -43,6 +43,7 @@ const PRIVATE_MENU = [
   { command: 'empty', description: '当前单边/空簿的市场' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
+  { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
   { command: 'unwatch', description: '取消密集追踪' },
   { command: 'add', description: '加入监控 (用法: /add <id|slug|url>)' },
   { command: 'remove', description: '永久移除' },
@@ -690,6 +691,7 @@ const HELP = [
   '/quiet [duration] — 全局静音所有提醒（默认 2h，/quiet off 取消）',
   '/alerts [on|off &lt;kind&gt;|reset] — 按类型开关：stall / mid_jump / wide_spread / reward_zone / empty_book',
   '/watch &lt;id&gt; — 密集追踪',
+  '/watched — 列出当前所有 /watch 追踪的市场',
   '/unwatch &lt;id|all&gt; — 取消密集追踪',
   '',
   '<b>批量 / 维护</b>',
@@ -1717,6 +1719,32 @@ async function handle(text, state, ctx, chatId, fromId) {
       return await buildProbeMessage(arg, state);
     }
 
+    case '/watched': {
+      // List markets registered via /watch. Mirrors /snapshot's no-arg
+      // listing so users have a uniform "what am I tracking" view.
+      const ids = state.watchedIds ?? [];
+      if (!ids.length) {
+        return '当前无 /watch 追踪。\n用 /watch &lt;id&gt; 添加，或在 admin 私聊粘 URL/id 进入操作菜单。';
+      }
+      const lines = [`<b>👁 追踪中的市场 (${ids.length})</b>`];
+      for (const id of ids) {
+        const slot = state.markets[id];
+        const title = slot?.title
+          ? htmlEscape(shortTitle(slot.title, 40))
+          : `Market ${htmlEscape(id)}`;
+        const rate = Number.isFinite(slot?.lastHourlyRate)
+          ? `${slot.lastHourlyRate.toFixed(0)}/h`
+          : '?/h';
+        const since = slot?.lastChangeAt
+          ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}`
+          : '';
+        lines.push(`<code>#${htmlEscape(id)}</code> ${title} — ${rate}${since ? ` · ${since}` : ''}`);
+      }
+      lines.push('');
+      lines.push('用 /unwatch &lt;id&gt; 单个取消 · /unwatch all 全部取消');
+      return lines.join('\n');
+    }
+
     case '/watch': {
       if (!arg) return '用法：/watch &lt;marketId | slug | URL&gt;\n密集追踪：每次 tick 检测到买1卖1变动就立刻提醒（1 分钟冷却）。';
       const resolved = await resolveMarketInput(arg);
@@ -1729,7 +1757,7 @@ async function handle(text, state, ctx, chatId, fromId) {
     }
 
     case '/unwatch': {
-      if (!arg) return '用法：/unwatch &lt;marketId|all&gt;';
+      if (!arg) return '用法：/unwatch &lt;marketId|all&gt;\n（无参数列表已追踪：/watched）';
       if (arg === 'all') {
         state.watchedIds = [];
       } else {
