@@ -1,6 +1,6 @@
 import { config } from '../src/config.js';
 import { fetchJson } from '../src/http.js';
-import { resolveSlugToId } from '../src/predict.js';
+import { resolveSlugToId, getSlugMapCached } from '../src/predict.js';
 import { slugifyMarketTitle, rewardZoneStatus } from '../src/format.js';
 
 const arg = process.argv[2];
@@ -36,22 +36,54 @@ function extractSlug(input) {
 }
 
 (async () => {
-  // 0. If input is a slug or URL, resolve to a numeric id first.
+  // 0. If input is a slug or URL, resolve to a numeric id. Two paths:
+  //    a) resolveSlugToId — matches slugify(title) against GraphQL list.
+  //       Works for single-outcome markets where URL slug ≈ title.
+  //    b) getSlugMapCached reverse-lookup — matches categorySlug from the
+  //       REST scan. Required for multi-outcome event pages where the
+  //       URL slug is event-level and the children are titled "100-200" /
+  //       "200-300" / etc; resolveSlugToId can't see those.
   let marketId = arg;
   const maybeSlug = extractSlug(arg);
   if (maybeSlug) {
     console.log(`> resolving slug "${maybeSlug}" -> id`);
+    let resolved = null;
     try {
-      const id = await resolveSlugToId(maybeSlug, slugifyMarketTitle);
-      if (!id) {
-        console.error(`  could not resolve slug "${maybeSlug}". Try the numeric id instead.`);
+      resolved = await resolveSlugToId(maybeSlug, slugifyMarketTitle);
+    } catch (err) {
+      console.log(`  resolveSlugToId error: ${err.message}`);
+    }
+    if (resolved) {
+      console.log(`  -> #${resolved} (via title slugify)`);
+      marketId = resolved;
+    } else {
+      // Fallback: scan REST slug map for categorySlug matches.
+      console.log('  title-slugify miss, falling back to categorySlug reverse-lookup');
+      try {
+        const slugMap = await getSlugMapCached();
+        const matches = [];
+        for (const [id, slug] of slugMap.entries()) {
+          if (slug === maybeSlug) matches.push(id);
+        }
+        if (matches.length === 0) {
+          console.error(`  no match for categorySlug "${maybeSlug}".`);
+          console.error(`  REST slug cache has ${slugMap.size} entries — this market may be out of cache range.`);
+          console.error('  Try the numeric id directly, or open the page and grab the conditionId from the network tab.');
+          process.exit(1);
+        }
+        if (matches.length > 1) {
+          console.log(`  ${matches.length} sub-markets share this event-level slug:`);
+          for (const id of matches) console.log(`    #${id}`);
+          console.log(`  using first one (#${matches[0]}) for the rest of the dump.`);
+          console.log(`  (re-run with a specific id to inspect another sub-market)`);
+        } else {
+          console.log(`  -> #${matches[0]} (via categorySlug)`);
+        }
+        marketId = matches[0];
+      } catch (err) {
+        console.error('  reverse-lookup failed:', err.message);
         process.exit(1);
       }
-      console.log(`  -> #${id}`);
-      marketId = id;
-    } catch (err) {
-      console.error('  resolve failed:', err.message);
-      process.exit(1);
     }
   }
 
