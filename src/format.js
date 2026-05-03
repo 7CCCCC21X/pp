@@ -85,16 +85,27 @@ export function marketLink(marketId, title, question, slug) {
 }
 
 // Reward-zone evaluation. Predict.fun gives PP rewards to limit orders
-// within ±maxDistance of mid with size ≥ minSize. Per-market
-// spreadThreshold / shareThreshold in the market object override the
-// global defaults.
-export function rewardZoneStatus(orderbook, market, defaults) {
-  const maxDistance = Number.isFinite(market?.spreadThreshold) && market.spreadThreshold > 0
-    ? market.spreadThreshold
-    : defaults.maxDistance;
-  const minSize = Number.isFinite(market?.shareThreshold) && market.shareThreshold > 0
-    ? market.shareThreshold
-    : defaults.minSize;
+// Reward zone activation = an order at price within ±maxDistance of mid
+// with size ≥ minSize. Threshold precedence (high → low):
+//   1. overrides.maxDistance / minSize  — explicit /setmarket value
+//   2. market.spreadThreshold / shareThreshold — REST per-market values
+//   3. defaults.maxDistance / minSize    — env REWARD_ZONE_* fallback
+// Predict.fun ships per-market values for ~100% of markets today, so
+// without (1) the overrides path is dead code; passing them as a
+// fourth arg makes /setmarket actually take effect for power users
+// who want a tighter early-warning rule than the platform's actual
+// PP-eligibility window.
+export function rewardZoneStatus(orderbook, market, defaults, overrides = {}) {
+  const fromOverride = (v) => Number.isFinite(v) && v > 0 ? v : null;
+  const fromMarket = (v) => Number.isFinite(v) && v > 0 ? v : null;
+  const maxDistance =
+    fromOverride(overrides.maxDistance) ??
+    fromMarket(market?.spreadThreshold) ??
+    defaults.maxDistance;
+  const minSize =
+    fromOverride(overrides.minSize) ??
+    fromMarket(market?.shareThreshold) ??
+    defaults.minSize;
   const bid = orderbook.bestBid;
   const ask = orderbook.bestAsk;
   if (!bid || !ask) {

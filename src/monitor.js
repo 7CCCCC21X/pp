@@ -325,14 +325,22 @@ export async function checkMarket(marketId, state, { isPaused }) {
     }
   }
 
-  // Reward-zone evaluation per tick. Per-market overrides via /setmarket
-  // beat the global config; the market object's spreadThreshold /
-  // shareThreshold (from Predict.fun's REST sample) win over either.
-  // Computed BEFORE checkFilter so requireXRewardGap filters can read it.
-  const zone = rewardZoneStatus(orderbook, market, {
-    maxDistance: effectiveOverride(state, marketId, 'rewardZoneMaxDistance', config.rewardZoneMaxDistance),
-    minSize: effectiveOverride(state, marketId, 'rewardZoneMinSize', config.rewardZoneMinSize),
-  });
+  // Reward-zone evaluation per tick. Precedence inside rewardZoneStatus:
+  //   /setmarket override → REST market.spreadThreshold/shareThreshold
+  //   → env REWARD_ZONE_* default. Computed BEFORE checkFilter so
+  //   requireXRewardGap filters can read it.
+  const zone = rewardZoneStatus(
+    orderbook,
+    market,
+    {
+      maxDistance: config.rewardZoneMaxDistance,
+      minSize: config.rewardZoneMinSize,
+    },
+    {
+      maxDistance: effectiveOverride(state, marketId, 'rewardZoneMaxDistance', null),
+      minSize: effectiveOverride(state, marketId, 'rewardZoneMinSize', null),
+    },
+  );
   slot.zoneStatus = {
     bidActivated: zone.bidActivated,
     askActivated: zone.askActivated,

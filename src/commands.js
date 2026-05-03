@@ -541,7 +541,7 @@ function opportunityScore(slot) {
   return rate * mult;
 }
 
-async function buildProbeMessage(marketId) {
+async function buildProbeMessage(marketId, state) {
   const summary = await getMarketRewardSummary(marketId);
   if (!summary.market) {
     return `未找到市场 #${htmlEscape(marketId)}（不在 REST 列表里，可能 id 错了或已 resolve）。`;
@@ -555,10 +555,17 @@ async function buildProbeMessage(marketId) {
   }
   const mid = midOf(ob);
   const spread = spreadOf(ob);
-  const zone = rewardZoneStatus(ob, m, {
-    maxDistance: config.rewardZoneMaxDistance,
-    minSize: config.rewardZoneMinSize,
-  });
+  // Match monitor.js precedence so /probe reflects what alerts would use:
+  //   /setmarket override > REST market.spreadThreshold > env default.
+  const { effectiveOverride } = await import('./state.js');
+  const zone = rewardZoneStatus(
+    ob, m,
+    { maxDistance: config.rewardZoneMaxDistance, minSize: config.rewardZoneMinSize },
+    {
+      maxDistance: effectiveOverride(state ?? {}, marketId, 'rewardZoneMaxDistance', null),
+      minSize: effectiveOverride(state ?? {}, marketId, 'rewardZoneMinSize', null),
+    },
+  );
   // Probe builds a fresh link from the live market — pull a real slug
   // from the same REST cache the monitor uses (best effort).
   let realSlug = null;
@@ -1060,7 +1067,8 @@ async function buildConfigDump(state) {
   lines.push(`  停滞 (stall): ${config.alertStall ? 'on' : 'off'} · ${config.staleHours}h`);
   lines.push(`  跳变 (midJump): ${config.alertMidJump ? 'on' : 'off'} · ≥ ${config.midJumpThreshold} · 冷却 ${(config.midJumpCooldownMs / 60000).toFixed(0)}min`);
   lines.push(`  阔差 (wideSpread): ${config.alertWideSpread ? 'on' : 'off'} · > ${(config.maxSpread * 100).toFixed(2)}¢ · 持续 ${config.wideSpreadMinMinutes}min`);
-  lines.push(`  奖励区 (rewardZone): ${config.alertRewardZone ? 'on' : 'off'} · 距 mid ≤ ${(config.rewardZoneMaxDistance * 100).toFixed(2)}¢ · 量 ≥ ${config.rewardZoneMinSize} · 持续 ${config.rewardZoneMinMinutes}min`);
+  lines.push(`  奖励区 (rewardZone): ${config.alertRewardZone ? 'on' : 'off'} · env 默认距 mid ≤ ${(config.rewardZoneMaxDistance * 100).toFixed(2)}¢ · 量 ≥ ${config.rewardZoneMinSize} · 持续 ${config.rewardZoneMinMinutes}min`);
+  lines.push(`    实际值精度: /setmarket 覆盖 → REST market.spreadThreshold/shareThreshold → env 默认（绝大多数市场 REST 都会给值）`);
   lines.push(`  空簿 (emptyBook): ${config.alertEmptyBook ? 'on' : 'off'} · 持续 ${config.emptyBookMinMinutes}min`);
   lines.push(`  恢复提醒: ${config.alertRecovery ? 'on' : 'off'} · 跨类型冷却: ${(config.marketAlertCooldownMs / 60000).toFixed(0)}min`);
   lines.push('');
@@ -1381,7 +1389,7 @@ async function handle(text, state, ctx, chatId, fromId) {
 
     case '/probe': {
       if (!arg) return '用法：/probe &lt;marketId&gt;';
-      return await buildProbeMessage(arg);
+      return await buildProbeMessage(arg, state);
     }
 
     case '/watch': {

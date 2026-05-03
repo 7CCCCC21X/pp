@@ -122,6 +122,42 @@ test('rewardZoneStatus uses per-market overrides', () => {
   assert.equal(z.bidActivated, false); // spread/2 = 1¢ > 0.5¢
 });
 
+test('rewardZoneStatus precedence: explicit override beats REST market value', () => {
+  // Real-world scenario the audit caught: REST sets spreadThreshold=0.06
+  // (loose), user wants tighter early-warning at 0.02 via /setmarket.
+  // The override should win — without it the field was dead code.
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.49, size: 200 }, bestAsk: { price: 0.51, size: 200 } },
+    { spreadThreshold: 0.06, shareThreshold: 100 },     // REST
+    { maxDistance: 0.10, minSize: 50 },                  // env default
+    { maxDistance: 0.02, minSize: 150 },                 // /setmarket override
+  );
+  assert.equal(z.maxDistance, 0.02, 'override beats REST');
+  assert.equal(z.minSize, 150, 'override beats REST');
+});
+
+test('rewardZoneStatus precedence: REST wins when no override set', () => {
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.49, size: 200 }, bestAsk: { price: 0.51, size: 200 } },
+    { spreadThreshold: 0.03, shareThreshold: 200 },
+    { maxDistance: 0.06, minSize: 100 },
+    { maxDistance: null, minSize: null },                // no override
+  );
+  assert.equal(z.maxDistance, 0.03);
+  assert.equal(z.minSize, 200);
+});
+
+test('rewardZoneStatus precedence: env default when neither override nor REST set', () => {
+  const z = rewardZoneStatus(
+    { bestBid: { price: 0.49, size: 200 }, bestAsk: { price: 0.51, size: 200 } },
+    {}, // no spreadThreshold/shareThreshold
+    { maxDistance: 0.06, minSize: 100 },
+    {},
+  );
+  assert.equal(z.maxDistance, 0.06);
+  assert.equal(z.minSize, 100);
+});
+
 test('rewardZoneStatus handles empty book', () => {
   const z = rewardZoneStatus({ bestBid: null, bestAsk: null }, {}, { maxDistance: 0.06, minSize: 100 });
   assert.equal(z.bidActivated, false);
