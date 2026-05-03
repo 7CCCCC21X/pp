@@ -1,6 +1,6 @@
 import { config } from '../src/config.js';
 import { fetchJson } from '../src/http.js';
-import { resolveSlugToId, getSlugMapCached } from '../src/predict.js';
+import { resolveSlugToId } from '../src/predict.js';
 import { slugifyMarketTitle, rewardZoneStatus } from '../src/format.js';
 
 const arg = process.argv[2];
@@ -22,6 +22,50 @@ async function postGraphQL(query, variables) {
     body: JSON.stringify({ query, variables }),
   });
   return res.json();
+}
+
+// Pull every market id off a predict.fun market page. Next.js renders
+// the __NEXT_DATA__ blob server-side with full market objects (id +
+// conditionId + title + …) so a recursive walk reliably finds every
+// outcome — single-market pages return one id, event pages return
+// many. This is the authoritative fallback when REST/GraphQL slug
+// lookups miss.
+async function idsFromMarketPage(slug) {
+  const url = `https://predict.fun/en/market/${encodeURIComponent(slug)}`;
+  const res = await fetch(url, {
+    redirect: 'follow',
+    headers: {
+      // Some CDNs serve different content to non-browser UAs; mimic Chrome.
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36',
+      'Accept': 'text/html,application/xhtml+xml',
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching market page`);
+  const html = await res.text();
+  const m = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) throw new Error('__NEXT_DATA__ not found in HTML (page shape may have changed)');
+  let data;
+  try {
+    data = JSON.parse(m[1]);
+  } catch (err) {
+    throw new Error(`__NEXT_DATA__ JSON parse failed: ${err.message}`);
+  }
+  // Recursive walk for objects shaped like a market — id + conditionId
+  // is a strong signal (avoids false positives on user/event objects).
+  const ids = [];
+  const seen = new Set();
+  function walk(v) {
+    if (!v || typeof v !== 'object') return;
+    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+    const id = v.id;
+    if (id != null && typeof v.conditionId === 'string' && !seen.has(String(id))) {
+      seen.add(String(id));
+      ids.push(String(id));
+    }
+    for (const k of Object.keys(v)) walk(v[k]);
+  }
+  walk(data);
+  return ids;
 }
 
 // Extract slug from a predict.fun URL or accept a bare slug. Returns
@@ -57,31 +101,33 @@ function extractSlug(input) {
       console.log(`  -> #${resolved} (via title slugify)`);
       marketId = resolved;
     } else {
-      // Fallback: scan REST slug map for categorySlug matches.
-      console.log('  title-slugify miss, falling back to categorySlug reverse-lookup');
+      // Authoritative fallback: scrape the actual market page. Predict.fun
+      // is a Next.js site that injects a __NEXT_DATA__ JSON blob with
+      // every market id rendered on the page — same source the browser
+      // uses, so anything you can see in your browser this can resolve.
+      // Works for both single markets and event pages with multiple
+      // sub-markets (recursive walk pulls every {id, conditionId} pair).
+      console.log('  title-slugify miss, scraping page __NEXT_DATA__');
       try {
-        const slugMap = await getSlugMapCached();
-        const matches = [];
-        for (const [id, slug] of slugMap.entries()) {
-          if (slug === maybeSlug) matches.push(id);
+        const ids = await idsFromMarketPage(maybeSlug);
+        if (ids.length === 0) {
+          throw new Error('no market ids found in __NEXT_DATA__');
         }
-        if (matches.length === 0) {
-          console.error(`  no match for categorySlug "${maybeSlug}".`);
-          console.error(`  REST slug cache has ${slugMap.size} entries — this market may be out of cache range.`);
-          console.error('  Try the numeric id directly, or open the page and grab the conditionId from the network tab.');
-          process.exit(1);
-        }
-        if (matches.length > 1) {
-          console.log(`  ${matches.length} sub-markets share this event-level slug:`);
-          for (const id of matches) console.log(`    #${id}`);
-          console.log(`  using first one (#${matches[0]}) for the rest of the dump.`);
-          console.log(`  (re-run with a specific id to inspect another sub-market)`);
+        if (ids.length === 1) {
+          console.log(`  -> #${ids[0]} (via page scrape)`);
         } else {
-          console.log(`  -> #${matches[0]} (via categorySlug)`);
+          console.log(`  ${ids.length} markets on this event page:`);
+          for (const id of ids) console.log(`    #${id}`);
+          console.log(`  using first (#${ids[0]}); re-run with a specific id for another outcome.`);
         }
-        marketId = matches[0];
+        marketId = ids[0];
       } catch (err) {
-        console.error('  reverse-lookup failed:', err.message);
+        console.error(`\n  page scrape failed: ${err.message}`);
+        console.error('  Last-resort options:');
+        console.error('  1) Open the URL in a browser');
+        console.error('  2) DevTools → Network → reload, look for "/v1/markets/<digits>"');
+        console.error('     — the digits are the marketId');
+        console.error('  3) Re-run: npm run reward-check <id>');
         process.exit(1);
       }
     }
