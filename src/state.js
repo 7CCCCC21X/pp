@@ -16,6 +16,7 @@ function emptyState() {
     alertKinds: {},       // per-kind on/off override; missing = use config default
     snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
     chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
+    chatDigests: {},      // chatId -> { intervalMs, queue, lastFlushAt } batched-alert mode
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -46,6 +47,7 @@ export async function loadState() {
       alertKinds: json.alertKinds ?? {},
       snapshots: json.snapshots ?? {},
       chatRouting: json.chatRouting ?? {},
+      chatDigests: json.chatDigests ?? {},
       filters: json.filters ?? {},
     };
   } catch (err) {

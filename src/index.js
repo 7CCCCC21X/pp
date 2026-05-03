@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
 import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats } from './state.js';
-import { checkMarket } from './monitor.js';
+import { checkMarket, flushChatDigests } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
 import { sendDailyDigest, shouldSendDigest } from './digest.js';
@@ -119,6 +119,7 @@ async function tick(state) {
     if (!ids.includes(id)) delete state.markets[id];
   }
   await maybeDigest(state);
+  await flushChatDigests(state).catch((err) => warn('digest flush failed:', err.message));
   await persist(state);
 }
 

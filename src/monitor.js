@@ -176,7 +176,36 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
       log(`[${marketId}] suppress ${kind} (no eligible chats — admin chat unset?)`);
       return false;
     }
-    await broadcastTelegramMessage(tagged, { chatIds, replyMarkup: alertKeyboard(marketId) });
+    // Split chats into "send now" vs "queue for digest". watch / snapshot
+    // (ADMIN_ONLY_KINDS) are never digested — user explicitly registered
+    // those for immediate per-market follow.
+    const baseKind = kind.replace(/_recovered$/, '');
+    const isDigestable = !ADMIN_ONLY_KINDS.has(baseKind);
+    const immediate = [];
+    if (isDigestable) {
+      for (const cid of chatIds) {
+        const d = state.chatDigests?.[cid];
+        if (d?.intervalMs > 0) {
+          if (!Array.isArray(d.queue)) d.queue = [];
+          d.queue.push({
+            kind, marketId,
+            title: slot.title ?? null,
+            rate: slot.lastHourlyRate ?? 0,
+            priority,
+            ts: Date.now(),
+          });
+          // Cap to avoid unbounded growth between flushes.
+          if (d.queue.length > 100) d.queue = d.queue.slice(-100);
+        } else {
+          immediate.push(cid);
+        }
+      }
+    } else {
+      immediate.push(...chatIds);
+    }
+    if (immediate.length) {
+      await broadcastTelegramMessage(tagged, { chatIds: immediate, replyMarkup: alertKeyboard(marketId) });
+    }
   } catch (err) {
     warn(`[${marketId}] telegram send (${kind}) failed:`, err.message);
     return false;
@@ -195,6 +224,68 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
     slot.lastAnyAlertAt = Date.now();
   }
   return true;
+}
+
+const KIND_LABELS = {
+  stall: '🟡 停滞',
+  mid_jump: '⚡ 跳变',
+  wide_spread: '🔴 阔差',
+  reward_zone: '🎯 奖励区',
+  empty_book: '🌊 空簿',
+  stall_recovered: '✅ 停滞恢复',
+  mid_jump_recovered: '✅ 跳变恢复',
+  wide_spread_recovered: '✅ 阔差恢复',
+  reward_zone_recovered: '✅ 奖励区恢复',
+  empty_book_recovered: '✅ 空簿恢复',
+};
+
+// Render a queued list of digest items as a single message. Groups
+// by kind, then collapses repeats per market so the same market
+// firing 5 times doesn't bloat the summary.
+export function formatDigestSummary(items) {
+  if (!items.length) return '';
+  const byKind = new Map();
+  for (const i of items) {
+    if (!byKind.has(i.kind)) byKind.set(i.kind, []);
+    byKind.get(i.kind).push(i);
+  }
+  const lines = [`📦 <b>提醒摘要 (${items.length} 条)</b>`, ''];
+  for (const [kind, batch] of byKind) {
+    const label = KIND_LABELS[kind] ?? kind;
+    lines.push(`${label} <b>${batch.length}</b>`);
+    const byMarket = new Map();
+    for (const i of batch) byMarket.set(i.marketId, i); // last-wins
+    for (const [id, i] of byMarket) {
+      const title = i.title ? htmlEscape(String(i.title).slice(0, 40)) : `Market ${htmlEscape(id)}`;
+      const rate = Number.isFinite(i.rate) && i.rate > 0 ? ` · ${i.rate.toFixed(0)}/h` : '';
+      lines.push(`  <code>#${htmlEscape(id)}</code> ${title}${rate}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+// Called from the tick loop. For each chat in digest mode whose
+// interval has elapsed, sends the queued items as one summary
+// message and resets the queue. Failures are logged but not retried
+// (re-queueing would loop on persistent send errors).
+export async function flushChatDigests(state) {
+  const now = Date.now();
+  const digests = state.chatDigests ?? {};
+  for (const [cid, d] of Object.entries(digests)) {
+    if (!d.intervalMs || !Array.isArray(d.queue) || d.queue.length === 0) continue;
+    if (now - (d.lastFlushAt ?? 0) < d.intervalMs) continue;
+    const items = d.queue.slice();
+    d.queue = [];
+    d.lastFlushAt = now;
+    try {
+      const text = formatDigestSummary(items);
+      const { sendLongTelegramMessage } = await import('./telegram.js');
+      await sendLongTelegramMessage(text, { chatId: cid });
+    } catch (err) {
+      warn(`digest flush to ${cid} failed:`, err.message);
+    }
+  }
 }
 
 const DETECTORS = [

@@ -692,6 +692,7 @@ const HELP = [
   '/quiet [duration] — 全局静音所有提醒（默认 2h，/quiet off 取消）',
   '/alerts [on|off &lt;kind&gt;|reset] — 全局按类型开关：stall / mid_jump / wide_spread / reward_zone / empty_book',
   '/route [on|off &lt;kind&gt;|reset] — 当前 chat 独立路由（每个群可只看自己关心的 kind）',
+  '/digest-mode [interval | off] — 当前 chat 改批量摘要模式（每 N 分钟一条总结）',
   '/watch &lt;id&gt; — 密集追踪',
   '/watched — 列出当前所有 /watch 追踪的市场',
   '/unwatch &lt;id|all&gt; — 取消密集追踪',
@@ -1585,6 +1586,53 @@ async function handle(text, state, ctx, chatId, fromId) {
     // detector still runs and updates baselines / history.
     //   /alerts                    → list current state
     //   /alerts off <kind>         → disable
+    // Per-chat digest mode: queue alerts and flush as one summary
+    // every N minutes. Trades immediacy for less disruption — useful
+    // for groups where you want alert volume but not alert pings every
+    // few minutes. watch / snapshot are NOT digested (those are
+    // explicit per-market follows that should arrive in real time).
+    //   /digest-mode               → show current chat's setting
+    //   /digest-mode 5m | 30m | 1d → enable
+    //   /digest-mode off           → disable + flush remaining queue
+    case '/digest-mode': {
+      const cid = String(chatId ?? '');
+      if (!cid) return '无法识别当前 chat。';
+      if (!arg) {
+        const d = state.chatDigests?.[cid];
+        if (!d?.intervalMs) {
+          return '当前 chat 没有 digest 模式（实时推送）。\n用法：/digest-mode 5m  →  开启 5 分钟摘要';
+        }
+        const mins = Math.round(d.intervalMs / 60000);
+        const queued = d.queue?.length ?? 0;
+        const last = d.lastFlushAt
+          ? `${fmtElapsed(Date.now() - d.lastFlushAt)} 前`
+          : '未推过';
+        return `📦 <b>当前 chat digest 模式</b>\n每 ${mins} 分钟一次摘要 · 队列里 ${queued} 条等待 · 上次 ${last}\n\n关闭：/digest-mode off`;
+      }
+      if (arg === 'off' || arg === '0' || arg === 'cancel') {
+        const d = state.chatDigests?.[cid];
+        if (!d) return '当前 chat 不在 digest 模式。';
+        // Flush any pending items immediately so user doesn't lose them.
+        if (Array.isArray(d.queue) && d.queue.length) {
+          const { formatDigestSummary } = await import('./monitor.js');
+          await sendLongTelegramMessage(formatDigestSummary(d.queue), { chatId: cid }).catch(() => {});
+        }
+        const next = { ...state.chatDigests };
+        delete next[cid];
+        state.chatDigests = next;
+        await ctx.persist();
+        return '已关闭 digest 模式（恢复实时推送）。';
+      }
+      const ms = parseDuration(arg);
+      if (!ms) return '用法：/digest-mode 5m / 30m / 2h / 1d / off';
+      if (ms < 60_000) return '最少 1 分钟（避免频繁刷屏）。';
+      state.chatDigests = { ...(state.chatDigests ?? {}) };
+      state.chatDigests[cid] = { intervalMs: ms, queue: [], lastFlushAt: 0 };
+      await ctx.persist();
+      const mins = Math.round(ms / 60000);
+      return `📦 digest 模式开启 — 每 ${mins} 分钟推一次摘要\n（实时推送暂停；watch / snapshot 不受影响）`;
+    }
+
     // Per-CHAT alert routing (vs /alerts which is global). Each chat
     // can independently exclude alert kinds — admin DM keeps all,
     // group A only takes reward_zone, group B only stall etc.
