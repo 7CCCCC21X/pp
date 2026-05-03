@@ -48,17 +48,30 @@ function bool(name, fallback) {
 function buildFilterDefaults() {
   const out = {};
   const depth = 3;
+  // Per-level: 3 levels × 2 sides × {min,max} × {Price,Size} = 24 keys.
+  // maxSize is now wired (was previously skipped) so users can ask for
+  // "thin only" markets via FILTER_MAX_BID1_SIZE etc.
   for (const side of ['Bid', 'Ask']) {
     for (let lvl = 1; lvl <= depth; lvl++) {
       for (const op of ['min', 'max']) {
         for (const attr of ['Price', 'Size']) {
-          if (op === 'max' && attr === 'Size') continue;
           const key = `${op}${side}${lvl}${attr}`;
           const env = 'FILTER_' + key.replace(/([A-Z])/g, '_$1').toUpperCase();
           out[key] = numOrNull(env);
         }
       }
     }
+  }
+  // Derived/global metrics — let users target opportunity shapes
+  // (薄盘 / 阔差 / 中价偏远 / 奖励区空缺) directly.
+  for (const key of [
+    'minMid', 'maxMid',
+    'minSpread', 'maxSpread',
+    'maxTopUsd', 'maxTotalUsd',
+    'requireAnyRewardGap', 'requireBidRewardGap', 'requireAskRewardGap',
+  ]) {
+    const env = 'FILTER_' + key.replace(/([A-Z])/g, '_$1').toUpperCase();
+    out[key] = numOrNull(env);
   }
   return out;
 }

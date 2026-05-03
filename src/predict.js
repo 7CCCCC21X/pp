@@ -529,9 +529,15 @@ export function marketEndMs(m) {
     const ts = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
     if (Number.isFinite(ts)) return ts;
   }
-  // Fallback: parse the end time from the title (Predict.fun GraphQL
-  // doesn't expose a real end-time field for many markets).
-  return parseEndFromTitle(m.title);
+  // Fallback: parse the end time from any text field that might encode it.
+  // Outcome-name markets ("Yes"/"No"/"Draw") have a useless title — the
+  // dated string lives in question, categorySlug, etc. Without this loop,
+  // MIN_REMAINING_HOURS lets short-lived markets through.
+  for (const s of [m.title, m.question, m.categorySlug, m.slug, m.marketSlug]) {
+    const ts = parseEndFromTitle(s);
+    if (ts != null) return ts;
+  }
+  return null;
 }
 
 export function isMarketTradeable(m) {

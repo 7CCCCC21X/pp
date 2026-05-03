@@ -195,10 +195,6 @@ export async function checkMarket(marketId, state, { isPaused }) {
   }
   // Reset error counter on a successful fetch so a recovered market clears.
 
-  const filters = effectiveFilters(state);
-  const filterReason = checkFilter(orderbook, filters);
-  const filtered = filterReason !== null;
-
   const now = Date.now();
   const cur = {
     bidPrice: orderbook.bestBid?.price ?? null,
@@ -214,8 +210,12 @@ export async function checkMarket(marketId, state, { isPaused }) {
     key: orderbook.orderbookKey,
   };
   slot.lastError = null;
-  slot.lastSkipReason = null;
   slot.consecutiveOrderbookErrors = 0;
+  // Reset only non-filter skip reasons; the filter result a few lines down
+  // overwrites lastSkipReason itself with either the failing rule or null.
+  if (!slot.lastSkipReason || !slot.lastSkipReason.startsWith('过滤器:')) {
+    slot.lastSkipReason = null;
+  }
   // Stash the parsed end time for /status to compute remaining hours +
   // total available PP without redoing the regex match each command.
   slot.endMs = marketEndMs(market);
@@ -263,6 +263,7 @@ export async function checkMarket(marketId, state, { isPaused }) {
   // Reward-zone evaluation per tick. Per-market overrides via /setmarket
   // beat the global config; the market object's spreadThreshold /
   // shareThreshold (from Predict.fun's REST sample) win over either.
+  // Computed BEFORE checkFilter so requireXRewardGap filters can read it.
   const zone = rewardZoneStatus(orderbook, market, {
     maxDistance: effectiveOverride(state, marketId, 'rewardZoneMaxDistance', config.rewardZoneMaxDistance),
     minSize: effectiveOverride(state, marketId, 'rewardZoneMinSize', config.rewardZoneMinSize),
@@ -275,6 +276,19 @@ export async function checkMarket(marketId, state, { isPaused }) {
     maxDistance: zone.maxDistance,
     minSize: zone.minSize,
   };
+
+  // Filter is the LAST gate before alerting — record reason on the slot
+  // so /status can tell "blocked by filter X" apart from "no data" / "no
+  // reward" / "paused". Empty filterReason clears any stale 过滤器: tag.
+  const filters = effectiveFilters(state);
+  const filterReason = checkFilter(orderbook, filters, { zone });
+  const filtered = filterReason !== null;
+  slot.lastFilterReason = filterReason;
+  if (filtered) {
+    slot.lastSkipReason = `过滤器: ${filterReason}`;
+  } else if (slot.lastSkipReason && slot.lastSkipReason.startsWith('过滤器:')) {
+    slot.lastSkipReason = null;
+  }
 
   const bidChanged = topMoved(slot.baseline.bidPrice, slot.baseline.bidSize, orderbook.bestBid);
   const askChanged = topMoved(slot.baseline.askPrice, slot.baseline.askSize, orderbook.bestAsk);

@@ -164,6 +164,24 @@ test('marketEndMs returns null when missing', () => {
   assert.equal(marketEndMs(null), null);
 });
 
+test('marketEndMs: falls back to question when title is unhelpful', () => {
+  // Outcome-name market: title="Yes", dated string is in question.
+  // Parser picks the end time (1AM) → 1AM EST = 6AM UTC.
+  assert.equal(marketEndMs({
+    title: 'Yes',
+    question: 'Bitcoin Up or Down - Jan 1, 2020, 12AM-1AM ET',
+  }), Date.UTC(2020, 0, 1, 6, 0));
+});
+
+test('marketEndMs: falls back to categorySlug when title+question miss', () => {
+  // Only categorySlug carries the date. 11PM Dec 31 EST = 4AM Jan 1 UTC.
+  assert.equal(marketEndMs({
+    title: 'Draw',
+    question: 'Will it be a draw?',
+    categorySlug: 'final-on-Dec 31, 2099, 11PM ET',
+  }), Date.UTC(2100, 0, 1, 4, 0));
+});
+
 test('isMarketTradeable: active market', () => {
   assert.equal(isMarketTradeable({
     isResolved: false,
