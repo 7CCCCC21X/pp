@@ -12,6 +12,7 @@ import { detectMidJump } from './alerts/midJump.js';
 import { detectWideSpread } from './alerts/wideSpread.js';
 import { detectRewardZone } from './alerts/rewardZone.js';
 import { detectEmptyBook } from './alerts/emptyBook.js';
+import { detectSnapshot } from './alerts/snapshot.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[monitor]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[monitor]', ...args);
@@ -102,11 +103,11 @@ function chatsForKind(state, kind) {
 }
 
 async function alert(state, kind, slot, marketId, message, extra = {}) {
-  const isWatchOrRecovery = kind === 'watch' || kind.endsWith('_recovered');
+  const isExempt = kind === 'watch' || kind === 'snapshot' || kind.endsWith('_recovered');
 
   // 1) Global temporary mute — /quiet sets state.quietUntil.
   //    Recoveries still land (they're "back to normal" pings, not noise).
-  if (!isWatchOrRecovery) {
+  if (!isExempt) {
     if (state.quietUntil && Date.now() < state.quietUntil) {
       log(`[${marketId}] suppress ${kind} (quiet until ${new Date(state.quietUntil).toISOString()})`);
       return false;
@@ -135,7 +136,7 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
     highThreshold: config.alertPriorityHigh,
     mediumThreshold: config.alertPriorityMedium,
   });
-  if (!isWatchOrRecovery) {
+  if (!isExempt) {
     const minRank = PRIORITY_RANK[config.alertPriorityMin] ?? 0;
     const myRank = PRIORITY_RANK[priority] ?? 1;
     if (myRank < minRank) {
@@ -146,7 +147,7 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
 
   // 4) Per-market cross-type cooldown to keep one illiquid market from
   //    emitting wide_spread + reward_zone + empty_book back-to-back.
-  if (!isWatchOrRecovery) {
+  if (!isExempt) {
     const sinceAny = Date.now() - (slot.lastAnyAlertAt ?? 0);
     if (sinceAny < config.marketAlertCooldownMs) {
       log(`[${marketId}] suppress ${kind} (per-market cooldown ${Math.round(sinceAny / 1000)}s)`);
@@ -179,7 +180,7 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
     score: Math.round(score),
     ...extra,
   }).catch(() => {});
-  if (!isWatchOrRecovery) {
+  if (!isExempt) {
     slot.lastAnyAlertAt = Date.now();
   }
   return true;
@@ -191,6 +192,7 @@ const DETECTORS = [
   detectWideSpread,
   detectRewardZone,
   detectEmptyBook,
+  detectSnapshot,     // periodic full-orderbook push for /snapshot markets
   // Stall is special — also resets on book move; runs last because it
   // depends on baseline state from the move-detection block.
 ];

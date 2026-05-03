@@ -14,6 +14,7 @@ function emptyState() {
     allowedChats: [],     // runtime-managed whitelist (private chats / groups)
     quietUntil: 0,        // global silence until this unix ms (0 = off)
     alertKinds: {},       // per-kind on/off override; missing = use config default
+    snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -42,6 +43,7 @@ export async function loadState() {
       allowedChats: json.allowedChats ?? [],
       quietUntil: json.quietUntil ?? 0,
       alertKinds: json.alertKinds ?? {},
+      snapshots: json.snapshots ?? {},
       filters: json.filters ?? {},
     };
   } catch (err) {

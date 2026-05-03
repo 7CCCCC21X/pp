@@ -49,6 +49,7 @@ const PRIVATE_MENU = [
   { command: 'pause', description: '静音指定市场' },
   { command: 'resume', description: '恢复监控' },
   { command: 'snooze', description: '临时静音单市场 (用法: /snooze <id> 1h)' },
+  { command: 'snapshot', description: '定时盘口快照（admin 私聊，用法: /snapshot <id> 5m）' },
   { command: 'quiet', description: '全局静音所有提醒 (用法: /quiet 2h | /quiet off)' },
   { command: 'alerts', description: '按类型开关提醒（停滞/跳变/阔差/奖励区/空簿）' },
   { command: 'discover', description: '立即触发自动发现' },
@@ -425,6 +426,7 @@ const HELP = [
   '/pause &lt;id&gt; — 静音',
   '/resume &lt;id&gt; — 取消静音',
   '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 临时静音单市场',
+  '/snapshot [id interval | id off | (无参列表)] — 定时盘口快照（仅 admin 私聊收）',
   '/quiet [duration] — 全局静音所有提醒（默认 2h，/quiet off 取消）',
   '/alerts [on|off &lt;kind&gt;|reset] — 按类型开关：stall / mid_jump / wide_spread / reward_zone / empty_book',
   '/watch &lt;id&gt; — 密集追踪',
@@ -1232,6 +1234,62 @@ async function handle(text, state, ctx, chatId, fromId) {
       state.snoozes = { ...(state.snoozes ?? {}), [id]: Date.now() + ms };
       await ctx.persist();
       return `已临时静音 #${htmlEscape(id)} ${htmlEscape(durStr)}（到 ${new Date(state.snoozes[id]).toISOString()}）`;
+    }
+
+    // /snapshot: periodic full-orderbook push for a specific market.
+    // Goes to admin DM only (kind-routed). Bypasses all volume gates
+    // (cooldown / quiet / priority floor) since user explicitly wants
+    // it. Auto-adds to manualIds so the tick loop polls the market.
+    //   /snapshot                  → list registrations
+    //   /snapshot <id> <interval>  → set / replace
+    //   /snapshot <id> off         → clear
+    case '/snapshot': {
+      if (!arg) {
+        const entries = Object.entries(state.snapshots ?? {});
+        if (!entries.length) {
+          return '当前无定时快照。\n用 /snapshot &lt;id&gt; &lt;interval&gt; 添加（如 /snapshot 257916 5m）\n推送只到 admin 私聊。';
+        }
+        const lines = ['<b>📸 定时快照</b>'];
+        for (const [id, s] of entries) {
+          const slot = state.markets[id];
+          const title = slot?.title ? htmlEscape(shortTitle(slot.title, 40)) : `Market ${id}`;
+          const intervalMin = Math.max(1, Math.round(s.intervalMs / 60000));
+          const lastSent = s.lastSentAt
+            ? `${fmtElapsed(Date.now() - s.lastSentAt)} 前`
+            : '从未';
+          lines.push(`<code>#${htmlEscape(id)}</code> ${title} — 每 ${intervalMin}min · 上次 ${lastSent}`);
+        }
+        lines.push('');
+        lines.push('关掉用 /snapshot &lt;id&gt; off');
+        return lines.join('\n');
+      }
+      const [idArg, intervalArg] = arg.split(/\s+/);
+      if (!idArg || !intervalArg) {
+        return '用法：\n/snapshot &lt;id&gt; &lt;interval&gt;  设置（如 /snapshot 257916 5m）\n/snapshot &lt;id&gt; off          关闭\n/snapshot                 列出';
+      }
+      const id = String(idArg);
+      if (intervalArg === 'off' || intervalArg === '0') {
+        if (state.snapshots?.[id]) {
+          const next = { ...state.snapshots };
+          delete next[id];
+          state.snapshots = next;
+          await ctx.persist();
+          return `已关闭 #${htmlEscape(id)} 的定时快照。`;
+        }
+        return `#${htmlEscape(id)} 没有定时快照在跑。`;
+      }
+      const ms = parseDuration(intervalArg);
+      if (!ms) return `无法解析时长 "${htmlEscape(intervalArg)}"，支持 5m / 30m / 2h / 1d`;
+      if (ms < 60_000) return '间隔太短（&lt; 1 分钟）— 太频繁会被 Telegram 限流，最少 1m';
+      state.snapshots = { ...(state.snapshots ?? {}), [id]: { intervalMs: ms, lastSentAt: 0 } };
+      // Auto-add to manualIds so checkMarket actually polls this market.
+      // Skip if it's already in env / autoIds / manualIds — activeMarketIds
+      // dedupes on read.
+      if (!state.manualIds.includes(id) && !state.removedIds.includes(id)) {
+        state.manualIds = [...state.manualIds, id];
+      }
+      await ctx.persist();
+      return `📸 #${htmlEscape(id)} 已注册定时快照，每 ${htmlEscape(intervalArg)} 推一次到 admin 私聊。\n（已自动加入监控池，下次 tick 起算）`;
     }
 
     // Global mute — silences ALL non-recovery alerts for a duration.
