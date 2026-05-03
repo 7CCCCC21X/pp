@@ -1,5 +1,6 @@
 import { config } from './config.js';
-import { sendLongTelegramMessage, htmlEscape } from './telegram.js';
+import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
+import { broadcastChats } from './state.js';
 import { readHistorySince, summarize24h } from './history.js';
 import { fmtElapsed, shortTitle } from './format.js';
 
@@ -11,12 +12,13 @@ function sumKey(summary, key) {
   return summary.reduce((acc, m) => acc + (m[key] ?? 0), 0);
 }
 
-export async function sendDailyDigest() {
+export async function sendDailyDigest(state) {
+  const chatIds = broadcastChats(state);
   const since = Date.now() - 24 * 3600 * 1000;
   const records = await readHistorySince(since);
   const summary = summarize24h(records);
   if (!summary.length) {
-    await sendLongTelegramMessage('📈 <b>过去 24 小时摘要</b>\n无任何事件。');
+    await broadcastTelegramMessage('📈 <b>过去 24 小时摘要</b>\n无任何事件。', { chatIds });
     return;
   }
   summary.sort((a, b) => (b.ppEarned ?? 0) - (a.ppEarned ?? 0));
@@ -63,7 +65,7 @@ export async function sendDailyDigest() {
     lines.push(`${medal} <code>#${htmlEscape(m.marketId)}</code> ${title}`);
     lines.push(`   <b>${pp} PP</b> · ${rate}${counts ? ` · ${counts}` : ''}${stall ? ` · ${stall}` : ''}`);
   }
-  await sendLongTelegramMessage(lines.join('\n'));
+  await broadcastTelegramMessage(lines.join('\n'), { chatIds });
   log(`sent digest (24h PP=${totalPP.toFixed(2)})`);
 }
 

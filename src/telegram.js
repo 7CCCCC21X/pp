@@ -94,6 +94,25 @@ export async function sendLongTelegramMessage(text, opts = {}) {
   return results;
 }
 
+// Fans out a single text + reply_markup to every chatId in the list.
+// Each chat is independent — a failed send is logged and skipped so one
+// bad group doesn't cancel the broadcast to admin's private chat. Empty
+// list returns immediately.
+export async function broadcastTelegramMessage(text, { chatIds, replyMarkup } = {}) {
+  if (!Array.isArray(chatIds) || chatIds.length === 0) return [];
+  const results = [];
+  for (const id of chatIds) {
+    try {
+      const r = await sendLongTelegramMessage(text, { chatId: id, replyMarkup });
+      results.push(r);
+    } catch (err) {
+      console.warn(new Date().toISOString(), '[telegram] broadcast to', id, 'failed:', err.message);
+      results.push(null);
+    }
+  }
+  return results;
+}
+
 export async function editTelegramMessage(chatId, messageId, text, replyMarkup) {
   const payload = {
     chat_id: chatId,

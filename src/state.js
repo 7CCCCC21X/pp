@@ -11,6 +11,7 @@ function emptyState() {
     watchedIds: [],
     snoozes: {},          // marketId -> unix ms when snooze ends
     overrides: {},        // marketId -> partial config override
+    allowedChats: [],     // runtime-managed whitelist (private chats / groups)
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -36,6 +37,7 @@ export async function loadState() {
       watchedIds: json.watchedIds ?? [],
       snoozes: json.snoozes ?? {},
       overrides: json.overrides ?? {},
+      allowedChats: json.allowedChats ?? [],
       filters: json.filters ?? {},
     };
   } catch (err) {
@@ -67,6 +69,51 @@ export function isSnoozed(state, marketId) {
 export function effectiveOverride(state, marketId, key, fallback) {
   const v = state.overrides?.[marketId]?.[key];
   return v != null && Number.isFinite(v) ? v : fallback;
+}
+
+// Admin = the TELEGRAM_CHAT_ID env owner (private chat). Only admin can
+// manage the whitelist or peek at sensitive /config dumps. Returns false
+// if the env isn't configured (defensive).
+export function isAdminChat(chatId) {
+  if (chatId == null || chatId === '') return false;
+  if (!config.telegramChatId) return false;
+  return String(chatId) === String(config.telegramChatId);
+}
+
+// Permitted = admin OR runtime-whitelisted OR env-whitelisted. Used for
+// command access AND broadcast targeting (alerts, digest, autodiscover).
+export function isPermittedChat(state, chatId) {
+  if (chatId == null || chatId === '') return false;
+  const id = String(chatId);
+  if (id === String(config.telegramChatId)) return true;
+  if (config.telegramAllowedChats.includes(id)) return true;
+  return (state?.allowedChats ?? []).includes(id);
+}
+
+// Deduped list of every chat that should receive broadcasts.
+export function broadcastChats(state) {
+  const out = new Set();
+  if (config.telegramChatId) out.add(String(config.telegramChatId));
+  for (const id of config.telegramAllowedChats) out.add(String(id));
+  for (const id of (state?.allowedChats ?? [])) out.add(String(id));
+  return [...out];
+}
+
+export function addAllowedChat(state, chatId) {
+  const id = String(chatId);
+  if (!state.allowedChats) state.allowedChats = [];
+  if (state.allowedChats.includes(id)) return false;
+  state.allowedChats.push(id);
+  return true;
+}
+
+export function removeAllowedChat(state, chatId) {
+  const id = String(chatId);
+  if (!state.allowedChats?.length) return false;
+  const idx = state.allowedChats.indexOf(id);
+  if (idx < 0) return false;
+  state.allowedChats.splice(idx, 1);
+  return true;
 }
 
 export function activeMarketIds(state) {

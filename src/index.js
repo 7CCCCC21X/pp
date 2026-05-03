@@ -1,11 +1,11 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
-import { loadState, saveState, activeMarketIds, isSnoozed } from './state.js';
+import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats } from './state.js';
 import { checkMarket } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
 import { sendDailyDigest, shouldSendDigest } from './digest.js';
-import { sendLongTelegramMessage } from './telegram.js';
+import { broadcastTelegramMessage } from './telegram.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[main]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[main]', ...args);
@@ -37,8 +37,9 @@ async function maybeDiscover(state) {
         .slice(0, 10)
         .map((m) => `#${m.id} (${m.hourlyRate.toFixed(2)}/h)`)
         .join(', ');
-      await sendLongTelegramMessage(
+      await broadcastTelegramMessage(
         `<b>自动发现</b>: ${rewarded.length} 个有奖励的市场\n${preview}${rewarded.length > 10 ? ' ...' : ''}`,
+        { chatIds: broadcastChats(state) },
       ).catch(() => {});
     }
   } catch (err) {
@@ -50,7 +51,7 @@ async function maybeDigest(state) {
   if (!pendingDigest && !shouldSendDigest(state)) return;
   pendingDigest = false;
   try {
-    await sendDailyDigest();
+    await sendDailyDigest(state);
     state.lastDigestSentAt = Date.now();
   } catch (err) {
     warn('digest failed:', err.message);

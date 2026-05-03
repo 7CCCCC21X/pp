@@ -266,8 +266,5 @@ export function validateConfig() {
   }
 }
 
-export function isAllowedChat(chatId) {
-  const id = String(chatId);
-  if (id === String(config.telegramChatId)) return true;
-  return config.telegramAllowedChats.includes(id);
-}
+// Permission gates moved to state.js (isAdminChat, isPermittedChat,
+// broadcastChats) so runtime whitelist additions live in state.json.

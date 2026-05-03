@@ -69,3 +69,45 @@ test('isSnoozed: cleans expired entry', () => {
   assert.equal(isSnoozed(state, '999'), false);
   assert.equal(state.snoozes['999'], undefined);
 });
+
+const { isAdminChat, isPermittedChat, addAllowedChat, removeAllowedChat, broadcastChats } = await import('../src/state.js');
+
+test('isAdminChat: matches TELEGRAM_CHAT_ID env', () => {
+  // env stub above sets TELEGRAM_CHAT_ID=1
+  assert.equal(isAdminChat('1'), true);
+  assert.equal(isAdminChat(1), true); // string-coerced
+  assert.equal(isAdminChat('2'), false);
+  assert.equal(isAdminChat(null), false);
+  assert.equal(isAdminChat(''), false);
+});
+
+test('isPermittedChat: admin OR runtime whitelist OR env whitelist', () => {
+  const state = { allowedChats: ['-1001234567890'] };
+  assert.equal(isPermittedChat(state, '1'), true);              // admin
+  assert.equal(isPermittedChat(state, '-1001234567890'), true); // runtime
+  assert.equal(isPermittedChat(state, '999'), false);           // unknown
+  assert.equal(isPermittedChat(state, null), false);
+});
+
+test('addAllowedChat: dedupes and reports', () => {
+  const state = { allowedChats: [] };
+  assert.equal(addAllowedChat(state, '-100'), true);
+  assert.equal(addAllowedChat(state, '-100'), false);
+  assert.deepEqual(state.allowedChats, ['-100']);
+});
+
+test('removeAllowedChat: removes when present', () => {
+  const state = { allowedChats: ['-100', '-200'] };
+  assert.equal(removeAllowedChat(state, '-100'), true);
+  assert.deepEqual(state.allowedChats, ['-200']);
+  assert.equal(removeAllowedChat(state, '-100'), false);
+});
+
+test('broadcastChats: union of admin + env + runtime, deduped', () => {
+  const state = { allowedChats: ['-100', '1'] };  // '1' duplicates env admin
+  const out = broadcastChats(state);
+  assert.ok(out.includes('1'));
+  assert.ok(out.includes('-100'));
+  // dedupe: admin + runtime '1' counts once
+  assert.equal(out.length, new Set(out).size);
+});

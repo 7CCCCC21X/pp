@@ -1,10 +1,10 @@
 import { config } from './config.js';
 import { getMarketRewardSummary, getOrderbook, marketEndMs, getSlugMapCached, getMarketRestById } from './predict.js';
-import { sendTelegramMessage, htmlEscape } from './telegram.js';
+import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtElapsed, midOf, spreadOf, rewardZoneStatus } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
-import { effectiveOverride } from './state.js';
+import { effectiveOverride, broadcastChats } from './state.js';
 import { alertKeyboard } from './commands.js';
 import { detectStall } from './alerts/stall.js';
 import { detectWatch } from './alerts/watch.js';
@@ -81,7 +81,7 @@ function ensureStubSlot(state, marketId, now) {
   return slot;
 }
 
-async function alert(kind, slot, marketId, message, extra = {}) {
+async function alert(state, kind, slot, marketId, message, extra = {}) {
   // Per-market cross-type cooldown to keep one illiquid market from
   // emitting wide_spread + reward_zone + empty_book back-to-back. Watch
   // is exempt (its job is per-tick reporting) and so are recovery
@@ -95,7 +95,8 @@ async function alert(kind, slot, marketId, message, extra = {}) {
     }
   }
   try {
-    await sendTelegramMessage(message, { replyMarkup: alertKeyboard(marketId) });
+    const chatIds = broadcastChats(state);
+    await broadcastTelegramMessage(message, { chatIds, replyMarkup: alertKeyboard(marketId) });
   } catch (err) {
     warn(`[${marketId}] telegram send (${kind}) failed:`, err.message);
     return false;
@@ -307,7 +308,7 @@ export async function checkMarket(marketId, state, { isPaused }) {
     bidChanged,
     askChanged,
     zone,
-    alert,
+    alert: (kind, slot, mid, msg, extra) => alert(state, kind, slot, mid, msg, extra),
     log,
   };
 

@@ -1,4 +1,4 @@
-import { config, isAllowedChat } from './config.js';
+import { config } from './config.js';
 import {
   sendTelegramMessage,
   sendLongTelegramMessage,
@@ -8,7 +8,14 @@ import {
   setMyCommands,
   answerCallbackQuery,
 } from './telegram.js';
-import { activeMarketIds } from './state.js';
+import {
+  activeMarketIds,
+  isAdminChat,
+  isPermittedChat,
+  addAllowedChat,
+  removeAllowedChat,
+  broadcastChats,
+} from './state.js';
 import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
 import { getMarketRewardSummary, getOrderbook, resolveSlugToId, getCacheStats, refreshAllCaches } from './predict.js';
@@ -42,6 +49,8 @@ const COMMAND_MENU = [
   { command: 'discover', description: '立即触发自动发现' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
+  { command: 'config', description: '查看当前监控条件 / 阈值 / 过滤器' },
+  { command: 'whitelist', description: '管理白名单（仅 admin）' },
   { command: 'help', description: '显示帮助（含进阶命令）' },
 ];
 
@@ -289,7 +298,11 @@ const HELP = [
   '/filter — 查看当前过滤器',
   '/setfilter &lt;name&gt; &lt;value&gt; — 设置过滤器（如 minBid1Price 0.05）',
   '/clearfilter &lt;name|all&gt; — 清除过滤器',
-  '过滤器字段: min/max + Bid/Ask + 1/2/3 + Price/Size',
+  '过滤器字段: min/max + Bid/Ask + 1/2/3 + Price/Size，以及派生 mid/spread/topUsd/totalUsd 和 requireXRewardGap',
+  '',
+  '<b>权限 / 配置</b>',
+  '/config — 查看当前监控条件（阈值 / 过滤器 / 覆盖 / 白名单）',
+  '/whitelist [list|add &lt;id&gt;|remove &lt;id&gt;] — 管理可使用 / 接收广播的 chat（仅 admin）',
   '',
   '/help — 本帮助',
 ].join('\n');
@@ -806,7 +819,91 @@ function statusLine(state, id) {
   return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · ${rate}/h${timeBadge}${zoneTag(slot)}`;
 }
 
-async function handle(text, state, ctx) {
+function formatWhitelist(state) {
+  const lines = ['<b>👥 白名单</b>'];
+  if (config.telegramChatId) {
+    lines.push(`  admin (env): <code>${htmlEscape(config.telegramChatId)}</code>`);
+  } else {
+    lines.push('  admin (env): <i>未配置 TELEGRAM_CHAT_ID</i>');
+  }
+  if (config.telegramAllowedChats.length) {
+    lines.push('  env extra (TELEGRAM_ALLOWED_CHATS):');
+    for (const id of config.telegramAllowedChats) {
+      lines.push(`    <code>${htmlEscape(id)}</code>`);
+    }
+  }
+  const runtime = state.allowedChats ?? [];
+  if (runtime.length) {
+    lines.push('  state runtime:');
+    for (const id of runtime) {
+      lines.push(`    <code>${htmlEscape(id)}</code>`);
+    }
+  } else {
+    lines.push('  state runtime: <i>(空) — 用 /whitelist add &lt;chatId&gt; 添加群组</i>');
+  }
+  lines.push('');
+  lines.push(`广播目标共 <b>${broadcastChats(state).length}</b> 个 chat。`);
+  return lines.join('\n');
+}
+
+async function buildConfigDump(state) {
+  const eff = effectiveFilters(state);
+  const lines = ['<b>🛠 监控条件</b>', ''];
+
+  // Polling + discovery
+  lines.push('<b>📡 轮询</b>');
+  lines.push(`  POLL_INTERVAL_MS: ${(config.pollIntervalMs / 1000).toFixed(0)}s · MARKETS_CACHE_TTL_MS: ${(config.marketsCacheTtlMs / 60000).toFixed(0)}min`);
+  lines.push('');
+  lines.push('<b>🔍 自动发现</b>');
+  if (config.autodiscover) {
+    lines.push(`  AUTODISCOVER: on · MIN_HOURLY_RATE ≥ ${config.minHourlyRate} · MIN_REMAINING_HOURS ≥ ${config.minRemainingHours}h · 上限 ${config.discoveryMaxMarkets}`);
+    lines.push(`  DISCOVERY_INTERVAL_MS: ${(config.discoveryIntervalMs / 60000).toFixed(0)}min · SKIP_NO_REWARD: ${config.skipNoReward ? 'on' : 'off'}`);
+  } else {
+    lines.push('  AUTODISCOVER: off');
+  }
+  lines.push('');
+
+  // Alert toggles + thresholds
+  lines.push('<b>🔔 提醒阈值</b>');
+  lines.push(`  停滞 (stall): ${config.alertStall ? 'on' : 'off'} · ${config.staleHours}h`);
+  lines.push(`  跳变 (midJump): ${config.alertMidJump ? 'on' : 'off'} · ≥ ${config.midJumpThreshold} · 冷却 ${(config.midJumpCooldownMs / 60000).toFixed(0)}min`);
+  lines.push(`  阔差 (wideSpread): ${config.alertWideSpread ? 'on' : 'off'} · > ${(config.maxSpread * 100).toFixed(2)}¢ · 持续 ${config.wideSpreadMinMinutes}min`);
+  lines.push(`  奖励区 (rewardZone): ${config.alertRewardZone ? 'on' : 'off'} · 距 mid ≤ ${(config.rewardZoneMaxDistance * 100).toFixed(2)}¢ · 量 ≥ ${config.rewardZoneMinSize} · 持续 ${config.rewardZoneMinMinutes}min`);
+  lines.push(`  空簿 (emptyBook): ${config.alertEmptyBook ? 'on' : 'off'} · 持续 ${config.emptyBookMinMinutes}min`);
+  lines.push(`  恢复提醒: ${config.alertRecovery ? 'on' : 'off'} · 跨类型冷却: ${(config.marketAlertCooldownMs / 60000).toFixed(0)}min`);
+  lines.push('');
+
+  // Filters in effect
+  const activeFilters = FILTER_KEYS.filter((k) => eff[k] != null);
+  if (activeFilters.length) {
+    lines.push('<b>🔧 全局过滤器</b>');
+    for (const k of activeFilters) {
+      const tag = state?.filters?.[k] != null ? ' <i>(live)</i>' : ' <i>(env)</i>';
+      lines.push(`  ${FILTER_LABELS[k]} ${eff[k]}${tag}`);
+    }
+    lines.push('');
+  } else {
+    lines.push('<b>🔧 全局过滤器</b>: 无');
+    lines.push('');
+  }
+
+  // Per-market overrides
+  const overrides = Object.entries(state.overrides ?? {});
+  if (overrides.length) {
+    lines.push(`<b>📋 每市场覆盖 (${overrides.length})</b>`);
+    for (const [id, kv] of overrides) {
+      const pairs = Object.entries(kv).map(([k, v]) => `${k}=${v}`).join(', ');
+      lines.push(`  #${htmlEscape(id)}: ${htmlEscape(pairs)}`);
+    }
+    lines.push('');
+  }
+
+  // Whitelist
+  lines.push(formatWhitelist(state));
+  return { text: lines.join('\n') };
+}
+
+async function handle(text, state, ctx, chatId) {
   const [raw, ...rest] = text.trim().split(/\s+/);
   if (!raw) return null;
   const cmd = raw.replace(/@\w+$/, '').toLowerCase();
@@ -1027,6 +1124,44 @@ async function handle(text, state, ctx) {
       return `已清除覆盖 ${arg}（恢复 env 默认）。`;
     }
 
+    // Whitelist management — admin-only (private chat with TELEGRAM_CHAT_ID).
+    // Adds/removes chat IDs that can both call read commands AND receive
+    // broadcasts (alerts, digests, autodiscover summaries). Get the
+    // group's chat id from Railway logs after adding the bot to a group:
+    // "ignoring message from chat -1001234567890" → /whitelist add <id>.
+    case '/whitelist': {
+      if (!isAdminChat(chatId)) return '仅 admin 可管理白名单（请在 admin 私聊里执行）。';
+      const [sub, target] = arg.split(/\s+/);
+      const action = (sub ?? '').toLowerCase();
+      if (!action || action === 'list' || action === 'ls') {
+        return formatWhitelist(state);
+      }
+      if (action === 'add') {
+        if (!target) return '用法：/whitelist add &lt;chatId&gt;（群组 id 通常以 -100 开头）';
+        if (!/^-?\d+$/.test(target)) return `无效 chat id "${htmlEscape(target)}"，必须是整数`;
+        const added = addAllowedChat(state, target);
+        await ctx.persist();
+        return added
+          ? `已加入白名单：${htmlEscape(target)}\n${formatWhitelist(state)}`
+          : `${htmlEscape(target)} 已在白名单。`;
+      }
+      if (action === 'remove' || action === 'rm') {
+        if (!target) return '用法：/whitelist remove &lt;chatId&gt;';
+        const removed = removeAllowedChat(state, target);
+        await ctx.persist();
+        return removed
+          ? `已从白名单移除：${htmlEscape(target)}\n${formatWhitelist(state)}`
+          : `${htmlEscape(target)} 不在 state 白名单（env 白名单需改环境变量）。`;
+      }
+      return '用法：/whitelist [list|add &lt;id&gt;|remove &lt;id&gt;]';
+    }
+
+    case '/config': {
+      // Read-only — anyone whitelisted can see it. (No secrets here:
+      // bot token / API key are explicitly excluded.)
+      return await buildConfigDump(state);
+    }
+
     default:
       return null;
   }
@@ -1041,7 +1176,7 @@ function normalizeReply(reply) {
 async function dispatchCommand(text, state, ctx, { chatId }) {
   let reply;
   try {
-    reply = await handle(text, state, ctx);
+    reply = await handle(text, state, ctx, chatId);
   } catch (err) {
     warn('handler error:', err.message);
     await sendTelegramMessage(`错误: ${htmlEscape(err.message)}`, { chatId }).catch(() => {});
@@ -1081,7 +1216,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
           if (u.update_id > maxId) maxId = u.update_id;
           if (u.message?.text) {
             const chatId = u.message.chat?.id;
-            if (!isAllowedChat(chatId)) {
+            if (!isPermittedChat(state, chatId)) {
               warn(`ignoring message from chat ${chatId}`);
               continue;
             }
@@ -1093,7 +1228,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
             // Always answer the callback so Telegram dismisses the loading
             // spinner, even if the chat is not allowed.
             await answerCallbackQuery(cq.id).catch(() => {});
-            if (!isAllowedChat(chatId)) {
+            if (!isPermittedChat(state, chatId)) {
               warn(`ignoring callback from chat ${chatId}`);
               continue;
             }
