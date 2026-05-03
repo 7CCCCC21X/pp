@@ -122,6 +122,35 @@ test('rewardZoneStatus uses per-market overrides', () => {
   assert.equal(z.bidActivated, false); // spread/2 = 1¢ > 0.5¢
 });
 
+test('rewardZoneStatus: source tags reflect precedence layer', () => {
+  // env-only path: no override, no REST → defaults
+  const z1 = rewardZoneStatus(
+    { bestBid: { price: 0.5, size: 100 }, bestAsk: { price: 0.51, size: 100 } },
+    {}, { maxDistance: 0.06, minSize: 100 }, {},
+  );
+  assert.equal(z1.maxSource, 'env');
+  assert.equal(z1.sizeSource, 'env');
+
+  // REST path: market sets both
+  const z2 = rewardZoneStatus(
+    { bestBid: { price: 0.5, size: 100 }, bestAsk: { price: 0.51, size: 100 } },
+    { spreadThreshold: 0.03, shareThreshold: 200 },
+    { maxDistance: 0.06, minSize: 100 }, {},
+  );
+  assert.equal(z2.maxSource, 'rest');
+  assert.equal(z2.sizeSource, 'rest');
+
+  // Override path: /setmarket beats REST
+  const z3 = rewardZoneStatus(
+    { bestBid: { price: 0.5, size: 100 }, bestAsk: { price: 0.51, size: 100 } },
+    { spreadThreshold: 0.03, shareThreshold: 200 },
+    { maxDistance: 0.06, minSize: 100 },
+    { maxDistance: 0.01, minSize: null },
+  );
+  assert.equal(z3.maxSource, 'override');
+  assert.equal(z3.sizeSource, 'rest', 'mixed: override on max only, REST still wins for size');
+});
+
 test('rewardZoneStatus precedence: explicit override beats REST market value', () => {
   // Real-world scenario the audit caught: REST sets spreadThreshold=0.06
   // (loose), user wants tighter early-warning at 0.02 via /setmarket.

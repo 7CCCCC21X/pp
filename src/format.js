@@ -98,18 +98,22 @@ export function marketLink(marketId, title, question, slug) {
 export function rewardZoneStatus(orderbook, market, defaults, overrides = {}) {
   const fromOverride = (v) => Number.isFinite(v) && v > 0 ? v : null;
   const fromMarket = (v) => Number.isFinite(v) && v > 0 ? v : null;
-  const maxDistance =
-    fromOverride(overrides.maxDistance) ??
-    fromMarket(market?.spreadThreshold) ??
-    defaults.maxDistance;
-  const minSize =
-    fromOverride(overrides.minSize) ??
-    fromMarket(market?.shareThreshold) ??
-    defaults.minSize;
+  // Track which layer of the precedence ladder each value came from so
+  // formatOrderbookBlock / /probe can label "±6¢ (REST)" vs "(覆盖)" vs
+  // "(env)" — otherwise users can't tell whether a threshold is what
+  // Predict.fun actually rewards or just the global fallback.
+  const overMax = fromOverride(overrides.maxDistance);
+  const restMax = fromMarket(market?.spreadThreshold);
+  const overSize = fromOverride(overrides.minSize);
+  const restSize = fromMarket(market?.shareThreshold);
+  const maxDistance = overMax ?? restMax ?? defaults.maxDistance;
+  const minSize = overSize ?? restSize ?? defaults.minSize;
+  const maxSource = overMax != null ? 'override' : restMax != null ? 'rest' : 'env';
+  const sizeSource = overSize != null ? 'override' : restSize != null ? 'rest' : 'env';
   const bid = orderbook.bestBid;
   const ask = orderbook.bestAsk;
   if (!bid || !ask) {
-    return { maxDistance, minSize, mid: null, bidActivated: false, askActivated: false, bidReason: bid ? null : '无买单', askReason: ask ? null : '无卖单' };
+    return { maxDistance, minSize, maxSource, sizeSource, mid: null, bidActivated: false, askActivated: false, bidReason: bid ? null : '无买单', askReason: ask ? null : '无卖单' };
   }
   const mid = (bid.price + ask.price) / 2;
   const bidDist = mid - bid.price;
@@ -121,6 +125,8 @@ export function rewardZoneStatus(orderbook, market, defaults, overrides = {}) {
   return {
     maxDistance,
     minSize,
+    maxSource,
+    sizeSource,
     mid,
     bidActivated: bidInZone && bidSizeOk,
     askActivated: askInZone && askSizeOk,
@@ -190,7 +196,14 @@ export function formatOrderbookBlock(orderbook, zone) {
 
   if (zone) {
     lines.push('');
-    lines.push(`🎯 <b>奖励区</b> ±${(zone.maxDistance * 100).toFixed(1)}¢ · size ≥ ${compactNumber(zone.minSize, 0)}`);
+    // Source tag clarifies whether the ±X¢ rule is Predict.fun's
+    // platform value (REST), a /setmarket override, or the env
+    // fallback that's almost never reached today.
+    const srcLabel = (s) => s === 'override' ? '覆盖' : s === 'rest' ? 'REST' : 'env';
+    const tag = (zone.maxSource === zone.sizeSource)
+      ? srcLabel(zone.maxSource)
+      : `${srcLabel(zone.maxSource)}/${srcLabel(zone.sizeSource)}`;
+    lines.push(`🎯 <b>奖励区</b> ±${(zone.maxDistance * 100).toFixed(1)}¢ · size ≥ ${compactNumber(zone.minSize, 0)} <i>(${tag})</i>`);
     lines.push(zoneLine('买侧', zone.bidActivated, zone.bidReason));
     lines.push(zoneLine('卖侧', zone.askActivated, zone.askReason));
   }
