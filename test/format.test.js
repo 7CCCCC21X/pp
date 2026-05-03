@@ -9,6 +9,7 @@ import {
   spreadOf,
   rewardZoneStatus,
   slugify,
+  formatOpportunitySummary,
 } from '../src/format.js';
 
 test('fmtSide handles null', () => {
@@ -124,4 +125,49 @@ test('rewardZoneStatus handles empty book', () => {
   assert.equal(z.bidActivated, false);
   assert.equal(z.askActivated, false);
   assert.equal(z.bidReason, '无买单');
+});
+
+test('formatOpportunitySummary: lists side gaps and PP forecast', () => {
+  // 1h until end, 1200/h → ≈1200 PP. Bid side missing (zone gap).
+  const text = formatOpportunitySummary({
+    orderbook: {
+      bestBid: { price: 0.30, size: 50 },
+      bestAsk: { price: 0.40, size: 80 },
+    },
+    zone: { bidActivated: false, askActivated: true, bidReason: '量 50 < 100' },
+    totalHourlyRate: 1200,
+    endMs: Date.now() + 3600_000,
+  });
+  assert.ok(text.includes('🔥'), 'has opp emoji');
+  assert.ok(text.includes('💰'), 'has earn emoji');
+  assert.ok(text.includes('买侧'), 'mentions bid gap');
+  assert.ok(text.includes('1200 PP/h'), 'shows hourly rate');
+  assert.ok(/剩余 1\.0h/.test(text), 'shows remaining hours');
+  // 1200 × 1h ≈ 1200 PP
+  assert.ok(/≈ <b>1200 PP<\/b>/.test(text), 'shows total PP estimate');
+  assert.ok(text.includes('spread 10.00¢'), 'shows spread');
+});
+
+test('formatOpportunitySummary: handles missing endMs and zone', () => {
+  const text = formatOpportunitySummary({
+    orderbook: { bestBid: { price: 0.5, size: 100 }, bestAsk: { price: 0.51, size: 100 } },
+    zone: null,
+    totalHourlyRate: 500,
+    endMs: null,
+  });
+  // No "剩余 Xh" when endMs unknown
+  assert.ok(!text.includes('剩余'), 'no remaining-hours line without endMs');
+  assert.ok(text.includes('500 PP/h'));
+  // No zone → "奖励区双边正常" fallback
+  assert.ok(text.includes('双边正常'));
+});
+
+test('formatOpportunitySummary: skips totalPP when endMs is past', () => {
+  const text = formatOpportunitySummary({
+    orderbook: { bestBid: { price: 0.5, size: 100 }, bestAsk: { price: 0.51, size: 100 } },
+    zone: null,
+    totalHourlyRate: 1000,
+    endMs: Date.now() - 1000,
+  });
+  assert.ok(!text.includes('剩余'));
 });

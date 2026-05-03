@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
-import { fmtElapsed, marketLink, formatOrderbookBlock } from '../format.js';
+import { fmtElapsed, marketLink, formatOrderbookBlock, formatOpportunitySummary } from '../format.js';
 import { effectiveOverride } from '../state.js';
 
 export async function detectStall(ctx) {
@@ -21,7 +21,8 @@ export async function detectStall(ctx) {
   const msg = [
     `🟡 <b>订单簿停滞超过 ${staleHours} 小时</b>`,
     `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
-    `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 停滞 ${htmlEscape(fmtElapsed(elapsedMs))}`,
+    `<code>#${htmlEscape(marketId)}</code> · 停滞 ${htmlEscape(fmtElapsed(elapsedMs))}`,
+    formatOpportunitySummary({ orderbook, zone, totalHourlyRate, endMs: slot.endMs }),
     '',
     formatOrderbookBlock(orderbook, zone),
   ].join('\n');

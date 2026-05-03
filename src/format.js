@@ -200,3 +200,48 @@ export function spreadOf(orderbook) {
   if (!Number.isFinite(bid) || !Number.isFinite(ask)) return null;
   return ask - bid;
 }
+
+// Two-line "why look at this" summary printed at the top of every
+// alert message — answers "what's the opportunity" and "how much PP
+// is on the table" so the recipient can decide without reading the
+// full orderbook table beneath. Returns a multiline HTML string (no
+// trailing newline). Falls back gracefully when zone / endMs are
+// unknown.
+export function formatOpportunitySummary({ orderbook, zone, totalHourlyRate, endMs }) {
+  const bid = orderbook?.bestBid;
+  const ask = orderbook?.bestAsk;
+  const spread = (Number.isFinite(bid?.price) && Number.isFinite(ask?.price))
+    ? ask.price - bid.price
+    : null;
+  const topUsd = (bid ? bid.price * bid.size : 0) + (ask ? ask.price * ask.size : 0);
+
+  const gaps = [];
+  if (zone) {
+    if (!zone.bidActivated) gaps.push(`买侧 ${zone.bidReason ?? '未激活'}`);
+    if (!zone.askActivated) gaps.push(`卖侧 ${zone.askReason ?? '未激活'}`);
+  }
+  const oppText = gaps.length ? gaps.join(' · ') : '奖励区双边正常';
+
+  const oppParts = [`🔥 <b>机会</b>: ${htmlEscape(oppText)}`];
+  if (spread != null) {
+    oppParts.push(`spread ${(spread * 100).toFixed(2)}¢`);
+  }
+  if (topUsd > 0) {
+    oppParts.push(`顶层 $${topUsd.toFixed(0)}`);
+  }
+
+  const remainH = (Number.isFinite(endMs) && endMs > Date.now())
+    ? (endMs - Date.now()) / 3600000
+    : null;
+  const totalPp = (remainH != null && Number.isFinite(totalHourlyRate))
+    ? totalHourlyRate * remainH
+    : null;
+
+  const earn = [`💰 <b>${(totalHourlyRate ?? 0).toFixed(0)} PP/h</b>`];
+  if (remainH != null) {
+    earn.push(`剩余 ${remainH.toFixed(1)}h`);
+    if (totalPp != null) earn.push(`≈ <b>${totalPp.toFixed(0)} PP</b>`);
+  }
+
+  return [oppParts.join(' · '), earn.join(' · ')].join('\n');
+}

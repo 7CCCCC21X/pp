@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
-import { fmtElapsed, marketLink, spreadOf, formatOrderbookBlock } from '../format.js';
+import { fmtElapsed, marketLink, spreadOf, formatOrderbookBlock, formatOpportunitySummary } from '../format.js';
 import { effectiveOverride } from '../state.js';
 
 export async function detectWideSpread(ctx) {
@@ -36,7 +36,8 @@ export async function detectWideSpread(ctx) {
   const msg = [
     `🔴 <b>价差走阔 ${(curSpread * 100).toFixed(2)}¢</b>`,
     `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
-    `<code>#${htmlEscape(marketId)}</code> · PP <b>${totalHourlyRate.toFixed(2)}/h</b> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
+    `<code>#${htmlEscape(marketId)}</code> · 持续 ${htmlEscape(fmtElapsed(elapsed))}`,
+    formatOpportunitySummary({ orderbook, zone, totalHourlyRate, endMs: slot.endMs }),
     '',
     formatOrderbookBlock(orderbook, zone),
   ].join('\n');
