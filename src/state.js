@@ -71,13 +71,22 @@ export function effectiveOverride(state, marketId, key, fallback) {
   return v != null && Number.isFinite(v) ? v : fallback;
 }
 
-// Admin = the TELEGRAM_CHAT_ID env owner (private chat). Only admin can
-// manage the whitelist or peek at sensitive /config dumps. Returns false
-// if the env isn't configured (defensive).
+// Admin = the TELEGRAM_CHAT_ID env owner. Two flavours because chatId
+// and userId only coincide in private chats:
+//   isAdminChat: this conversation is the admin's private DM with bot.
+//   isAdminUser: the message author is the admin (works in groups too).
+// /activate / /whitelist gate on isAdminUser so admin can use them from
+// any chat they're personally in.
 export function isAdminChat(chatId) {
   if (chatId == null || chatId === '') return false;
   if (!config.telegramChatId) return false;
   return String(chatId) === String(config.telegramChatId);
+}
+
+export function isAdminUser(userId) {
+  if (userId == null || userId === '') return false;
+  if (!config.telegramChatId) return false;
+  return String(userId) === String(config.telegramChatId);
 }
 
 // Permitted = admin OR runtime-whitelisted OR env-whitelisted. Used for

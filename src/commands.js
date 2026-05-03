@@ -10,7 +10,7 @@ import {
 } from './telegram.js';
 import {
   activeMarketIds,
-  isAdminChat,
+  isAdminUser,
   isPermittedChat,
   addAllowedChat,
   removeAllowedChat,
@@ -50,6 +50,7 @@ const COMMAND_MENU = [
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
   { command: 'config', description: '查看当前监控条件 / 阈值 / 过滤器' },
+  { command: 'activate', description: '在群里激活机器人（仅 admin）' },
   { command: 'whitelist', description: '管理白名单（仅 admin）' },
   { command: 'help', description: '显示帮助（含进阶命令）' },
 ];
@@ -302,6 +303,8 @@ const HELP = [
   '',
   '<b>权限 / 配置</b>',
   '/config — 查看当前监控条件（阈值 / 过滤器 / 覆盖 / 白名单）',
+  '/activate — 在当前 chat 激活机器人（群里发 /activate@&lt;botname&gt;，仅 admin）',
+  '/deactivate — 从白名单移除当前 chat（仅 admin）',
   '/whitelist [list|add &lt;id&gt;|remove &lt;id&gt;] — 管理可使用 / 接收广播的 chat（仅 admin）',
   '',
   '/help — 本帮助',
@@ -903,7 +906,7 @@ async function buildConfigDump(state) {
   return { text: lines.join('\n') };
 }
 
-async function handle(text, state, ctx, chatId) {
+async function handle(text, state, ctx, chatId, fromId) {
   const [raw, ...rest] = text.trim().split(/\s+/);
   if (!raw) return null;
   const cmd = raw.replace(/@\w+$/, '').toLowerCase();
@@ -1124,20 +1127,48 @@ async function handle(text, state, ctx, chatId) {
       return `已清除覆盖 ${arg}（恢复 env 默认）。`;
     }
 
-    // Whitelist management — admin-only (private chat with TELEGRAM_CHAT_ID).
-    // Adds/removes chat IDs that can both call read commands AND receive
-    // broadcasts (alerts, digests, autodiscover summaries). Get the
-    // group's chat id from Railway logs after adding the bot to a group:
-    // "ignoring message from chat -1001234567890" → /whitelist add <id>.
+    // /activate (admin user only): one-tap enrollment from inside a
+    // group. Admin types `/activate@<botname>` in the group; the
+    // group's chatId gets added to state.allowedChats. Telegram group
+    // privacy mode means the bot only sees commands addressed via
+    // @<botname> in groups, so the suffix is required there.
+    case '/activate': {
+      if (!isAdminUser(fromId)) return null; // silent: don't leak command's existence
+      if (chatId == null) return '无法识别当前 chat。';
+      const id = String(chatId);
+      const added = addAllowedChat(state, id);
+      await ctx.persist();
+      return added
+        ? `✅ 已激活当前 chat <code>${htmlEscape(id)}</code>\n这里现在可以收提醒、digest 和命令了。`
+        : `当前 chat <code>${htmlEscape(id)}</code> 已在白名单。`;
+    }
+
+    case '/deactivate': {
+      if (!isAdminUser(fromId)) return null;
+      if (chatId == null) return '无法识别当前 chat。';
+      const id = String(chatId);
+      if (id === String(config.telegramChatId)) {
+        return '不能从白名单移除 admin 私聊（这是 env 配置的）。';
+      }
+      const removed = removeAllowedChat(state, id);
+      await ctx.persist();
+      return removed
+        ? `已从白名单移除当前 chat <code>${htmlEscape(id)}</code>。`
+        : `当前 chat 不在 state 白名单（env 白名单需改环境变量）。`;
+    }
+
+    // Whitelist management — admin user, can run from anywhere they're
+    // present (private DM or any group they're in). Adds/removes chat
+    // IDs that can both call commands AND receive broadcasts.
     case '/whitelist': {
-      if (!isAdminChat(chatId)) return '仅 admin 可管理白名单（请在 admin 私聊里执行）。';
+      if (!isAdminUser(fromId)) return '仅 admin 可管理白名单。';
       const [sub, target] = arg.split(/\s+/);
       const action = (sub ?? '').toLowerCase();
       if (!action || action === 'list' || action === 'ls') {
         return formatWhitelist(state);
       }
       if (action === 'add') {
-        if (!target) return '用法：/whitelist add &lt;chatId&gt;（群组 id 通常以 -100 开头）';
+        if (!target) return '用法：/whitelist add &lt;chatId&gt;（或在群里发 /activate@&lt;botname&gt; 一键加）';
         if (!/^-?\d+$/.test(target)) return `无效 chat id "${htmlEscape(target)}"，必须是整数`;
         const added = addAllowedChat(state, target);
         await ctx.persist();
@@ -1167,16 +1198,26 @@ async function handle(text, state, ctx, chatId) {
   }
 }
 
+// True if the message starts with /activate (with or without an
+// @<botname> suffix). Used as the pre-permission gate for
+// admin-driven group enrollment.
+function isActivateCommand(text) {
+  if (typeof text !== 'string') return false;
+  const first = text.trim().split(/\s+/)[0] ?? '';
+  const cmd = first.replace(/@\w+$/, '').toLowerCase();
+  return cmd === '/activate';
+}
+
 function normalizeReply(reply) {
   if (reply == null) return null;
   if (typeof reply === 'string') return { text: reply };
   return reply;
 }
 
-async function dispatchCommand(text, state, ctx, { chatId }) {
+async function dispatchCommand(text, state, ctx, { chatId, fromId }) {
   let reply;
   try {
-    reply = await handle(text, state, ctx, chatId);
+    reply = await handle(text, state, ctx, chatId, fromId);
   } catch (err) {
     warn('handler error:', err.message);
     await sendTelegramMessage(`错误: ${htmlEscape(err.message)}`, { chatId }).catch(() => {});
@@ -1216,20 +1257,31 @@ export function startCommandLoop({ getState, persist, ctx }) {
           if (u.update_id > maxId) maxId = u.update_id;
           if (u.message?.text) {
             const chatId = u.message.chat?.id;
+            const fromId = u.message.from?.id;
+            const text = u.message.text;
+            // Pre-permission: admin can fire `/activate@<botname>` in
+            // a brand-new group to enroll it without going to private
+            // chat first. Anything else from an unenrolled chat is
+            // silently ignored (logged for the admin's discovery).
             if (!isPermittedChat(state, chatId)) {
-              warn(`ignoring message from chat ${chatId}`);
+              if (isActivateCommand(text) && isAdminUser(fromId)) {
+                await dispatchCommand(text, state, fullCtx, { chatId, fromId });
+              } else {
+                warn(`ignoring message from chat ${chatId} (from user ${fromId})`);
+              }
               continue;
             }
-            await dispatchCommand(u.message.text, state, fullCtx, { chatId });
+            await dispatchCommand(text, state, fullCtx, { chatId, fromId });
           } else if (u.callback_query) {
             const cq = u.callback_query;
             const chatId = cq.message?.chat?.id;
+            const fromId = cq.from?.id;
             const messageId = cq.message?.message_id;
             // Always answer the callback so Telegram dismisses the loading
             // spinner, even if the chat is not allowed.
             await answerCallbackQuery(cq.id).catch(() => {});
             if (!isPermittedChat(state, chatId)) {
-              warn(`ignoring callback from chat ${chatId}`);
+              warn(`ignoring callback from chat ${chatId} (from user ${fromId})`);
               continue;
             }
             const data = String(cq.data ?? '').trim();
@@ -1245,7 +1297,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 warn('page callback error:', err.message);
               });
             } else {
-              await dispatchCommand(data, state, fullCtx, { chatId });
+              await dispatchCommand(data, state, fullCtx, { chatId, fromId });
             }
           }
         }

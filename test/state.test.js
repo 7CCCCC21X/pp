@@ -70,7 +70,7 @@ test('isSnoozed: cleans expired entry', () => {
   assert.equal(state.snoozes['999'], undefined);
 });
 
-const { isAdminChat, isPermittedChat, addAllowedChat, removeAllowedChat, broadcastChats } = await import('../src/state.js');
+const { isAdminChat, isAdminUser, isPermittedChat, addAllowedChat, removeAllowedChat, broadcastChats } = await import('../src/state.js');
 
 test('isAdminChat: matches TELEGRAM_CHAT_ID env', () => {
   // env stub above sets TELEGRAM_CHAT_ID=1
@@ -79,6 +79,14 @@ test('isAdminChat: matches TELEGRAM_CHAT_ID env', () => {
   assert.equal(isAdminChat('2'), false);
   assert.equal(isAdminChat(null), false);
   assert.equal(isAdminChat(''), false);
+});
+
+test('isAdminUser: matches the admin user id (private chat id)', () => {
+  // /activate uses this so admin can run from groups (where chat.id !== from.id).
+  assert.equal(isAdminUser('1'), true);
+  assert.equal(isAdminUser(1), true);
+  assert.equal(isAdminUser('999'), false);
+  assert.equal(isAdminUser(null), false);
 });
 
 test('isPermittedChat: admin OR runtime whitelist OR env whitelist', () => {
