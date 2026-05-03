@@ -551,6 +551,38 @@ export function isMarketTradeable(m) {
   return true;
 }
 
+// Combine GraphQL + REST views of a market into a single object the
+// rest of the bot uses. Pure function — exported for testability so
+// the merge precedence is verifiable without spinning up the network.
+//
+// Field-by-field rules:
+//   - title / question / conditionId / status / categorySlug:
+//       prefer GraphQL, fill from REST only if missing.
+//   - spreadThreshold / shareThreshold:
+//       GraphQL returns 0 for markets that haven't been explicitly tuned
+//       (default-tier on Predict.fun's side). 0 is "unset" downstream —
+//       rewardZoneStatus falls to env default and the alert shows
+//       "±6.0¢ (env)" even though REST exposes the real per-market value.
+//       Always prefer REST when REST has a positive number.
+//   - rewards / tradingStatus / isResolved / endsAt:
+//       always REST when present — these are time-sensitive runtime
+//       fields GraphQL doesn't expose reliably.
+export function mergeMarket(market, rest, marketId) {
+  const combined = market ? { ...market } : { id: rest?.id ?? marketId };
+  if (!rest) return combined;
+  for (const k of ['title', 'question', 'conditionId', 'status', 'categorySlug']) {
+    if (combined[k] == null && rest[k] != null) combined[k] = rest[k];
+  }
+  for (const k of ['spreadThreshold', 'shareThreshold']) {
+    if (Number.isFinite(rest[k]) && rest[k] > 0) combined[k] = rest[k];
+  }
+  if (rest.rewards != null) combined.rewards = rest.rewards;
+  if (rest.tradingStatus != null) combined.tradingStatus = rest.tradingStatus;
+  if (rest.isResolved != null) combined.isResolved = rest.isResolved;
+  if (rest.endsAt != null) combined.endsAt = rest.endsAt;
+  return combined;
+}
+
 // Reward + orderbook key lookup that the rest of the bot uses. Reads from
 // the cached REST market list (no per-market GraphQL).
 export async function getMarketRewardSummary(marketId) {
@@ -578,19 +610,7 @@ export async function getMarketRewardSummary(marketId) {
     };
   }
 
-  // Combine — start with whichever side we got, then overlay the other
-  // for missing fields. REST wins on the time-sensitive bits (rewards,
-  // tradingStatus, isResolved, endsAt) since GraphQL has no equivalents.
-  const combined = market ? { ...market } : { id: rest?.id ?? marketId };
-  if (rest) {
-    for (const k of ['title', 'question', 'conditionId', 'spreadThreshold', 'shareThreshold', 'status', 'categorySlug']) {
-      if (combined[k] == null && rest[k] != null) combined[k] = rest[k];
-    }
-    if (rest.rewards != null) combined.rewards = rest.rewards;
-    if (rest.tradingStatus != null) combined.tradingStatus = rest.tradingStatus;
-    if (rest.isResolved != null) combined.isResolved = rest.isResolved;
-    if (rest.endsAt != null) combined.endsAt = rest.endsAt;
-  }
+  const combined = mergeMarket(market, rest, marketId);
 
   const totalHourlyRate = extractHourlyRate(combined);
   const preferredKey = combined[config.orderbookKeyField];
