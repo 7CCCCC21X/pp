@@ -29,6 +29,8 @@ export async function tgApi(method, payload, { timeoutMs = 15_000, retries = 2 }
 
 // getUpdates uses long polling and needs the orchestrator's AbortController
 // for graceful shutdown, so we keep it on raw fetch instead of fetchJson.
+// my_chat_member tells us when the bot is added to / removed from / promoted
+// in a chat — needed for the auto-welcome on group join.
 export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
   const res = await fetch(tgUrl('getUpdates'), {
     method: 'POST',
@@ -36,7 +38,7 @@ export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
     body: JSON.stringify({
       offset,
       timeout: timeoutSec,
-      allowed_updates: ['message', 'callback_query'],
+      allowed_updates: ['message', 'callback_query', 'my_chat_member'],
     }),
     signal,
   });
@@ -125,8 +127,24 @@ export async function editTelegramMessage(chatId, messageId, text, replyMarkup) 
   return tgApi('editMessageText', payload);
 }
 
-export async function setMyCommands(commands) {
-  return tgApi('setMyCommands', { commands });
+// scope: optional Telegram BotCommandScope object, e.g.
+// { type: 'all_private_chats' } / { type: 'all_group_chats' } /
+// { type: 'default' }. Without it, sets the default scope (fallback
+// for every chat type that has no more-specific scope).
+export async function setMyCommands(commands, scope) {
+  const payload = { commands };
+  if (scope) payload.scope = scope;
+  return tgApi('setMyCommands', payload);
+}
+
+// One-shot bot identity lookup, cached for the process lifetime so the
+// my_chat_member handler can recognise events about itself ("am I the
+// chat member that was just added?") and so welcome messages can embed
+// the bot's @username for /cmd@<botname> instructions in groups.
+let cachedMe = null;
+export async function getMe() {
+  if (!cachedMe) cachedMe = await tgApi('getMe', {});
+  return cachedMe;
 }
 
 export async function answerCallbackQuery(callbackQueryId, { text, showAlert } = {}) {

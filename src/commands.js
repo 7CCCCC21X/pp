@@ -7,6 +7,7 @@ import {
   getUpdates,
   setMyCommands,
   answerCallbackQuery,
+  getMe,
 } from './telegram.js';
 import {
   activeMarketIds,
@@ -24,12 +25,14 @@ import { slugifyMarketTitle } from './format.js';
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
 
-// Commands shown in Telegram's blue "/" menu next to the input box.
-// Main menu — kept tight (~18 commands) so the "/" autocomplete in
-// Telegram is scannable. Advanced commands (setfilter / setmarket /
-// scan / opportunities / list) still work but aren't surfaced here;
-// /help lists everything.
-const COMMAND_MENU = [
+// Telegram's blue "/" menu next to the input box. Two scopes so
+// group members don't see admin-only management commands cluttering
+// their autocomplete:
+//   PRIVATE_MENU = full set, registered as all_private_chats + default.
+//   GROUP_MENU   = subset, registered as all_group_chats. /activate stays
+//                  here so admin can self-enroll the group; /whitelist
+//                  is hidden because it's managed elsewhere.
+const PRIVATE_MENU = [
   { command: 'menu', description: '快捷菜单' },
   { command: 'status', description: '监控面板（市场数 + 总 PP/h + 空缺数）' },
   { command: 'find', description: '自定义筛选查询（卡片向导）' },
@@ -54,6 +57,8 @@ const COMMAND_MENU = [
   { command: 'whitelist', description: '管理白名单（仅 admin）' },
   { command: 'help', description: '显示帮助（含进阶命令）' },
 ];
+
+const GROUP_MENU = PRIVATE_MENU.filter((c) => c.command !== 'whitelist');
 
 // Inline keyboard for /menu — quick-tap buttons that issue commands via
 // callback_data. Each button label is short to fit on mobile.
@@ -306,6 +311,11 @@ const HELP = [
   '/activate — 在当前 chat 激活机器人（群里发 /activate@&lt;botname&gt;，仅 admin）',
   '/deactivate — 从白名单移除当前 chat（仅 admin）',
   '/whitelist [list|add &lt;id&gt;|remove &lt;id&gt;] — 管理可使用 / 接收广播的 chat（仅 admin）',
+  '',
+  '<b>群组使用</b>',
+  '1. 把机器人加入群（自动收到欢迎消息）',
+  '2. admin 在群里发 /activate@&lt;botname&gt;',
+  '3. 群里所有命令必须带 @&lt;botname&gt; 后缀（Telegram 隐私模式）',
   '',
   '/help — 本帮助',
 ].join('\n');
@@ -1198,6 +1208,28 @@ async function handle(text, state, ctx, chatId, fromId) {
   }
 }
 
+// One-shot welcome posted to a group right after the bot is added.
+// Embeds the bot's @username so all examples are paste-ready under
+// Telegram's group privacy mode (which requires the @<botname> suffix
+// for the bot to even see the message).
+export function buildWelcomeText(botUsername) {
+  const u = botUsername ? `@${botUsername}` : '@&lt;botname&gt;';
+  return [
+    '👋 你好！我是 Predict.fun 监控机器人。',
+    '',
+    `要启用本群的监控提醒，请由 admin 发送：`,
+    `<code>/activate${u}</code>`,
+    '',
+    '激活后任意成员可用：',
+    `<code>/status${u}</code> — 监控面板`,
+    `<code>/top${u}</code> — PP/h 排行`,
+    `<code>/gaps${u}</code> — 奖励区空缺`,
+    `<code>/help${u}</code> — 完整命令`,
+    '',
+    `⚠️ Telegram 群里使用命令必须带 ${u} 后缀（隐私模式所致）。`,
+  ].join('\n');
+}
+
 // True if the message starts with /activate (with or without an
 // @<botname> suffix). Used as the pre-permission gate for
 // admin-driven group enrollment.
@@ -1238,11 +1270,29 @@ export function startCommandLoop({ getState, persist, ctx }) {
   let stopped = false;
   const ctrl = new AbortController();
   const fullCtx = { ...ctx, persist };
+  let botId = null;
+  let botUsername = null;
 
-  // Register commands with Telegram (best-effort; ignore failure).
-  setMyCommands(COMMAND_MENU).catch((err) =>
-    warn('setMyCommands failed:', err.message),
+  // Register commands per-scope (best-effort). Group members get a
+  // trimmed menu; admin's private chat sees everything; default is the
+  // catch-all fallback for any chat type with no explicit registration.
+  setMyCommands(PRIVATE_MENU, { type: 'all_private_chats' }).catch((err) =>
+    warn('setMyCommands(private) failed:', err.message),
   );
+  setMyCommands(GROUP_MENU, { type: 'all_group_chats' }).catch((err) =>
+    warn('setMyCommands(group) failed:', err.message),
+  );
+  setMyCommands(PRIVATE_MENU, { type: 'default' }).catch((err) =>
+    warn('setMyCommands(default) failed:', err.message),
+  );
+
+  // Cache bot identity once so my_chat_member can recognise self-events
+  // and welcome messages can embed @<botname>.
+  getMe().then((me) => {
+    botId = me?.id ?? null;
+    botUsername = me?.username ?? null;
+    log(`bot identity: @${botUsername} (id=${botId})`);
+  }).catch((err) => warn('getMe failed:', err.message));
 
   (async () => {
     log('listening for commands');
@@ -1255,6 +1305,27 @@ export function startCommandLoop({ getState, persist, ctx }) {
         let maxId = state.telegramOffset ?? 0;
         for (const u of updates) {
           if (u.update_id > maxId) maxId = u.update_id;
+          if (u.my_chat_member) {
+            // Bot was added/removed/promoted in some chat. Welcome on
+            // the join transition (kicked/left → member/administrator)
+            // for non-private chats. Bypasses whitelist gate because
+            // it's a one-shot reply to the join event itself.
+            const ev = u.my_chat_member;
+            const targetUserId = ev.new_chat_member?.user?.id;
+            if (botId != null && targetUserId === botId) {
+              const fromStatus = ev.old_chat_member?.status;
+              const toStatus = ev.new_chat_member?.status;
+              const wasOut = fromStatus === 'left' || fromStatus === 'kicked';
+              const nowIn = toStatus === 'member' || toStatus === 'administrator';
+              const groupChat = ev.chat?.type === 'group' || ev.chat?.type === 'supergroup';
+              if (wasOut && nowIn && groupChat && ev.chat?.id != null) {
+                log(`my_chat_member: bot joined chat ${ev.chat.id} (${ev.chat.title ?? '?'})`);
+                await sendTelegramMessage(buildWelcomeText(botUsername), { chatId: ev.chat.id })
+                  .catch((err) => warn(`welcome to ${ev.chat.id} failed:`, err.message));
+              }
+            }
+            continue;
+          }
           if (u.message?.text) {
             const chatId = u.message.chat?.id;
             const fromId = u.message.from?.id;
