@@ -1,12 +1,31 @@
 import { config } from './config.js';
-import { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } from './predict.js';
+import {
+  getAllMarketsCached,
+  listActiveRewardedMarketsRest,
+  extractHourlyRate,
+  isMarketTradeable,
+  marketEndMs,
+} from './predict.js';
 
 const log = (...a) => console.log(new Date().toISOString(), '[discovery]', ...a);
+const warn = (...a) => console.warn(new Date().toISOString(), '[discovery]', ...a);
 
 export async function discoverRewardedMarkets() {
   log('refreshing market list...');
-  const all = await getAllMarketsCached();
-  log(`scanned ${all.length} markets`);
+  // PRIMARY: REST `?hasActiveRewards=true` — server already drops markets
+  // not currently in a reward window, so the response is ~100 markets vs
+  // GraphQL's ~thousands. Falls back to the GraphQL list (scanned
+  // client-side) on REST error so we degrade rather than fail discovery.
+  let all;
+  let source = 'rest';
+  try {
+    all = await listActiveRewardedMarketsRest();
+  } catch (err) {
+    warn(`REST hasActiveRewards fetch failed (${err.message}); falling back to GraphQL`);
+    all = await getAllMarketsCached();
+    source = 'graphql';
+  }
+  log(`scanned ${all.length} markets (source=${source})`);
   const rewarded = [];
   const minRate = Math.max(0, config.minHourlyRate);
   const minRemainingMs = Math.max(0, config.minRemainingHours) * 3600 * 1000;

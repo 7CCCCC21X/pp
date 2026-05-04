@@ -301,6 +301,55 @@ export async function listAllMarkets({ pageSize = 100, maxPages = 100, onProgres
   return [...seen.values()];
 }
 
+// REST `/v1/markets?hasActiveRewards=true` — server-side filter (added by
+// Predict.fun in 2026-04) that returns only markets currently in a rewarded
+// window. Trims discovery from "all N thousand markets" to "the ~hundred
+// that actually pay PP right now," cutting bandwidth + parse cost on every
+// 30-min refresh cycle.
+//
+// Pagination uses `?after=<lastId>` cursors (same shape as the slug map),
+// breaks on empty page or short page. `onProgress` mirrors listAllMarkets
+// so the same /refresh / discovery callbacks can attach.
+export async function listActiveRewardedMarketsRest({ pageSize = 100, maxPages = 50, onProgress } = {}) {
+  const seen = new Map();
+  let lastId = null;
+  for (let page = 0; page < maxPages; page++) {
+    if (onProgress) onProgress({ phase: 'fetching', page, after: lastId, total: seen.size });
+    const params = new URLSearchParams({ first: String(pageSize), hasActiveRewards: 'true' });
+    if (lastId != null) params.set('after', String(lastId));
+    const url = `${config.restUrl}/markets?${params.toString()}`;
+    let arr;
+    try {
+      const json = await fetchJson(url, {
+        headers: restHeaders(),
+        timeoutMs: config.orderbookTimeoutMs ?? 10_000,
+        retries: 1,
+      });
+      arr = unwrapList(json);
+    } catch (err) {
+      if (onProgress) onProgress({ phase: 'error', page, error: err.message, total: seen.size });
+      throw err;
+    }
+    let progress = 0;
+    for (const m of arr) {
+      if (m?.id == null || seen.has(String(m.id))) continue;
+      seen.set(String(m.id), m);
+      progress += 1;
+    }
+    if (onProgress) {
+      onProgress({
+        phase: 'page', page, edges: arr.length, newMarkets: progress,
+        total: seen.size, hasNext: arr.length >= pageSize,
+      });
+    }
+    if (!arr.length || !progress || arr.length < pageSize) break;
+    const newLast = arr[arr.length - 1]?.id;
+    if (newLast == null || newLast === lastId) break;
+    lastId = newLast;
+  }
+  return [...seen.values()];
+}
+
 // Cache the full market list so that a 5-min poll cycle doesn't refetch it
 // for every market.
 let _cache = { at: 0, markets: null, byId: null, inFlight: null };
