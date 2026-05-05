@@ -69,25 +69,32 @@ const GROUP_MENU = PRIVATE_MENU.filter((c) => c.command !== 'whitelist');
 
 // Inline keyboard for /menu. Two layouts:
 //   - private: full grouped layout (机会找寻 / 监控管理 / 单市场 / 设置)
-//   - group:   top-row reads only — group members rarely need /refresh
-//              / /digest / /alerts which are admin-flavored
+//   - group:   read-only browsing buttons only — admin actions like
+//              /refresh, /discover, /alerts, /filter, /snapshot are
+//              hidden so group members aren't tempted to flip global
+//              config; everything they CAN do lands on this keyboard
+//              so they don't have to remember slash-command names.
 function menuKeyboard({ isPrivate = true } = {}) {
   if (!isPrivate) {
     return {
       inline_keyboard: [
         [
-          { text: '📡 状态', callback_data: '/status' },
           { text: '🔥 PP/h 榜', callback_data: '/top' },
-        ],
-        [
           { text: '🎯 空缺榜', callback_data: '/gaps' },
           { text: '💧 薄盘榜', callback_data: '/thin' },
         ],
         [
           { text: '📏 价差榜', callback_data: '/wide' },
           { text: '🌊 空簿榜', callback_data: '/empty' },
+          { text: '⏱ 停滞榜', callback_data: '/stale' },
         ],
         [
+          { text: '🔍 自定义筛', callback_data: '/find' },
+          { text: '📡 状态', callback_data: '/status' },
+          { text: '📈 24h 摘要', callback_data: '/digest' },
+        ],
+        [
+          { text: '📋 当前配置', callback_data: '/config' },
           { text: '❓ 帮助', callback_data: '/help' },
         ],
       ],
@@ -137,7 +144,15 @@ function menuKeyboard({ isPrivate = true } = {}) {
 // scannable. Embedded URL/id paste hint reduces friction for the
 // most common admin flow.
 function menuText({ isPrivate = true } = {}) {
-  if (!isPrivate) return '<b>快捷菜单</b> — 点按钮或输入 /command';
+  if (!isPrivate) {
+    return [
+      '<b>快捷菜单</b>',
+      '',
+      '🔍 <b>找机会</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 自定义筛',
+      '📡 <b>查看</b>: 状态 / 24h 摘要 / 当前配置',
+      '<i>群里按钮只放只读浏览。改阈值/订阅请去私聊。</i>',
+    ].join('\n');
+  }
   return [
     '<b>快捷菜单</b>',
     '',
