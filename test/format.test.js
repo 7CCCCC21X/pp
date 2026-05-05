@@ -49,24 +49,41 @@ test('fmtElapsed clamps negative', () => {
 
 test('marketLink: explicit slug wins (real categorySlug from REST)', () => {
   const link = marketLink('210562', 'Draw', 'whatever', 'english-premier-league-winner');
-  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/english-premier-league-winner"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/english-premier-league-winner\?ref=B00EA"/);
   assert.match(link, />Draw<\/a>/);
 });
 
 test('marketLink: question slugified when no explicit slug', () => {
   const link = marketLink('210562', 'Draw', 'Real Madrid vs Barcelona — Match Result');
-  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/real-madrid-vs-barcelona-match-result"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/real-madrid-vs-barcelona-match-result\?ref=B00EA"/);
 });
 
 test('marketLink: falls back to title slug when no question or explicit slug', () => {
   const link = marketLink('1', 'BNB up or down (May 2 2026 2am ET)');
-  assert.match(link, /\/bnb-up-or-down-may-2-2026-2am-et/);
+  assert.match(link, /\/bnb-up-or-down-may-2-2026-2am-et\?ref=B00EA/);
 });
 
 test('marketLink: id fallback when nothing else', () => {
   const link = marketLink('123', null);
-  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/123"/);
+  assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/123\?ref=B00EA"/);
   assert.match(link, /Market 123/);
+});
+
+test('marketLink: ref code can be disabled with PREDICT_REF_CODE=""', async () => {
+  // config is captured at import time; verify the disable path works by
+  // momentarily blanking the value (full test of env-driven boot is in
+  // config validation, but we want to make sure the marketLink code path
+  // gracefully omits ?ref when the value is falsy).
+  const { config } = await import('../src/config.js');
+  const original = config.predictRefCode;
+  config.predictRefCode = '';
+  try {
+    const link = marketLink('123', null);
+    assert.match(link, /href="https:\/\/predict\.fun\/zh-cn\/market\/123"/);
+    assert.doesNotMatch(link, /\?ref=/);
+  } finally {
+    config.predictRefCode = original;
+  }
 });
 
 test('marketLink escapes title text', () => {

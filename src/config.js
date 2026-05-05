@@ -187,6 +187,11 @@ export const config = {
   graphqlUrl: process.env.GRAPHQL_URL ?? 'https://graphql.predict.fun/graphql',
   restUrl: (process.env.REST_URL ?? 'https://api.predict.fun/v1').replace(/\/$/, ''),
 
+  // Referral code appended as ?ref=... to every market URL the bot links
+  // to (alert messages, /probe cards, list rows). Set PREDICT_REF_CODE='' to
+  // disable. Stripped to ASCII alnum so a typo'd value can't break links.
+  predictRefCode: (process.env.PREDICT_REF_CODE ?? 'B00EA').replace(/[^A-Za-z0-9_-]/g, ''),
+
   // Orderbook URL shape. {key} is replaced with market[ORDERBOOK_KEY_FIELD].
   // Default `conditionId` matches predict.fun's REST API. The bot self-heals
   // by trying alternate (path, field) combinations on 404 and caching the

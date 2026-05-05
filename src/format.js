@@ -1,4 +1,5 @@
 import { htmlEscape } from './telegram.js';
+import { config } from './config.js';
 
 export function fmtSide(side) {
   if (!side) return '无';
@@ -83,9 +84,11 @@ export function marketLink(marketId, title, question, slug) {
   const urlSlug = slug
     || (question ? slugifyMarketTitle(question) : null)
     || (title ? slugifyMarketTitle(title) : null);
-  const url = urlSlug
+  const base = urlSlug
     ? `https://predict.fun/zh-cn/market/${urlSlug}`
     : `https://predict.fun/zh-cn/market/${encodeURIComponent(marketId)}`;
+  const ref = config.predictRefCode;
+  const url = ref ? `${base}?ref=${ref}` : base;
   return `<a href="${url}">${safeTitle}</a>`;
 }
 
