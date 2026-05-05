@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
-import { marketLink, midOf, formatOrderbookBlock, formatOpportunitySummary } from '../format.js';
+import { marketLink, midOf, fmtCents, formatOrderbookBlock, formatOpportunitySummary } from '../format.js';
 import { effectiveOverride } from '../state.js';
 
 export async function detectMidJump(ctx) {
@@ -18,9 +18,9 @@ export async function detectMidJump(ctx) {
     if (jump >= jumpThreshold && cooldownOk) {
       const direction = curMid > slot.lastMid ? '↑' : '↓';
       const msg = [
-        `⚡ <b>中价跳变 ${direction} ${jump.toFixed(4)}</b>`,
+        `⚡ <b>中价跳变 ${direction} ${(jump * 100).toFixed(2)}¢</b>`,
         `${marketLink(marketId, slot.title, slot.question, slot.slug)}`,
-        `<code>#${htmlEscape(marketId)}</code> · ${slot.lastMid.toFixed(4)} → <b>${curMid.toFixed(4)}</b>`,
+        `<code>#${htmlEscape(marketId)}</code> · ${fmtCents(slot.lastMid)} → <b>${fmtCents(curMid)}</b>`,
         formatOpportunitySummary({ orderbook, zone, totalHourlyRate, endMs: slot.endMs }),
         '',
         formatOrderbookBlock(orderbook, zone),

@@ -18,7 +18,7 @@ import {
   broadcastChats,
   effectiveOverride,
 } from './state.js';
-import { fmtElapsed, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
+import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
 import { getMarketRewardSummary, getOrderbook, resolveSlugToId, getCacheStats, refreshAllCaches } from './predict.js';
 import { slugifyMarketTitle } from './format.js';
@@ -1131,16 +1131,16 @@ async function buildProbeMessage(marketId, state) {
   if (!ob.bids.length) lines.push('  (空)');
   for (let i = 0; i < ob.bids.length; i++) {
     const b = ob.bids[i];
-    lines.push(`  买${i + 1}: ${b.price.toFixed(4)} × ${b.size}`);
+    lines.push(`  买${i + 1}: ${fmtCents(b.price)} × ${b.size}`);
   }
   lines.push('<b>卖盘</b>');
   if (!ob.asks.length) lines.push('  (空)');
   for (let i = 0; i < ob.asks.length; i++) {
     const a = ob.asks[i];
-    lines.push(`  卖${i + 1}: ${a.price.toFixed(4)} × ${a.size}`);
+    lines.push(`  卖${i + 1}: ${fmtCents(a.price)} × ${a.size}`);
   }
   lines.push('');
-  lines.push(`mid: ${mid != null ? mid.toFixed(4) : 'n/a'}  ·  spread: ${spread != null ? `${(spread * 100).toFixed(2)}¢` : 'n/a'}`);
+  lines.push(`mid: ${mid != null ? fmtCents(mid) : 'n/a'}  ·  spread: ${spread != null ? `${(spread * 100).toFixed(2)}¢` : 'n/a'}`);
   const srcLabel = (s) => s === 'override' ? '覆盖' : s === 'rest' ? 'REST' : 'env';
   lines.push(`奖励区: ±${(zone.maxDistance * 100).toFixed(1)}¢ / size ≥ ${zone.minSize}  (距离: ${srcLabel(zone.maxSource)}, size: ${srcLabel(zone.sizeSource)})`);
   lines.push(`  买侧: ${zone.bidActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.bidReason ?? '未激活')}`}`);

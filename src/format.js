@@ -2,7 +2,7 @@ import { htmlEscape } from './telegram.js';
 
 export function fmtSide(side) {
   if (!side) return '无';
-  const price = side.price.toFixed(4);
+  const price = fmtCents(side.price);
   const size = side.size.toLocaleString('en-US', { maximumFractionDigits: 2 });
   return `${price} × ${size}`;
 }
@@ -21,9 +21,14 @@ function compactNumber(n, digits = 0) {
   return v.toLocaleString('en-US', { maximumFractionDigits: digits });
 }
 
-function fmtPriceValue(n) {
+// Predict.fun prices are probabilities in [0, 1] but the platform UI
+// displays them as cents (63¢, 64.5¢). Mirror that convention so users
+// don't have to mentally multiply by 100. Trailing zeros stripped:
+// 0.63 → "63¢", 0.635 → "63.5¢", 0.6345 → "63.45¢".
+export function fmtCents(n) {
   const v = Number(n);
-  return Number.isFinite(v) ? v.toFixed(4) : '-';
+  if (!Number.isFinite(v)) return '-';
+  return `${parseFloat((v * 100).toFixed(2))}¢`;
 }
 
 function fmtSizeValue(n) {
@@ -139,7 +144,7 @@ function bookLine(label, row) {
   if (!row) return `${label.padEnd(4)} 空`;
   // Each row's $ value = price × size (USDC equivalent on Predict.fun).
   const total = row.price * row.size;
-  return `${label.padEnd(4)} ${fmtPriceValue(row.price).padEnd(7)} × ${fmtSizeValue(row.size).padEnd(9)} = $${fmtSizeValue(total)}`;
+  return `${label.padEnd(4)} ${fmtCents(row.price).padEnd(7)} × ${fmtSizeValue(row.size).padEnd(9)} = $${fmtSizeValue(total)}`;
 }
 
 function sideTotal(rows) {
@@ -190,7 +195,7 @@ export function formatOrderbookBlock(orderbook, zone) {
   if (mid != null && spread != null) {
     const spreadIcon = spread <= 0.02 ? '🟢' : spread <= 0.05 ? '🟡' : '🔴';
     lines.push(
-      `${spreadIcon} mid <code>${mid.toFixed(4)}</code> · spread <b>${(spread * 100).toFixed(2)}¢</b> · 总深度 $${fmtSizeValue(bidTotal + askTotal)}`,
+      `${spreadIcon} mid <code>${fmtCents(mid)}</code> · spread <b>${(spread * 100).toFixed(2)}¢</b> · 总深度 $${fmtSizeValue(bidTotal + askTotal)}`,
     );
   }
 

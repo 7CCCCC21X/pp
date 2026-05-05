@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   fmtSide,
+  fmtCents,
   fmtElapsed,
   marketLink,
   midOf,
@@ -18,10 +19,20 @@ test('fmtSide handles null', () => {
   assert.equal(fmtSide(null), '无');
 });
 
-test('fmtSide formats price and size', () => {
+test('fmtSide formats price as cents and includes size', () => {
   const out = fmtSide({ price: 0.5, size: 100 });
-  assert.match(out, /0\.5000/);
+  assert.match(out, /50¢/);
   assert.match(out, /100/);
+});
+
+test('fmtCents trims trailing zeros', () => {
+  assert.equal(fmtCents(0.63), '63¢');
+  assert.equal(fmtCents(0.635), '63.5¢');
+  assert.equal(fmtCents(0.6345), '63.45¢');
+  assert.equal(fmtCents(1), '100¢');
+  assert.equal(fmtCents(0), '0¢');
+  assert.equal(fmtCents(NaN), '-');
+  assert.equal(fmtCents(undefined), '-');
 });
 
 test('fmtElapsed minutes', () => {

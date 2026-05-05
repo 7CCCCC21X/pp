@@ -1,5 +1,5 @@
 import { htmlEscape } from '../telegram.js';
-import { fmtSide, marketLink, formatOrderbookBlock } from '../format.js';
+import { fmtCents, marketLink, formatOrderbookBlock } from '../format.js';
 
 export async function detectWatch(ctx) {
   const {
@@ -13,8 +13,8 @@ export async function detectWatch(ctx) {
   if (!cooldownOk) return;
 
   const fmtMove = (label, prev, next) => {
-    const prevPart = prev?.price != null ? `${prev.price.toFixed(4)} × ${prev.size}` : '空';
-    const nextPart = next?.price != null ? `${next.price.toFixed(4)} × ${next.size}` : '空';
+    const prevPart = prev?.price != null ? `${fmtCents(prev.price)} × ${prev.size}` : '空';
+    const nextPart = next?.price != null ? `${fmtCents(next.price)} × ${next.size}` : '空';
     return `${label}: ${prevPart} → ${nextPart}`;
   };
   const prevBid = slot.baseline.bidPrice != null ? { price: slot.baseline.bidPrice, size: slot.baseline.bidSize } : null;
