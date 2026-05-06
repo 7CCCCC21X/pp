@@ -57,6 +57,7 @@ const PRIVATE_MENU = [
   { command: 'alerts', description: '按类型开关提醒（停滞/跳变/阔差/奖励区/空簿）' },
   { command: 'route', description: '当前 chat 的路由（每个 chat 独立排除某些 kind）' },
   { command: 'discover', description: '立即触发自动发现' },
+  { command: 'diagdiscover', description: '对比 REST/GraphQL 两个发现源的数量' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
   { command: 'config', description: '查看当前监控条件 / 阈值 / 过滤器' },
@@ -1046,6 +1047,7 @@ const HELP = [
   '',
   '<b>🔄 维护 / 批量</b>',
   '/discover — 立即触发自动发现',
+  '/diagdiscover — 对比 REST/GraphQL 两个发现源（监控数量看着不对时用）',
   '/refresh — 立即刷新 PP/h 缓存',
   '/digest — 立即发送 24h 摘要',
   '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
@@ -1859,6 +1861,50 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/discover': {
       ctx.requestDiscovery();
       return '已触发自动发现，几分钟内完成。';
+    }
+
+    case '/diagdiscover': {
+      // Side-by-side count of REST vs GraphQL discovery sources, plus
+      // breakdown of which post-fetch filter eats which markets. Useful
+      // when /status shows fewer monitored markets than expected — points
+      // at whether REST returned fewer items, GraphQL did, or local
+      // filters (minRate, minRemaining) are dropping them.
+      const { compareDiscoverySources } = await import('./discovery.js');
+      const r = await compareDiscoverySources();
+      const fmtBd = (b) => b
+        ? `raw <b>${b.raw}</b> · 不可交易 ${b.notTradeable} · 低于 minRate ${b.belowMin} · 剩余太少 ${b.tooSoon} · 留 <b>${b.kept}</b>`
+        : 'n/a';
+      const fmtSample = (sample) => sample.length
+        ? sample.map((s) => `  <code>#${s.id}</code> · ${s.rate.toFixed(0)}/h · ${htmlEscape(shortTitle(s.title, 50))}`).join('\n')
+        : '  <i>(无)</i>';
+      const lines = [
+        `🔍 <b>发现源对比</b>  <i>(耗时 ${(r.elapsedMs / 1000).toFixed(1)}s)</i>`,
+        '',
+        r.rest.err
+          ? `🌐 REST hasActiveRewards: ❌ ${htmlEscape(r.rest.err)}`
+          : `🌐 REST hasActiveRewards: <b>${r.rest.count}</b> 个`,
+        r.rest.err ? null : `   ${fmtBd(r.rest.breakdown)}`,
+        '',
+        r.gql.err
+          ? `📡 GraphQL rate&gt;0:        ❌ ${htmlEscape(r.gql.err)}`
+          : `📡 GraphQL rate&gt;0:        <b>${r.gql.count}</b> 个`,
+        r.gql.err ? null : `   ${fmtBd(r.gql.breakdown)}`,
+        '',
+        `🔁 交集 <b>${r.bothCount}</b> · REST 独有 <b>${r.onlyRest.count}</b> · GraphQL 独有 <b>${r.onlyGql.count}</b>`,
+      ].filter((l) => l != null);
+      if (r.onlyGql.count) {
+        lines.push('');
+        lines.push(`<b>GraphQL 有但 REST 没的 (前 ${r.onlyGql.sample.length}):</b>`);
+        lines.push(fmtSample(r.onlyGql.sample));
+      }
+      if (r.onlyRest.count) {
+        lines.push('');
+        lines.push(`<b>REST 有但 GraphQL 没的 (前 ${r.onlyRest.sample.length}):</b>`);
+        lines.push(fmtSample(r.onlyRest.sample));
+      }
+      lines.push('');
+      lines.push(`<i>当前 minRate=${r.config.minRate} · minRemainingHours=${r.config.minRemainingHours}h · discoveryMaxMarkets=${r.config.discoveryMaxMarkets}</i>`);
+      return lines.join('\n');
     }
 
     case '/refresh': {
