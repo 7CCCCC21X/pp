@@ -696,17 +696,22 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 // dollar threshold, and the bot re-fetches each active market's orderbook
 // fresh (no cache) with a live progress bar before applying the filter.
 //
-// State encoding in callback_data: stale:<action>:<bits>:<thresh>:<page>
+// State encoding in callback_data: stale:<action>:<bits>:<thresh>:<sort>:<page>
 //   bits   = 6-char "b1b2b3a1a2a3" (1=selected). Default "100100".
 //   thresh = inf | 50 | 100 | 200 | 500. Default "inf".
+//   sort   = t | p (t=stall duration, p=PP/h). Default "t".
 //   page   = int (only used by action=page).
 //   actions = wizard | set | run | page | cancel
 //
-// Telegram callback_data limit is 64 bytes; this scheme fits in ~25.
+// Telegram callback_data limit is 64 bytes; this scheme fits in ~30.
+// Legacy (pre-sort) buttons used a 5-part shape — parsing falls back to
+// sort='t' when the field is absent so old in-flight messages still work.
 
 const STALE_THRESHOLDS = ['inf', '50', '100', '200', '500'];
 const STALE_LEVELS = ['b1', 'b2', 'b3', 'a1', 'a2', 'a3'];
 const STALE_LEVEL_LABELS = { b1: '买1', b2: '买2', b3: '买3', a1: '卖1', a2: '卖2', a3: '卖3' };
+const STALE_SORTS = ['t', 'p'];
+const STALE_SORT_LABELS = { t: '停滞时长', p: 'PP/h' };
 
 function parseStaleBits(bits) {
   const safe = (typeof bits === 'string' && /^[01]{6}$/.test(bits)) ? bits : '100100';
@@ -746,26 +751,30 @@ function sumLevels(book, sel) {
   return sum;
 }
 
-function staleWizardText(bits, thresh) {
+function staleWizardText(bits, thresh, sort) {
   const sel = parseStaleBits(bits);
   const picked = STALE_LEVELS.filter((k) => sel[k]).map((k) => STALE_LEVEL_LABELS[k]);
+  const sortKey = STALE_SORTS.includes(sort) ? sort : 't';
   const lines = [
     '<b>⏱ 停滞排名 · 过滤设置</b>',
     '',
     `📐 累加层级: ${picked.length ? `<b>${picked.join(' + ')}</b>` : '<i>未选 (=不过滤)</i>'}`,
     `💵 总额阈值: <b>${staleThreshLabel(thresh)}</b>`,
+    `📊 排序: <b>${STALE_SORT_LABELS[sortKey]}</b>`,
     '',
-    '<i>点 🚀 后会对 active 市场逐个重新抓 orderbook（实时数据），</i>',
-    '<i>过程中边抓边显示进度。完成后按 sum ≤ 阈值 过滤。</i>',
+    '<i>点 🚀 后:有过滤条件 → 重抓 orderbook 实时数据再筛+排序;</i>',
+    '<i>没过滤条件(默认) → 直接用现有数据排序,瞬间完成。</i>',
   ];
   return lines.join('\n');
 }
 
-function staleWizardKeyboard(bits, thresh) {
+function staleWizardKeyboard(bits, thresh, sort) {
   const sel = parseStaleBits(bits);
+  const sortKey = STALE_SORTS.includes(sort) ? sort : 't';
   const mark = (on, label) => on ? `✅ ${label}` : `⬜ ${label}`;
   const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t)}` : staleThreshLabel(t);
-  const cb = (action, b = bits, t = thresh) => `stale:${action}:${b}:${t}:0`;
+  const sortMark = (s) => s === sortKey ? `✅ ${STALE_SORT_LABELS[s]}` : STALE_SORT_LABELS[s];
+  const cb = (action, b = bits, t = thresh, s = sortKey) => `stale:${action}:${b}:${t}:${s}:0`;
   return {
     inline_keyboard: [
       [
@@ -782,8 +791,12 @@ function staleWizardKeyboard(bits, thresh) {
         text: threshMark(t),
         callback_data: cb('set', bits, t),
       })),
+      STALE_SORTS.map((s) => ({
+        text: sortMark(s),
+        callback_data: cb('set', bits, thresh, s),
+      })),
       [
-        { text: '🚀 重抓 + 筛', callback_data: cb('run') },
+        { text: '🚀 应用', callback_data: cb('run') },
         { text: '✖ 取消', callback_data: cb('cancel') },
       ],
     ],
@@ -884,21 +897,31 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, bi
 }
 
 export async function handleStaleFilterCallback(data, { chatId, messageId, state, fullCtx }) {
-  // data shape: stale:<action>:<bits>:<thresh>:<page>
+  // data shape: stale:<action>:<bits>:<thresh>:<sort>:<page>
+  // Legacy 5-part shape (pre-sort): stale:<action>:<bits>:<thresh>:<page>
+  // — old in-flight buttons still work, sort defaults to 't'.
   const parts = data.split(':');
   if (parts[0] !== 'stale') return false;
-  const [, action, bits = '100100', thresh = 'inf', pageStr = '0'] = parts;
+  let action, bits, thresh, sort, pageStr;
+  if (parts.length >= 6) {
+    [, action, bits, thresh, sort, pageStr] = parts;
+  } else {
+    [, action, bits, thresh, pageStr] = parts;
+    sort = 't';
+  }
   const safeBits = /^[01]{6}$/.test(bits) ? bits : '100100';
   const safeThresh = STALE_THRESHOLDS.includes(thresh) ? thresh : 'inf';
+  const safeSort = STALE_SORTS.includes(sort) ? sort : 't';
   const page = Math.max(0, Number(pageStr) || 0);
+  const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort };
 
   if (action === 'wizard' || action === 'set') {
     try {
       await editTelegramMessage(
         chatId,
         messageId,
-        staleWizardText(safeBits, safeThresh),
-        staleWizardKeyboard(safeBits, safeThresh),
+        staleWizardText(safeBits, safeThresh, safeSort),
+        staleWizardKeyboard(safeBits, safeThresh, safeSort),
       );
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
@@ -920,7 +943,7 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
   }
 
   if (action === 'page') {
-    const reply = renderListPage('stale', page, state, { bits: safeBits, thresh: safeThresh });
+    const reply = renderListPage('stale', page, state, filter);
     if (reply) {
       try {
         await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
@@ -934,6 +957,23 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
   }
 
   if (action === 'run') {
+    // No filter active → just re-render with the chosen sort. No refetch
+    // needed; the leaderboard data is already fresh (5-min poll). This
+    // makes "switch sort to PP/h" a 1-tap instant operation instead of a
+    // 1-2 minute wait.
+    if (!staleFilterIsActive(safeBits, safeThresh)) {
+      const reply = renderListPage('stale', 0, state, filter);
+      if (reply) {
+        try {
+          await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+        } catch (err) {
+          if (!/message is not modified/i.test(err.message ?? '')) {
+            warn('stale sort-only render failed:', err.message);
+          }
+        }
+      }
+      return true;
+    }
     const ids = activeMarketIds(state);
     if (!ids.length) {
       try {
@@ -946,7 +986,7 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
       bits: safeBits, thresh: safeThresh,
     });
     if (fullCtx?.persist) await fullCtx.persist().catch(() => {});
-    const reply = renderListPage('stale', 0, state, { bits: safeBits, thresh: safeThresh });
+    const reply = renderListPage('stale', 0, state, filter);
     if (reply) {
       try {
         await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
@@ -1295,13 +1335,14 @@ const PAGE_SIZE = 10;
 
 function pageKeyboard(cmd, page, totalPages, opts = {}) {
   // For /stale we use a filter-aware callback shape so pagination preserves
-  // the active filter (stale:page:bits:thresh:N). The wizard button is also
-  // appended as a second row so the user can re-open filter settings.
+  // the active filter (stale:page:bits:thresh:sort:N). The wizard button
+  // appended as a second row lets the user re-open filter settings.
   const isStale = cmd === 'stale';
   const bits = opts.bits ?? '100100';
   const thresh = opts.thresh ?? 'inf';
+  const sort = STALE_SORTS.includes(opts.sort) ? opts.sort : 't';
   const pageCb = (p) => isStale
-    ? `stale:page:${bits}:${thresh}:${p}`
+    ? `stale:page:${bits}:${thresh}:${sort}:${p}`
     : `page:${cmd}:${p}`;
   const rows = [];
   if (totalPages > 1) {
@@ -1313,9 +1354,12 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   }
   if (isStale) {
     const filterActive = staleFilterIsActive(bits, thresh);
+    const sortTag = sort !== 't' ? ` · 排序 ${STALE_SORT_LABELS[sort]}` : '';
     rows.push([{
-      text: filterActive ? `🎚 调整过滤 (${staleThreshLabel(thresh)})` : '🎚 过滤 (重抓+筛)',
-      callback_data: `stale:wizard:${bits}:${thresh}:0`,
+      text: filterActive
+        ? `🎚 调整 (${staleThreshLabel(thresh)}${sortTag})`
+        : `🎚 过滤 / 排序${sortTag}`,
+      callback_data: `stale:wizard:${bits}:${thresh}:${sort}:0`,
     }]);
   }
   return rows.length ? { inline_keyboard: rows } : undefined;
@@ -1459,9 +1503,18 @@ function renderListPage(cmd, page, state, filter = null) {
           // recentBook we can't honor the level-sum filter.
           if (!r.slot.recentBook) return false;
           return r.sumUsd != null && r.sumUsd <= threshUsd;
-        })
-        .sort((a, b) => b.sinceMs - a.sinceMs);
-      const headerParts = ['<b>⏱ 停滞时长排名</b>'];
+        });
+      const sortKey = STALE_SORTS.includes(filter?.sort) ? filter.sort : 't';
+      const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
+      if (sortKey === 'p') {
+        // PP/h descending; stall duration as tiebreaker so equal-rate markets
+        // stay in stall order.
+        rows.sort((a, b) => (rateOf(b) - rateOf(a)) || (b.sinceMs - a.sinceMs));
+      } else {
+        rows.sort((a, b) => b.sinceMs - a.sinceMs);
+      }
+      const headerLabel = sortKey === 'p' ? '⏱ 停滞排名 · 按 PP/h' : '⏱ 停滞时长排名';
+      const headerParts = [`<b>${headerLabel}</b>`];
       if (filterOn) {
         const picked = STALE_LEVELS.filter((k) => sel[k]).map((k) => STALE_LEVEL_LABELS[k]).join('+');
         headerParts.push(`<i>· 过滤: ${picked} ≤ $${threshUsd}</i>`);
@@ -1488,7 +1541,11 @@ function renderListPage(cmd, page, state, filter = null) {
   // For /stale we always want the wizard button visible (even with 0 rows
   // and a single page), so build the keyboard before the empty-rows shortcut.
   const kbOpts = cmd === 'stale' && filter
-    ? { bits: filter.bits ?? '100100', thresh: filter.thresh ?? 'inf' }
+    ? {
+        bits: filter.bits ?? '100100',
+        thresh: filter.thresh ?? 'inf',
+        sort: filter.sort ?? 't',
+      }
     : {};
   if (!rows.length) {
     const kb = pageKeyboard(cmd, 0, 1, kbOpts);
