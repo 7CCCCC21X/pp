@@ -8,24 +8,19 @@ import {
 } from './predict.js';
 
 const log = (...a) => console.log(new Date().toISOString(), '[discovery]', ...a);
-const warn = (...a) => console.warn(new Date().toISOString(), '[discovery]', ...a);
 
 export async function discoverRewardedMarkets() {
   log('refreshing market list...');
-  // PRIMARY: REST `?hasActiveRewards=true` — server already drops markets
-  // not currently in a reward window, so the response is ~100 markets vs
-  // GraphQL's ~thousands. Falls back to the GraphQL list (scanned
-  // client-side) on REST error so we degrade rather than fail discovery.
-  let all;
-  let source = 'rest';
-  try {
-    all = await listActiveRewardedMarketsRest();
-  } catch (err) {
-    warn(`REST hasActiveRewards fetch failed (${err.message}); falling back to GraphQL`);
-    all = await getAllMarketsCached();
-    source = 'graphql';
-  }
-  log(`scanned ${all.length} markets (source=${source})`);
+  // GraphQL is the source of truth here. We TRIED swapping in REST's
+  // ?hasActiveRewards=true filter (commit 32eca84) for the bandwidth win,
+  // but the endpoint caps at ~100 results regardless of cursor — /diag-
+  // discover showed REST returning 100 while GraphQL surfaced 937
+  // currently-rewarded markets including all the high-value ones (NBA /
+  // sports / index buckets). REST under-discovers by ~90%, so we rely on
+  // GraphQL and apply the rate>0 filter client-side.
+  // listActiveRewardedMarketsRest() stays exported for /diagdiscover.
+  const all = await getAllMarketsCached();
+  log(`scanned ${all.length} markets (source=graphql)`);
   const rewarded = [];
   const minRate = Math.max(0, config.minHourlyRate);
   const minRemainingMs = Math.max(0, config.minRemainingHours) * 3600 * 1000;
