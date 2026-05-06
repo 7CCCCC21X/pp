@@ -43,6 +43,7 @@ const PRIVATE_MENU = [
   { command: 'wide', description: '当前价差最大的市场' },
   { command: 'empty', description: '当前单边/空簿的市场' },
   { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
+  { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -90,11 +91,12 @@ function menuKeyboard({ isPrivate = true } = {}) {
           { text: '⏱ 停滞榜', callback_data: '/stale' },
         ],
         [
+          { text: '📋 全部市场', callback_data: '/all' },
           { text: '🔍 自定义筛', callback_data: '/find' },
           { text: '📡 状态', callback_data: '/status' },
-          { text: '📈 24h 摘要', callback_data: '/digest' },
         ],
         [
+          { text: '📈 24h 摘要', callback_data: '/digest' },
           { text: '📋 当前配置', callback_data: '/config' },
           { text: '❓ 帮助', callback_data: '/help' },
         ],
@@ -115,6 +117,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
         { text: '⏱ 停滞榜', callback_data: '/stale' },
       ],
       [
+        { text: '📋 全部市场', callback_data: '/all' },
         { text: '🔍 自定义筛', callback_data: '/find' },
       ],
       // 👁 监控管理
@@ -149,7 +152,7 @@ function menuText({ isPrivate = true } = {}) {
     return [
       '<b>快捷菜单</b>',
       '',
-      '🔍 <b>找机会</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 自定义筛',
+      '🔍 <b>找机会</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 全部 / 自定义筛',
       '📡 <b>查看</b>: 状态 / 24h 摘要 / 当前配置',
       '<i>群里按钮只放只读浏览。改阈值/订阅请去私聊。</i>',
     ].join('\n');
@@ -157,7 +160,7 @@ function menuText({ isPrivate = true } = {}) {
   return [
     '<b>快捷菜单</b>',
     '',
-    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 自定义筛',
+    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 全部 / 自定义筛',
     '👁 <b>监控管理</b>: 状态 / 刷新 / 自动发现',
     '📸 <b>单市场</b>: 直接粘 URL 或 #id 进来 → 出操作菜单',
     '⚙️ <b>设置</b>: 提醒类型 / 过滤器 / 配置',
@@ -691,40 +694,63 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 
 // ---------- /stale filter wizard ----------
 //
-// Lets the user filter the stall-duration leaderboard by "sum of selected
-// orderbook levels ≤ threshold". The user toggles which depth-3 levels
-// (买1/买2/买3 for bid, 卖1/卖2/卖3 for ask) participate in the sum, picks a
-// dollar threshold, and the bot re-fetches each active market's orderbook
-// fresh (no cache) with a live progress bar before applying the filter.
+// ---------- shared filter wizard (used by /stale and /all) ----------
 //
-// State encoding in callback_data: stale:<action>:<bits>:<thresh>:<sort>:<page>
+// Lets the user filter a market leaderboard by "sum of selected orderbook
+// levels ≤ threshold" plus pick a sort order. The user toggles which
+// depth-3 levels (买1/买2/买3 for bid, 卖1/卖2/卖3 for ask) participate in
+// the sum, picks a dollar threshold, and the bot re-fetches each active
+// market's orderbook fresh (no cache) with a live progress bar before
+// applying the filter.
+//
+// Two list "kinds" share this wizard:
+//   - stale: only live (not skipped/errored) markets, default sort by
+//            stall duration desc.
+//   - all:   every monitored market (incl. paused / skipped / errored),
+//            default sort by PP/h desc; used to browse the full pool.
+//
+// State encoding in callback_data: <kind>:<action>:<bits>:<thresh>:<sort>:<page>
+//   kind   = stale | all (also serves as callback prefix for routing).
 //   bits   = 6-char "b1b2b3a1a2a3" (1=selected). Default "100100".
 //   thresh = inf | 50 | 100 | 200 | 500. Default "inf".
-//   sort   = t | p (t=stall duration, p=PP/h). Default "t".
+//   sort   = t | p (t=stall duration, p=PP/h).
 //   page   = int (only used by action=page).
 //   actions = wizard | set | run | page | cancel
 //
 // Telegram callback_data limit is 64 bytes; this scheme fits in ~30.
-// Legacy (pre-sort) buttons used a 5-part shape — parsing falls back to
-// sort='t' when the field is absent so old in-flight messages still work.
+// Legacy (pre-sort) /stale buttons used a 5-part shape — parsing falls
+// back to sort='t' when the field is absent so old in-flight messages
+// still work.
 
-const STALE_THRESHOLDS = ['inf', '50', '100', '200', '500'];
-const STALE_LEVELS = ['b1', 'b2', 'b3', 'a1', 'a2', 'a3'];
-const STALE_LEVEL_LABELS = { b1: '买1', b2: '买2', b3: '买3', a1: '卖1', a2: '卖2', a3: '卖3' };
-const STALE_SORTS = ['t', 'p'];
-const STALE_SORT_LABELS = { t: '停滞时长', p: 'PP/h' };
+const LIST_THRESHOLDS = ['inf', '50', '100', '200', '500'];
+const LIST_LEVELS = ['b1', 'b2', 'b3', 'a1', 'a2', 'a3'];
+const LIST_LEVEL_LABELS = { b1: '买1', b2: '买2', b3: '买3', a1: '卖1', a2: '卖2', a3: '卖3' };
+const LIST_SORTS = ['t', 'p'];
+const LIST_SORT_LABELS = { t: '停滞时长', p: 'PP/h' };
+
+const LIST_KINDS = {
+  stale: { title: '⏱ 停滞排名', defaultSort: 't' },
+  all:   { title: '📋 全部市场', defaultSort: 'p' },
+};
+
+// Back-compat aliases for code that still imports the stale-prefixed names.
+const STALE_THRESHOLDS = LIST_THRESHOLDS;
+const STALE_LEVELS = LIST_LEVELS;
+const STALE_LEVEL_LABELS = LIST_LEVEL_LABELS;
+const STALE_SORTS = LIST_SORTS;
+const STALE_SORT_LABELS = LIST_SORT_LABELS;
 
 function parseStaleBits(bits) {
   const safe = (typeof bits === 'string' && /^[01]{6}$/.test(bits)) ? bits : '100100';
   const sel = {};
-  STALE_LEVELS.forEach((k, i) => { sel[k] = safe[i] === '1'; });
+  LIST_LEVELS.forEach((k, i) => { sel[k] = safe[i] === '1'; });
   return sel;
 }
 
 function flipStaleBit(bits, key) {
   const arr = parseStaleBits(bits);
   arr[key] = !arr[key];
-  return STALE_LEVELS.map((k) => arr[k] ? '1' : '0').join('');
+  return LIST_LEVELS.map((k) => arr[k] ? '1' : '0').join('');
 }
 
 function staleThreshLabel(t) {
@@ -752,16 +778,17 @@ function sumLevels(book, sel) {
   return sum;
 }
 
-function staleWizardText(bits, thresh, sort) {
+function listWizardText(kind, bits, thresh, sort) {
+  const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
-  const picked = STALE_LEVELS.filter((k) => sel[k]).map((k) => STALE_LEVEL_LABELS[k]);
-  const sortKey = STALE_SORTS.includes(sort) ? sort : 't';
+  const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]);
+  const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const lines = [
-    '<b>⏱ 停滞排名 · 过滤设置</b>',
+    `<b>${meta.title} · 过滤设置</b>`,
     '',
     `📐 累加层级: ${picked.length ? `<b>${picked.join(' + ')}</b>` : '<i>未选 (=不过滤)</i>'}`,
     `💵 总额阈值: <b>${staleThreshLabel(thresh)}</b>`,
-    `📊 排序: <b>${STALE_SORT_LABELS[sortKey]}</b>`,
+    `📊 排序: <b>${LIST_SORT_LABELS[sortKey]}</b>`,
     '',
     '<i>点 🚀 后:有过滤条件 → 重抓 orderbook 实时数据再筛+排序;</i>',
     '<i>没过滤条件(默认) → 直接用现有数据排序,瞬间完成。</i>',
@@ -769,13 +796,14 @@ function staleWizardText(bits, thresh, sort) {
   return lines.join('\n');
 }
 
-function staleWizardKeyboard(bits, thresh, sort) {
+function listWizardKeyboard(kind, bits, thresh, sort) {
+  const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
-  const sortKey = STALE_SORTS.includes(sort) ? sort : 't';
+  const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const mark = (on, label) => on ? `✅ ${label}` : `⬜ ${label}`;
   const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t)}` : staleThreshLabel(t);
-  const sortMark = (s) => s === sortKey ? `✅ ${STALE_SORT_LABELS[s]}` : STALE_SORT_LABELS[s];
-  const cb = (action, b = bits, t = thresh, s = sortKey) => `stale:${action}:${b}:${t}:${s}:0`;
+  const sortMark = (s) => s === sortKey ? `✅ ${LIST_SORT_LABELS[s]}` : LIST_SORT_LABELS[s];
+  const cb = (action, b = bits, t = thresh, s = sortKey) => `${kind}:${action}:${b}:${t}:${s}:0`;
   return {
     inline_keyboard: [
       [
@@ -788,11 +816,11 @@ function staleWizardKeyboard(bits, thresh, sort) {
         { text: mark(sel.a2, '卖2'), callback_data: cb('set', flipStaleBit(bits, 'a2')) },
         { text: mark(sel.a3, '卖3'), callback_data: cb('set', flipStaleBit(bits, 'a3')) },
       ],
-      STALE_THRESHOLDS.map((t) => ({
+      LIST_THRESHOLDS.map((t) => ({
         text: threshMark(t),
         callback_data: cb('set', bits, t),
       })),
-      STALE_SORTS.map((s) => ({
+      LIST_SORTS.map((s) => ({
         text: sortMark(s),
         callback_data: cb('set', bits, thresh, s),
       })),
@@ -811,8 +839,9 @@ const STALE_REFETCH_CONCURRENCY = 3;
 const STALE_PROGRESS_EDIT_EVERY = 8;
 const STALE_PROGRESS_EDIT_MIN_MS = 900;
 
-async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, bits, thresh }) {
+async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh }) {
   const { getOrderbook } = await import('./predict.js');
+  const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const total = ids.length;
   const results = new Map();
   let done = 0;
@@ -824,17 +853,17 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, bi
     const bar = '▰'.repeat(filled) + '▱'.repeat(20 - filled);
     const pct = ((done / Math.max(1, total)) * 100).toFixed(0);
     return [
-      '<b>⏱ 停滞排名 · 重抓中…</b>',
+      `<b>${meta.title} · 重抓中…</b>`,
       '',
       `<code>${bar}</code> ${pct}%`,
       `进度 <b>${done}</b> / ${total}${extraNote ? ` · ${extraNote}` : ''}`,
       '',
-      `📐 ${STALE_LEVELS.filter((k) => parseStaleBits(bits)[k]).map((k) => STALE_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(thresh)}`,
+      `📐 ${LIST_LEVELS.filter((k) => parseStaleBits(bits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(thresh)}`,
     ].join('\n');
   };
 
   const cancelKb = {
-    inline_keyboard: [[{ text: '⏳ 取消（完成后忽略）', callback_data: `stale:cancel:${bits}:${thresh}:0` }]],
+    inline_keyboard: [[{ text: '⏳ 取消（完成后忽略）', callback_data: `${kind}:cancel:${bits}:${thresh}:0` }]],
   };
 
   // Initial paint so user sees the bar immediately
@@ -897,22 +926,24 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, bi
   return results;
 }
 
-export async function handleStaleFilterCallback(data, { chatId, messageId, state, fullCtx }) {
-  // data shape: stale:<action>:<bits>:<thresh>:<sort>:<page>
-  // Legacy 5-part shape (pre-sort): stale:<action>:<bits>:<thresh>:<page>
-  // — old in-flight buttons still work, sort defaults to 't'.
+export async function handleListFilterCallback(data, { chatId, messageId, state, fullCtx }) {
+  // data shape: <kind>:<action>:<bits>:<thresh>:<sort>:<page>
+  // Legacy 5-part /stale shape (pre-sort): stale:<action>:<bits>:<thresh>:<page>
+  // — old in-flight buttons still work, sort defaults to kind's default.
   const parts = data.split(':');
-  if (parts[0] !== 'stale') return false;
+  const kind = parts[0];
+  if (!(kind in LIST_KINDS)) return false;
+  const meta = LIST_KINDS[kind];
   let action, bits, thresh, sort, pageStr;
   if (parts.length >= 6) {
     [, action, bits, thresh, sort, pageStr] = parts;
   } else {
     [, action, bits, thresh, pageStr] = parts;
-    sort = 't';
+    sort = meta.defaultSort;
   }
   const safeBits = /^[01]{6}$/.test(bits) ? bits : '100100';
-  const safeThresh = STALE_THRESHOLDS.includes(thresh) ? thresh : 'inf';
-  const safeSort = STALE_SORTS.includes(sort) ? sort : 't';
+  const safeThresh = LIST_THRESHOLDS.includes(thresh) ? thresh : 'inf';
+  const safeSort = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const page = Math.max(0, Number(pageStr) || 0);
   const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort };
 
@@ -921,20 +952,20 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
       await editTelegramMessage(
         chatId,
         messageId,
-        staleWizardText(safeBits, safeThresh, safeSort),
-        staleWizardKeyboard(safeBits, safeThresh, safeSort),
+        listWizardText(kind, safeBits, safeThresh, safeSort),
+        listWizardKeyboard(kind, safeBits, safeThresh, safeSort),
       );
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
-        warn('stale wizard edit failed:', err.message);
+        warn(`${kind} wizard edit failed:`, err.message);
       }
     }
     return true;
   }
 
   if (action === 'cancel') {
-    // Restore the plain stall leaderboard without filter.
-    const reply = renderListPage('stale', 0, state);
+    // Restore the plain leaderboard without filter.
+    const reply = renderListPage(kind, 0, state);
     if (reply) {
       try {
         await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
@@ -944,13 +975,13 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
   }
 
   if (action === 'page') {
-    const reply = renderListPage('stale', page, state, filter);
+    const reply = renderListPage(kind, page, state, filter);
     if (reply) {
       try {
         await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
       } catch (err) {
         if (!/message is not modified/i.test(err.message ?? '')) {
-          warn('stale page edit failed:', err.message);
+          warn(`${kind} page edit failed:`, err.message);
         }
       }
     }
@@ -960,16 +991,16 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
   if (action === 'run') {
     // No filter active → just re-render with the chosen sort. No refetch
     // needed; the leaderboard data is already fresh (5-min poll). This
-    // makes "switch sort to PP/h" a 1-tap instant operation instead of a
-    // 1-2 minute wait.
+    // makes "switch sort" a 1-tap instant operation instead of a 1-2
+    // minute wait.
     if (!staleFilterIsActive(safeBits, safeThresh)) {
-      const reply = renderListPage('stale', 0, state, filter);
+      const reply = renderListPage(kind, 0, state, filter);
       if (reply) {
         try {
           await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
         } catch (err) {
           if (!/message is not modified/i.test(err.message ?? '')) {
-            warn('stale sort-only render failed:', err.message);
+            warn(`${kind} sort-only render failed:`, err.message);
           }
         }
       }
@@ -984,15 +1015,15 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
     }
     await refetchOrderbooksWithProgress({
       ids, state, chatId, messageId,
-      bits: safeBits, thresh: safeThresh,
+      kind, bits: safeBits, thresh: safeThresh,
     });
     if (fullCtx?.persist) await fullCtx.persist().catch(() => {});
-    const reply = renderListPage('stale', 0, state, filter);
+    const reply = renderListPage(kind, 0, state, filter);
     if (reply) {
       try {
         await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
       } catch (err) {
-        warn('stale post-refetch render failed:', err.message);
+        warn(`${kind} post-refetch render failed:`, err.message);
       }
     }
     return true;
@@ -1000,6 +1031,10 @@ export async function handleStaleFilterCallback(data, { chatId, messageId, state
 
   return true;
 }
+
+// Back-compat export — index.js dispatcher imported handleStaleFilterCallback
+// before /all existed. Keep this alias so the old import keeps working.
+export const handleStaleFilterCallback = handleListFilterCallback;
 
 const HELP = [
   '<b>📊 核心</b>',
@@ -1016,6 +1051,7 @@ const HELP = [
   '/wide — 当前价差最大',
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
+  '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -1336,15 +1372,17 @@ function compactOpportunityRow(id, slot, extra = '') {
 const PAGE_SIZE = 10;
 
 function pageKeyboard(cmd, page, totalPages, opts = {}) {
-  // For /stale we use a filter-aware callback shape so pagination preserves
-  // the active filter (stale:page:bits:thresh:sort:N). The wizard button
-  // appended as a second row lets the user re-open filter settings.
-  const isStale = cmd === 'stale';
+  // /stale and /all both use a filter-aware callback shape so pagination
+  // preserves the active filter (<kind>:page:bits:thresh:sort:N). The
+  // wizard button appended as a second row lets the user re-open filter
+  // settings.
+  const isWizardCmd = cmd === 'stale' || cmd === 'all';
   const bits = opts.bits ?? '100100';
   const thresh = opts.thresh ?? 'inf';
-  const sort = STALE_SORTS.includes(opts.sort) ? opts.sort : 't';
-  const pageCb = (p) => isStale
-    ? `stale:page:${bits}:${thresh}:${sort}:${p}`
+  const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
+  const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
+  const pageCb = (p) => isWizardCmd
+    ? `${cmd}:page:${bits}:${thresh}:${sort}:${p}`
     : `page:${cmd}:${p}`;
   const rows = [];
   if (totalPages > 1) {
@@ -1354,14 +1392,14 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
     if (page < totalPages - 1) navRow.push({ text: '➡️ 下一页', callback_data: pageCb(page + 1) });
     rows.push(navRow);
   }
-  if (isStale) {
+  if (isWizardCmd) {
     const filterActive = staleFilterIsActive(bits, thresh);
-    const sortTag = sort !== 't' ? ` · 排序 ${STALE_SORT_LABELS[sort]}` : '';
+    const sortTag = sort !== defaultSort ? ` · 排序 ${LIST_SORT_LABELS[sort]}` : '';
     rows.push([{
       text: filterActive
         ? `🎚 调整 (${staleThreshLabel(thresh)}${sortTag})`
         : `🎚 过滤 / 排序${sortTag}`,
-      callback_data: `stale:wizard:${bits}:${thresh}:${sort}:0`,
+      callback_data: `${cmd}:wizard:${bits}:${thresh}:${sort}:0`,
     }]);
   }
   return rows.length ? { inline_keyboard: rows } : undefined;
@@ -1537,16 +1575,74 @@ function renderListPage(cmd, page, state, filter = null) {
       };
       break;
     }
+    case 'all': {
+      // Full monitored-market browser. Unlike /top /stale etc. this does
+      // NOT drop skipped/errored/paused markets — the whole point is to
+      // surface the "what else is in my pool" set so the user can see
+      // every id they've subscribed to. Per-market status is appended as
+      // a tag via extraFn.
+      const filterBits = filter?.bits ?? null;
+      const filterThresh = filter?.thresh ?? null;
+      const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
+      const sel = filterBits ? parseStaleBits(filterBits) : null;
+      const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
+      const pausedSet = new Set(state.pausedIds ?? []);
+      rows = allRows
+        .map(({ id, slot }) => {
+          const sinceMs = Number.isFinite(slot?.lastChangeAt)
+            ? Date.now() - slot.lastChangeAt
+            : null;
+          const sumUsd = sel ? sumLevels(slot?.recentBook, sel) : null;
+          let status = 'alive';
+          let statusTag = '';
+          if (!slot) { status = 'wait'; statusTag = '⏳ 等待首抓'; }
+          else if (slot.lastError) { status = 'error'; statusTag = `⚠ ${slot.lastError.slice(0, 40)}`; }
+          else if (slot.lastSkipReason) { status = 'skip'; statusTag = `⏭ ${slot.lastSkipReason.slice(0, 40)}`; }
+          if (pausedSet.has(id)) { status = 'paused'; statusTag = `⏸ 已暂停${statusTag ? ' · ' + statusTag : ''}`; }
+          return { id, slot: slot ?? {}, sinceMs, sumUsd, status, statusTag };
+        })
+        .filter((r) => {
+          if (!filterOn) return true;
+          if (!r.slot.recentBook) return false;
+          return r.sumUsd != null && r.sumUsd <= threshUsd;
+        });
+      const sortKey = LIST_SORTS.includes(filter?.sort) ? filter.sort : 'p';
+      const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
+      if (sortKey === 't') {
+        // Stall desc; markets without lastChangeAt sink to the bottom
+        // (they haven't reported orderbook activity yet, so "stall" is undefined).
+        rows.sort((a, b) => (b.sinceMs ?? -1) - (a.sinceMs ?? -1));
+      } else {
+        // PP/h desc; stall as tiebreaker
+        rows.sort((a, b) => (rateOf(b) - rateOf(a)) || ((b.sinceMs ?? 0) - (a.sinceMs ?? 0)));
+      }
+      const headerLabel = sortKey === 't' ? '📋 全部市场 · 按停滞时长' : '📋 全部市场 · 按 PP/h';
+      const headerParts = [`<b>${headerLabel}</b>`];
+      if (filterOn) {
+        const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
+        headerParts.push(`<i>· 过滤: ${picked} ≤ $${threshUsd}</i>`);
+      }
+      header = headerParts.join(' ');
+      extraFn = (_slot, row) => {
+        const parts = [];
+        if (row.sinceMs != null) parts.push(`停滞 ${fmtElapsed(row.sinceMs)}`);
+        if (row.statusTag) parts.push(row.statusTag);
+        if (filterOn && row.sumUsd != null) parts.push(`sum $${row.sumUsd.toFixed(0)}`);
+        return parts.join(' · ');
+      };
+      break;
+    }
     default:
       return null;
   }
-  // For /stale we always want the wizard button visible (even with 0 rows
-  // and a single page), so build the keyboard before the empty-rows shortcut.
-  const kbOpts = cmd === 'stale' && filter
+  // For /stale and /all we always want the wizard button visible (even
+  // with 0 rows and a single page), so build the keyboard before the
+  // empty-rows shortcut.
+  const kbOpts = (cmd === 'stale' || cmd === 'all') && filter
     ? {
         bits: filter.bits ?? '100100',
         thresh: filter.thresh ?? 'inf',
-        sort: filter.sort ?? 't',
+        sort: filter.sort ?? (LIST_KINDS[cmd]?.defaultSort ?? 't'),
       }
     : {};
   if (!rows.length) {
@@ -1961,6 +2057,7 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/wide':
     case '/empty':
     case '/stale':
+    case '/all':
     case '/opportunities':
     case '/opp': {
       const cmdName = cmd === '/opportunities' ? 'opp' : cmd.slice(1);
@@ -2637,9 +2734,9 @@ export function startCommandLoop({ getState, persist, ctx }) {
               await handleFindWizardCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
                 warn('find wizard error:', err.message);
               });
-            } else if (data.startsWith('stale:')) {
-              await handleStaleFilterCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
-                warn('stale filter error:', err.message);
+            } else if (data.startsWith('stale:') || data.startsWith('all:')) {
+              await handleListFilterCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+                warn('list filter error:', err.message);
               });
             } else if (data.startsWith('page:')) {
               await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
