@@ -835,16 +835,29 @@ function listWizardKeyboard(kind, bits, thresh, sort) {
 // Parallel orderbook re-fetch with live progress bar. Edits the wizard
 // message every PROGRESS_EDIT_EVERY completions (and at finish), throttled
 // so we don't trip Telegram's edit rate limit. Returns a Map<id, book>.
+//
+// Hard caps: each market gets at most STALE_PER_MARKET_TIMEOUT_MS to
+// finish; if it doesn't, we count it as a timeout and move on. Without
+// this cap, a market with no working URL combo cascades through every
+// fallback (5-10 attempts × 10s orderbookTimeoutMs each) — easily 60+
+// seconds per market — and a few of those at the tail leave the bar
+// pinned at 99% for minutes. The whole refetch also hits a global
+// deadline to bound worst case.
 const STALE_REFETCH_CONCURRENCY = 3;
 const STALE_PROGRESS_EDIT_EVERY = 8;
 const STALE_PROGRESS_EDIT_MIN_MS = 900;
+const STALE_PER_MARKET_TIMEOUT_MS = 20_000;
+const STALE_REFETCH_DEADLINE_MS = 5 * 60 * 1000;
 
 async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh }) {
   const { getOrderbook } = await import('./predict.js');
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const total = ids.length;
   const results = new Map();
+  const startedAt = Date.now();
   let done = 0;
+  let timedOut = 0;
+  let failed = 0;
   let lastEditAt = 0;
   let lastEditedDone = -1;
 
@@ -852,11 +865,15 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
     const filled = Math.round((done / Math.max(1, total)) * 20);
     const bar = '▰'.repeat(filled) + '▱'.repeat(20 - filled);
     const pct = ((done / Math.max(1, total)) * 100).toFixed(0);
+    const stuckTags = [];
+    if (timedOut) stuckTags.push(`超时跳过 ${timedOut}`);
+    if (failed) stuckTags.push(`其他错误 ${failed}`);
+    const stuckLine = stuckTags.length ? ` · ${stuckTags.join(' · ')}` : '';
     return [
       `<b>${meta.title} · 重抓中…</b>`,
       '',
       `<code>${bar}</code> ${pct}%`,
-      `进度 <b>${done}</b> / ${total}${extraNote ? ` · ${extraNote}` : ''}`,
+      `进度 <b>${done}</b> / ${total}${stuckLine}${extraNote ? ` · ${extraNote}` : ''}`,
       '',
       `📐 ${LIST_LEVELS.filter((k) => parseStaleBits(bits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(thresh)}`,
     ].join('\n');
@@ -887,21 +904,44 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
     }
   };
 
-  // Simple "next index" worker pool.
+  // Wrap getOrderbook in a per-market hard timeout so a single misbehaving
+  // market can't pin the whole batch at 99%.
+  const fetchOne = async (id, slot) => {
+    const orderbookKey = slot?.orderbookCache?.key ?? id;
+    let timer;
+    const timeout = new Promise((_, rej) => {
+      timer = setTimeout(
+        () => rej(new Error(`per-market timeout (${STALE_PER_MARKET_TIMEOUT_MS / 1000}s)`)),
+        STALE_PER_MARKET_TIMEOUT_MS,
+      );
+    });
+    try {
+      return await Promise.race([
+        getOrderbook(orderbookKey, {
+          contextMarketId: id,
+          cache: slot?.orderbookCache ?? null,
+        }),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // Simple "next index" worker pool. Stops feeding new markets once we
+  // hit the global deadline; in-flight ones still finish (capped by the
+  // per-market timeout above), so the worst-case finish is roughly
+  // deadline + per-market timeout.
   let nextIdx = 0;
   const worker = async () => {
     while (nextIdx < total) {
+      if (Date.now() - startedAt > STALE_REFETCH_DEADLINE_MS) break;
       const i = nextIdx++;
       const id = ids[i];
       const slot = state.markets[id];
-      const orderbookKey = slot?.orderbookCache?.key ?? id;
       try {
-        const book = await getOrderbook(orderbookKey, {
-          contextMarketId: id,
-          cache: slot?.orderbookCache ?? null,
-        });
+        const book = await fetchOne(id, slot);
         results.set(id, book);
-        // Persist top-3 levels on slot so pagination can reuse without re-fetch.
         if (slot) {
           slot.recentBook = {
             bids: book.bids ?? [],
@@ -910,9 +950,11 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
           };
         }
       } catch (err) {
-        log(`[${id}] stale refetch failed: ${err.message}`);
+        if (/timeout/i.test(err.message ?? '')) timedOut += 1;
+        else failed += 1;
+        log(`[${id}] refetch failed: ${err.message}`);
       }
-      done++;
+      done += 1;
       await maybeEditProgress();
     }
   };
@@ -923,7 +965,7 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
   }
   await Promise.all(workers);
   await maybeEditProgress(true);
-  return results;
+  return { results, timedOut, failed, abandoned: total - done };
 }
 
 export async function handleListFilterCallback(data, { chatId, messageId, state, fullCtx }) {
@@ -1013,15 +1055,24 @@ export async function handleListFilterCallback(data, { chatId, messageId, state,
       } catch {}
       return true;
     }
-    await refetchOrderbooksWithProgress({
+    const refetch = await refetchOrderbooksWithProgress({
       ids, state, chatId, messageId,
       kind, bits: safeBits, thresh: safeThresh,
     });
     if (fullCtx?.persist) await fullCtx.persist().catch(() => {});
     const reply = renderListPage(kind, 0, state, filter);
     if (reply) {
+      // If the refetch had any per-market timeouts or errors, prefix a
+      // one-line warning so the user knows the filter is computed over
+      // a partial dataset and which markets aren't represented.
+      const tags = [];
+      if (refetch.timedOut) tags.push(`${refetch.timedOut} 超时`);
+      if (refetch.failed) tags.push(`${refetch.failed} 错误`);
+      const prefix = tags.length
+        ? `<i>⚠ 重抓: ${tags.join(' · ')} 跳过 (这些市场不会出现在筛选结果里)</i>\n\n`
+        : '';
       try {
-        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+        await editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
       } catch (err) {
         warn(`${kind} post-refetch render failed:`, err.message);
       }
