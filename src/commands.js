@@ -1059,23 +1059,78 @@ export async function handleListFilterCallback(data, { chatId, messageId, state,
       ids, state, chatId, messageId,
       kind, bits: safeBits, thresh: safeThresh,
     });
-    if (fullCtx?.persist) await fullCtx.persist().catch(() => {});
-    const reply = renderListPage(kind, 0, state, filter);
+    // Intermediate "refetch done, rendering" state. Without this, if
+    // renderListPage or the final edit hangs, the user sees "重抓中…"
+    // forever and can't tell whether the workers are still going or
+    // we're just stuck rendering. Best-effort — failures here are
+    // ignored, the final edit below is what matters.
+    try {
+      const tagsMid = [];
+      if (refetch.timedOut) tagsMid.push(`${refetch.timedOut} 超时`);
+      if (refetch.failed) tagsMid.push(`${refetch.failed} 错误`);
+      const tail = tagsMid.length ? ` · ${tagsMid.join(' · ')} 跳过` : '';
+      await editTelegramMessage(
+        chatId, messageId,
+        `<b>${(LIST_KINDS[kind] ?? LIST_KINDS.stale).title} · 重抓完成</b>\n\n进度 ${refetch.results.size + (refetch.timedOut ?? 0) + (refetch.failed ?? 0)} / ${ids.length}${tail}\n\n<i>正在筛选 + 排序 + 渲染…</i>`,
+        undefined,
+      );
+    } catch {}
+    // Persist runs in the background — don't block the render path on
+    // disk I/O. If the state file is large (1k+ markets × recentBook
+    // each), JSON.stringify + fs.write can take a while, but it's not
+    // worth pinning the UI on it.
+    if (fullCtx?.persist) {
+      fullCtx.persist().catch((err) => warn(`${kind} persist failed:`, err.message));
+    }
+    let reply;
+    try {
+      reply = renderListPage(kind, 0, state, filter);
+    } catch (err) {
+      warn(`${kind} renderListPage threw:`, err.message);
+      try {
+        await editTelegramMessage(
+          chatId, messageId,
+          `<b>⚠ 渲染失败</b>\n\n重抓本身完成 (${ids.length} 个市场),但生成列表时报错: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /${kind} 查看(数据已存)。`,
+          undefined,
+        );
+      } catch {}
+      return true;
+    }
     if (reply) {
-      // If the refetch had any per-market timeouts or errors, prefix a
-      // one-line warning so the user knows the filter is computed over
-      // a partial dataset and which markets aren't represented.
       const tags = [];
       if (refetch.timedOut) tags.push(`${refetch.timedOut} 超时`);
       if (refetch.failed) tags.push(`${refetch.failed} 错误`);
       const prefix = tags.length
         ? `<i>⚠ 重抓: ${tags.join(' · ')} 跳过 (这些市场不会出现在筛选结果里)</i>\n\n`
         : '';
+      // Hard timeout on the final edit itself so a hung Telegram call
+      // can't lock the UI in "渲染中" state forever.
+      const editPromise = editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
+      const timeoutPromise = new Promise((_, rej) => setTimeout(
+        () => rej(new Error('post-refetch edit timeout (30s)')),
+        30_000,
+      ));
       try {
-        await editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
+        await Promise.race([editPromise, timeoutPromise]);
       } catch (err) {
         warn(`${kind} post-refetch render failed:`, err.message);
+        try {
+          await editTelegramMessage(
+            chatId, messageId,
+            `<b>⚠ 渲染超时</b>\n\n重抓完成 (${ids.length} 个),但 Telegram edit 失败: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /${kind} 查看。`,
+            undefined,
+          );
+        } catch {}
       }
+    } else {
+      // renderListPage returned null — shouldn't happen for known kinds
+      try {
+        await editTelegramMessage(
+          chatId, messageId,
+          `重抓完成,但 renderListPage 返回空。请发 /${kind} 重看。`,
+          undefined,
+        );
+      } catch {}
     }
     return true;
   }
