@@ -709,24 +709,32 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 //   - all:   every monitored market (incl. paused / skipped / errored),
 //            default sort by PP/h desc; used to browse the full pool.
 //
-// State encoding in callback_data: <kind>:<action>:<bits>:<thresh>:<sort>:<page>
+// State encoding in callback_data: <kind>:<action>:<bits>:<thresh>:<sort>:<dir>:<page>
 //   kind   = stale | all (also serves as callback prefix for routing).
 //   bits   = 6-char "b1b2b3a1a2a3" (1=selected). Default "100100".
-//   thresh = inf | 50 | 100 | 200 | 500. Default "inf".
+//   thresh = inf | <number> (e.g. 50, 100, 1000, 23456). Default "inf".
+//            Custom values entered via "✏ 自定义" button get stored as
+//            integers; presets are also strings of integers — same shape.
 //   sort   = t | p (t=stall duration, p=PP/h).
+//   dir    = le | ge (le = sum ≤ thresh = thin filter; ge = sum ≥ thresh
+//            = thick filter). Default "le".
 //   page   = int (only used by action=page).
-//   actions = wizard | set | run | page | cancel
+//   actions = wizard | set | run | page | cancel | custom
 //
-// Telegram callback_data limit is 64 bytes; this scheme fits in ~30.
-// Legacy (pre-sort) /stale buttons used a 5-part shape — parsing falls
-// back to sort='t' when the field is absent so old in-flight messages
-// still work.
+// Telegram callback_data limit is 64 bytes; this scheme fits in ~35.
+// Legacy callback shapes:
+//   5-part (pre-sort, pre-dir): stale:<action>:<bits>:<thresh>:<page>
+//   6-part (pre-dir):           <kind>:<action>:<bits>:<thresh>:<sort>:<page>
+// Both still parse — sort defaults to kind's default, dir defaults to "le".
 
-const LIST_THRESHOLDS = ['inf', '50', '100', '200', '500'];
+const LIST_THRESHOLDS = ['inf', '50', '100', '200', '500', '1000', '5000'];
 const LIST_LEVELS = ['b1', 'b2', 'b3', 'a1', 'a2', 'a3'];
 const LIST_LEVEL_LABELS = { b1: '买1', b2: '买2', b3: '买3', a1: '卖1', a2: '卖2', a3: '卖3' };
 const LIST_SORTS = ['t', 'p'];
 const LIST_SORT_LABELS = { t: '停滞时长', p: 'PP/h' };
+const LIST_DIRS = ['le', 'ge'];
+const LIST_DIR_LABELS = { le: '≤ (薄)', ge: '≥ (厚)' };
+const LIST_DIR_OP = { le: '≤', ge: '≥' };
 
 const LIST_KINDS = {
   stale: { title: '⏱ 停滞排名', defaultSort: 't' },
@@ -753,12 +761,22 @@ function flipStaleBit(bits, key) {
   return LIST_LEVELS.map((k) => arr[k] ? '1' : '0').join('');
 }
 
-function staleThreshLabel(t) {
-  return t === 'inf' ? '不限' : `≤$${t}`;
+// Threshold values are now arbitrary numeric strings (presets + custom).
+// Treat anything parseable as a positive integer as a valid thresh.
+function isCustomThresh(t) {
+  return typeof t === 'string' && t !== 'inf' && !LIST_THRESHOLDS.includes(t)
+    && /^\d+$/.test(t);
+}
+
+function staleThreshLabel(t, dir = 'le') {
+  if (t === 'inf') return '不限';
+  const op = LIST_DIR_OP[dir] ?? '≤';
+  return `${op}$${t}`;
 }
 
 function staleFilterIsActive(bits, thresh) {
-  return thresh !== 'inf' && /1/.test(bits);
+  return thresh !== 'inf' && /1/.test(bits)
+    && (LIST_THRESHOLDS.includes(thresh) || isCustomThresh(thresh));
 }
 
 function sumLevels(book, sel) {
@@ -778,32 +796,52 @@ function sumLevels(book, sel) {
   return sum;
 }
 
-function listWizardText(kind, bits, thresh, sort) {
+function listWizardText(kind, bits, thresh, sort, dir) {
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
   const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]);
   const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
+  const dirKey = LIST_DIRS.includes(dir) ? dir : 'le';
+  const customTag = isCustomThresh(thresh) ? ' <i>(自定义)</i>' : '';
   const lines = [
     `<b>${meta.title} · 过滤设置</b>`,
     '',
     `📐 累加层级: ${picked.length ? `<b>${picked.join(' + ')}</b>` : '<i>未选 (=不过滤)</i>'}`,
-    `💵 总额阈值: <b>${staleThreshLabel(thresh)}</b>`,
+    `💵 总额阈值: <b>${staleThreshLabel(thresh, dirKey)}</b>${customTag}`,
     `📊 排序: <b>${LIST_SORT_LABELS[sortKey]}</b>`,
     '',
     '<i>点 🚀 后:有过滤条件 → 重抓 orderbook 实时数据再筛+排序;</i>',
     '<i>没过滤条件(默认) → 直接用现有数据排序,瞬间完成。</i>',
+    '<i>自定义阈值: 点 ✏ 后回复一个数字(例如 350)即可。</i>',
   ];
   return lines.join('\n');
 }
 
-function listWizardKeyboard(kind, bits, thresh, sort) {
+function listWizardKeyboard(kind, bits, thresh, sort, dir) {
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
   const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
+  const dirKey = LIST_DIRS.includes(dir) ? dir : 'le';
   const mark = (on, label) => on ? `✅ ${label}` : `⬜ ${label}`;
-  const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t)}` : staleThreshLabel(t);
+  const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t, dirKey)}` : staleThreshLabel(t, dirKey);
   const sortMark = (s) => s === sortKey ? `✅ ${LIST_SORT_LABELS[s]}` : LIST_SORT_LABELS[s];
-  const cb = (action, b = bits, t = thresh, s = sortKey) => `${kind}:${action}:${b}:${t}:${s}:0`;
+  const dirMark = (d) => d === dirKey ? `✅ ${LIST_DIR_LABELS[d]}` : LIST_DIR_LABELS[d];
+  // 7-part callback: kind:action:bits:thresh:sort:dir:page
+  const cb = (action, b = bits, t = thresh, s = sortKey, d = dirKey) =>
+    `${kind}:${action}:${b}:${t}:${s}:${d}:0`;
+  // Threshold row gets the "✏ 自定义" affordance + the current custom value
+  // (if any) shown as a checkmarked button so the user can see what's set.
+  const threshButtons = LIST_THRESHOLDS.map((t) => ({
+    text: threshMark(t),
+    callback_data: cb('set', bits, t),
+  }));
+  const customButton = {
+    text: isCustomThresh(thresh) ? `✅ ✏自定义 ($${thresh})` : '✏ 自定义…',
+    callback_data: cb('custom'),
+  };
+  // Split threshold buttons into two rows so they fit comfortably on mobile.
+  const threshRow1 = threshButtons.slice(0, 4);
+  const threshRow2 = [...threshButtons.slice(4), customButton];
   return {
     inline_keyboard: [
       [
@@ -816,9 +854,11 @@ function listWizardKeyboard(kind, bits, thresh, sort) {
         { text: mark(sel.a2, '卖2'), callback_data: cb('set', flipStaleBit(bits, 'a2')) },
         { text: mark(sel.a3, '卖3'), callback_data: cb('set', flipStaleBit(bits, 'a3')) },
       ],
-      LIST_THRESHOLDS.map((t) => ({
-        text: threshMark(t),
-        callback_data: cb('set', bits, t),
+      threshRow1,
+      threshRow2,
+      LIST_DIRS.map((d) => ({
+        text: dirMark(d),
+        callback_data: cb('set', bits, thresh, sortKey, d),
       })),
       LIST_SORTS.map((s) => ({
         text: sortMark(s),
@@ -968,40 +1008,99 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
   return { results, timedOut, failed, abandoned: total - done };
 }
 
-export async function handleListFilterCallback(data, { chatId, messageId, state, fullCtx }) {
-  // data shape: <kind>:<action>:<bits>:<thresh>:<sort>:<page>
-  // Legacy 5-part /stale shape (pre-sort): stale:<action>:<bits>:<thresh>:<page>
-  // — old in-flight buttons still work, sort defaults to kind's default.
+// Pending-input map: chatId-userId → { kind, bits, thresh, sort, dir, messageId, expiresAt }
+// When user clicks "✏ 自定义" we stash this and the next plain message in
+// the same chat (within 5 min) gets parsed as the custom threshold.
+const PENDING_FILTER_INPUT_MS = 5 * 60 * 1000;
+const pendingFilterInput = new Map();
+const pendingKey = (chatId, userId) => `${chatId}-${userId}`;
+
+function setPendingFilterInput(chatId, userId, payload) {
+  pendingFilterInput.set(pendingKey(chatId, userId), {
+    ...payload,
+    expiresAt: Date.now() + PENDING_FILTER_INPUT_MS,
+  });
+}
+function consumePendingFilterInput(chatId, userId) {
+  const k = pendingKey(chatId, userId);
+  const v = pendingFilterInput.get(k);
+  if (!v) return null;
+  pendingFilterInput.delete(k);
+  if (v.expiresAt < Date.now()) return null;
+  return v;
+}
+
+export async function handleListFilterCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
+  // data shape: <kind>:<action>:<bits>:<thresh>:<sort>:<dir>:<page>
+  // Back-compat:
+  //   6-part (pre-dir): <kind>:<action>:<bits>:<thresh>:<sort>:<page>
+  //   5-part (pre-sort/pre-dir): stale:<action>:<bits>:<thresh>:<page>
   const parts = data.split(':');
   const kind = parts[0];
   if (!(kind in LIST_KINDS)) return false;
   const meta = LIST_KINDS[kind];
-  let action, bits, thresh, sort, pageStr;
-  if (parts.length >= 6) {
+  let action, bits, thresh, sort, dir, pageStr;
+  if (parts.length >= 7) {
+    [, action, bits, thresh, sort, dir, pageStr] = parts;
+  } else if (parts.length >= 6) {
     [, action, bits, thresh, sort, pageStr] = parts;
+    dir = 'le';
   } else {
     [, action, bits, thresh, pageStr] = parts;
     sort = meta.defaultSort;
+    dir = 'le';
   }
   const safeBits = /^[01]{6}$/.test(bits) ? bits : '100100';
-  const safeThresh = LIST_THRESHOLDS.includes(thresh) ? thresh : 'inf';
+  // Accept preset OR custom (positive integer string).
+  const safeThresh = (LIST_THRESHOLDS.includes(thresh) || isCustomThresh(thresh))
+    ? thresh : 'inf';
   const safeSort = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
+  const safeDir = LIST_DIRS.includes(dir) ? dir : 'le';
   const page = Math.max(0, Number(pageStr) || 0);
-  const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort };
+  const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir };
 
   if (action === 'wizard' || action === 'set') {
     try {
       await editTelegramMessage(
         chatId,
         messageId,
-        listWizardText(kind, safeBits, safeThresh, safeSort),
-        listWizardKeyboard(kind, safeBits, safeThresh, safeSort),
+        listWizardText(kind, safeBits, safeThresh, safeSort, safeDir),
+        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir),
       );
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
         warn(`${kind} wizard edit failed:`, err.message);
       }
     }
+    return true;
+  }
+
+  if (action === 'custom') {
+    // Stash pending-input state and edit wizard with a "waiting for input" hint.
+    // Next plain message in this chat from this user gets treated as the new
+    // threshold (parsed as a positive integer).
+    setPendingFilterInput(chatId, fromId, {
+      kind, bits: safeBits, sort: safeSort, dir: safeDir, messageId,
+    });
+    try {
+      const meta2 = LIST_KINDS[kind] ?? LIST_KINDS.stale;
+      const hint = [
+        `<b>${meta2.title} · 等待自定义阈值…</b>`,
+        '',
+        '请直接在这个 chat <b>回复一个数字</b>(USD 金额,例如 350)。',
+        '',
+        `当前选: 📐 ${LIST_LEVELS.filter((k) => parseStaleBits(safeBits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 📊 ${LIST_SORT_LABELS[safeSort]} · ${LIST_DIR_LABELS[safeDir]}`,
+        '',
+        '<i>5 分钟内有效。想取消就发任何非数字。</i>',
+      ].join('\n');
+      const cancelKb = {
+        inline_keyboard: [[{
+          text: '✖ 取消(回到向导)',
+          callback_data: `${kind}:wizard:${safeBits}:${safeThresh}:${safeSort}:${safeDir}:0`,
+        }]],
+      };
+      await editTelegramMessage(chatId, messageId, hint, cancelKb);
+    } catch {}
     return true;
   }
 
@@ -1479,7 +1578,7 @@ const PAGE_SIZE = 10;
 
 function pageKeyboard(cmd, page, totalPages, opts = {}) {
   // /stale and /all both use a filter-aware callback shape so pagination
-  // preserves the active filter (<kind>:page:bits:thresh:sort:N). The
+  // preserves the active filter (<kind>:page:bits:thresh:sort:dir:N). The
   // wizard button appended as a second row lets the user re-open filter
   // settings.
   const isWizardCmd = cmd === 'stale' || cmd === 'all';
@@ -1487,8 +1586,9 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   const thresh = opts.thresh ?? 'inf';
   const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
   const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
+  const dir = LIST_DIRS.includes(opts.dir) ? opts.dir : 'le';
   const pageCb = (p) => isWizardCmd
-    ? `${cmd}:page:${bits}:${thresh}:${sort}:${p}`
+    ? `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${p}`
     : `page:${cmd}:${p}`;
   const rows = [];
   if (totalPages > 1) {
@@ -1503,9 +1603,9 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
     const sortTag = sort !== defaultSort ? ` · 排序 ${LIST_SORT_LABELS[sort]}` : '';
     rows.push([{
       text: filterActive
-        ? `🎚 调整 (${staleThreshLabel(thresh)}${sortTag})`
+        ? `🎚 调整 (${staleThreshLabel(thresh, dir)}${sortTag})`
         : `🎚 过滤 / 排序${sortTag}`,
-      callback_data: `${cmd}:wizard:${bits}:${thresh}:${sort}:0`,
+      callback_data: `${cmd}:wizard:${bits}:${thresh}:${sort}:${dir}:0`,
     }]);
   }
   return rows.length ? { inline_keyboard: rows } : undefined;
@@ -1632,9 +1732,14 @@ function renderListPage(cmd, page, state, filter = null) {
       // refetch flow) is ≤ a dollar threshold.
       const filterBits = filter?.bits ?? null;
       const filterThresh = filter?.thresh ?? null;
+      const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
       const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
       const sel = filterBits ? parseStaleBits(filterBits) : null;
       const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
+      const passesThresh = (sumUsd) => {
+        if (sumUsd == null || threshUsd == null) return false;
+        return filterDir === 'ge' ? sumUsd >= threshUsd : sumUsd <= threshUsd;
+      };
       rows = allRows
         .filter(({ slot }) => isLive(slot) && Number.isFinite(slot.lastChangeAt))
         .map(({ id, slot }) => {
@@ -1648,7 +1753,7 @@ function renderListPage(cmd, page, state, filter = null) {
           // Drop markets that haven't been refetched in this session — without
           // recentBook we can't honor the level-sum filter.
           if (!r.slot.recentBook) return false;
-          return r.sumUsd != null && r.sumUsd <= threshUsd;
+          return passesThresh(r.sumUsd);
         });
       const sortKey = STALE_SORTS.includes(filter?.sort) ? filter.sort : 't';
       const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
@@ -1663,7 +1768,8 @@ function renderListPage(cmd, page, state, filter = null) {
       const headerParts = [`<b>${headerLabel}</b>`];
       if (filterOn) {
         const picked = STALE_LEVELS.filter((k) => sel[k]).map((k) => STALE_LEVEL_LABELS[k]).join('+');
-        headerParts.push(`<i>· 过滤: ${picked} ≤ $${threshUsd}</i>`);
+        const op = LIST_DIR_OP[filterDir] ?? '≤';
+        headerParts.push(`<i>· 过滤: ${picked} ${op} $${threshUsd}</i>`);
       }
       header = headerParts.join(' ');
       extraFn = (slot, row) => {
@@ -1689,9 +1795,14 @@ function renderListPage(cmd, page, state, filter = null) {
       // a tag via extraFn.
       const filterBits = filter?.bits ?? null;
       const filterThresh = filter?.thresh ?? null;
+      const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
       const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
       const sel = filterBits ? parseStaleBits(filterBits) : null;
       const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
+      const passesThresh = (sumUsd) => {
+        if (sumUsd == null || threshUsd == null) return false;
+        return filterDir === 'ge' ? sumUsd >= threshUsd : sumUsd <= threshUsd;
+      };
       const pausedSet = new Set(state.pausedIds ?? []);
       rows = allRows
         .map(({ id, slot }) => {
@@ -1710,7 +1821,7 @@ function renderListPage(cmd, page, state, filter = null) {
         .filter((r) => {
           if (!filterOn) return true;
           if (!r.slot.recentBook) return false;
-          return r.sumUsd != null && r.sumUsd <= threshUsd;
+          return passesThresh(r.sumUsd);
         });
       const sortKey = LIST_SORTS.includes(filter?.sort) ? filter.sort : 'p';
       const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
@@ -1726,7 +1837,8 @@ function renderListPage(cmd, page, state, filter = null) {
       const headerParts = [`<b>${headerLabel}</b>`];
       if (filterOn) {
         const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
-        headerParts.push(`<i>· 过滤: ${picked} ≤ $${threshUsd}</i>`);
+        const op = LIST_DIR_OP[filterDir] ?? '≤';
+        headerParts.push(`<i>· 过滤: ${picked} ${op} $${threshUsd}</i>`);
       }
       header = headerParts.join(' ');
       extraFn = (_slot, row) => {
@@ -1749,6 +1861,7 @@ function renderListPage(cmd, page, state, filter = null) {
         bits: filter.bits ?? '100100',
         thresh: filter.thresh ?? 'inf',
         sort: filter.sort ?? (LIST_KINDS[cmd]?.defaultSort ?? 't'),
+        dir: filter.dir ?? 'le',
       }
     : {};
   if (!rows.length) {
@@ -2799,6 +2912,28 @@ export function startCommandLoop({ getState, persist, ctx }) {
               }
               continue;
             }
+            // Pending custom-threshold input: if the user just clicked
+            // "✏ 自定义" in a /stale or /all wizard, the next plain
+            // message in this chat from this user is interpreted as the
+            // new threshold. Numeric → apply + re-render wizard.
+            // Non-numeric → cancel + restore wizard at default (inf).
+            const pending = consumePendingFilterInput(chatId, fromId);
+            if (pending) {
+              const trimmed = text.trim();
+              const num = /^\d+$/.test(trimmed) ? Number(trimmed) : null;
+              const newThresh = num != null && num > 0 ? String(num) : 'inf';
+              try {
+                await editTelegramMessage(
+                  chatId,
+                  pending.messageId,
+                  listWizardText(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
+                  listWizardKeyboard(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
+                );
+              } catch (err) {
+                warn(`custom-thresh apply edit failed: ${err.message}`);
+              }
+              continue;
+            }
             // Smart paste shortcut for admin DM: bare URLs / market ids
             // skip /command parsing and go straight to the action card.
             // Group chats are excluded so member-shared URLs don't expand
@@ -2841,7 +2976,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 warn('find wizard error:', err.message);
               });
             } else if (data.startsWith('stale:') || data.startsWith('all:')) {
-              await handleListFilterCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+              await handleListFilterCallback(data, { chatId, messageId, fromId, state, fullCtx }).catch((err) => {
                 warn('list filter error:', err.message);
               });
             } else if (data.startsWith('page:')) {
