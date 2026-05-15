@@ -119,3 +119,59 @@ test('broadcastChats: union of admin + env + runtime, deduped', () => {
   // dedupe: admin + runtime '1' counts once
   assert.equal(out.length, new Set(out).size);
 });
+
+const { recordMarketFirstSeen } = await import('../src/state.js');
+
+test('recordMarketFirstSeen: first call bootstraps existing markets at ms=0', () => {
+  // On a fresh install with thousands of pre-existing rewarded markets we
+  // must NOT flag them all as "new today". Empty map → all entries set to 0.
+  const state = { marketFirstSeen: {} };
+  const r = recordMarketFirstSeen(state, [
+    { id: 'A', title: 'Alpha', hourlyRate: 100, endMs: 1000 },
+    { id: 'B', title: 'Beta', hourlyRate: 200, endMs: 2000 },
+  ]);
+  assert.equal(r.added, 0);
+  assert.equal(state.marketFirstSeen.A.ms, 0);
+  assert.equal(state.marketFirstSeen.B.ms, 0);
+  assert.equal(state.marketFirstSeen.A.title, 'Alpha');
+  assert.equal(state.marketFirstSeen.A.rate, 100);
+});
+
+test('recordMarketFirstSeen: subsequent unseen ids get current timestamp', () => {
+  // After bootstrap, a market id that wasn't previously seen counts as new.
+  const state = {
+    marketFirstSeen: {
+      A: { ms: 0, title: 'Alpha', rate: 100, endMs: 1000 },
+    },
+  };
+  const before = Date.now();
+  const r = recordMarketFirstSeen(state, [
+    { id: 'A', title: 'Alpha', hourlyRate: 100, endMs: 1000 },
+    { id: 'C', title: 'Gamma', hourlyRate: 300, endMs: 3000 },
+  ]);
+  const after = Date.now();
+  assert.equal(r.added, 1);
+  assert.equal(state.marketFirstSeen.A.ms, 0); // unchanged
+  assert.ok(state.marketFirstSeen.C.ms >= before);
+  assert.ok(state.marketFirstSeen.C.ms <= after);
+  assert.equal(state.marketFirstSeen.C.title, 'Gamma');
+});
+
+test('recordMarketFirstSeen: prunes entries older than 14d', () => {
+  const old = Date.now() - 15 * 24 * 3600 * 1000;
+  const recent = Date.now() - 3600 * 1000;
+  const state = {
+    marketFirstSeen: {
+      OLD: { ms: old, title: 'old', rate: 1, endMs: 0 },
+      RECENT: { ms: recent, title: 'recent', rate: 1, endMs: 0 },
+      BOOTSTRAP: { ms: 0, title: 'pre-existing', rate: 1, endMs: 0 },
+    },
+  };
+  const r = recordMarketFirstSeen(state, [{ id: 'NEW', title: 'new', hourlyRate: 1, endMs: 0 }]);
+  assert.equal(r.added, 1);
+  assert.equal(r.pruned, 1);
+  assert.equal(state.marketFirstSeen.OLD, undefined);
+  assert.ok(state.marketFirstSeen.RECENT);
+  assert.ok(state.marketFirstSeen.BOOTSTRAP);
+  assert.ok(state.marketFirstSeen.NEW);
+});

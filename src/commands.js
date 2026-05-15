@@ -44,6 +44,7 @@ const PRIVATE_MENU = [
   { command: 'empty', description: '当前单边/空簿的市场' },
   { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
+  { command: 'new', description: '今日新上的有奖励市场（默认 24h；可加参数如 /new 7d）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -92,12 +93,12 @@ function menuKeyboard({ isPrivate = true } = {}) {
         ],
         [
           { text: '📋 全部市场', callback_data: '/all' },
+          { text: '🆕 新上市', callback_data: '/new' },
           { text: '🔍 自定义筛', callback_data: '/find' },
-          { text: '📡 状态', callback_data: '/status' },
         ],
         [
+          { text: '📡 状态', callback_data: '/status' },
           { text: '📈 24h 摘要', callback_data: '/digest' },
-          { text: '📋 当前配置', callback_data: '/config' },
           { text: '❓ 帮助', callback_data: '/help' },
         ],
       ],
@@ -118,6 +119,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
       ],
       [
         { text: '📋 全部市场', callback_data: '/all' },
+        { text: '🆕 新上市', callback_data: '/new' },
         { text: '🔍 自定义筛', callback_data: '/find' },
       ],
       // 👁 监控管理
@@ -1257,6 +1259,7 @@ const HELP = [
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
+  '/new [窗口] — 今日新上的有奖励市场（默认 24h；支持 /new 48h, /new 7d, 最长 30d）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -1587,9 +1590,14 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
   const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
   const dir = LIST_DIRS.includes(opts.dir) ? opts.dir : 'le';
-  const pageCb = (p) => isWizardCmd
-    ? `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${p}`
-    : `page:${cmd}:${p}`;
+  // /new encodes its time window so pagination preserves the active range.
+  const isNewCmd = cmd === 'new';
+  const windowMs = Number.isFinite(opts.windowMs) ? opts.windowMs : 24 * 3600 * 1000;
+  const pageCb = (p) => {
+    if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${p}`;
+    if (isNewCmd) return `page:new:${p}:${windowMs}`;
+    return `page:${cmd}:${p}`;
+  };
   const rows = [];
   if (totalPages > 1) {
     const navRow = [];
@@ -1614,12 +1622,18 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
 // Edit-in-place callback handler for page:* buttons.
 export async function handlePageCallback(data, { chatId, messageId, state, fullCtx }) {
   if (!data.startsWith('page:')) return false;
-  const [, cmd, pageStr] = data.split(':');
+  const [, cmd, pageStr, extra] = data.split(':');
   if (cmd === 'noop') return true; // page indicator button
   const page = Number(pageStr);
   if (!Number.isFinite(page) || page < 0) return true;
+  // /new encodes the time window as a 4th field so pagination preserves it.
+  let filter = null;
+  if (cmd === 'new' && extra != null) {
+    const windowMs = Number(extra);
+    if (Number.isFinite(windowMs) && windowMs > 0) filter = { windowMs };
+  }
   // Re-run the list command at the requested page and edit the message.
-  const reply = await renderListPage(cmd, page, state);
+  const reply = await renderListPage(cmd, page, state, filter);
   if (!reply) return true;
   try {
     await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
@@ -1654,6 +1668,38 @@ function renderListPage(cmd, page, state, filter = null) {
         .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
       header = '<b>🔥 PP/h Top</b>';
       break;
+    case 'new': {
+      // Markets first seen (as rewarded) within [now - windowMs, now]. Slot
+      // may be null for markets discovered after the most recent tick — we
+      // synthesize one from the firstSeen snapshot so they still render.
+      const windowMs = Number.isFinite(filter?.windowMs) ? filter.windowMs : 24 * 3600 * 1000;
+      const cutoff = Date.now() - windowMs;
+      const firstSeen = state.marketFirstSeen ?? {};
+      rows = [];
+      for (const [id, info] of Object.entries(firstSeen)) {
+        const ms = typeof info === 'number' ? info : info?.ms;
+        if (!Number.isFinite(ms) || ms <= 0 || ms < cutoff) continue;
+        const slot = state.markets[id] ?? null;
+        const synthSlot = slot ?? {
+          title: info?.title ?? null,
+          lastHourlyRate: info?.rate ?? null,
+          endMs: info?.endMs ?? null,
+        };
+        rows.push({ id, slot: synthSlot, firstSeenMs: ms, hasSlot: !!slot });
+      }
+      rows.sort((a, b) => b.firstSeenMs - a.firstSeenMs);
+      const windowLabel = windowMs <= 24 * 3600 * 1000
+        ? '24h'
+        : windowMs >= 24 * 3600 * 1000
+          ? `${(windowMs / (24 * 3600 * 1000)).toFixed(0)}d`
+          : `${(windowMs / 3600000).toFixed(0)}h`;
+      header = `<b>🆕 近 ${windowLabel} 新上奖励市场</b>`;
+      extraFn = (_slot, row) => {
+        const ago = fmtAgo(Date.now() - row.firstSeenMs);
+        return row.hasSlot ? `🆕 ${ago}` : `🆕 ${ago} · ⏳ 等首抓`;
+      };
+      break;
+    }
     case 'gaps':
       rows = allRows
         .filter(({ slot }) => isLive(slot) && slot.zoneStatus
@@ -1856,17 +1902,23 @@ function renderListPage(cmd, page, state, filter = null) {
   // For /stale and /all we always want the wizard button visible (even
   // with 0 rows and a single page), so build the keyboard before the
   // empty-rows shortcut.
-  const kbOpts = (cmd === 'stale' || cmd === 'all') && filter
-    ? {
-        bits: filter.bits ?? '100100',
-        thresh: filter.thresh ?? 'inf',
-        sort: filter.sort ?? (LIST_KINDS[cmd]?.defaultSort ?? 't'),
-        dir: filter.dir ?? 'le',
-      }
-    : {};
+  let kbOpts = {};
+  if ((cmd === 'stale' || cmd === 'all') && filter) {
+    kbOpts = {
+      bits: filter.bits ?? '100100',
+      thresh: filter.thresh ?? 'inf',
+      sort: filter.sort ?? (LIST_KINDS[cmd]?.defaultSort ?? 't'),
+      dir: filter.dir ?? 'le',
+    };
+  } else if (cmd === 'new') {
+    kbOpts = { windowMs: filter?.windowMs ?? 24 * 3600 * 1000 };
+  }
   if (!rows.length) {
     const kb = pageKeyboard(cmd, 0, 1, kbOpts);
-    return { text: `${header}\n\n暂无匹配市场。`, replyMarkup: kb };
+    const hint = cmd === 'new'
+      ? `\n\n<i>这段时间没有新上线的有奖励市场。试试更长的窗口，比如 /new 7d。</i>`
+      : '\n\n暂无匹配市场。';
+    return { text: `${header}${hint}`, replyMarkup: kb };
   }
   const { items, page: safePage, totalPages } = paginate(rows, page);
   const lines = [`${header} <i>(${items.length} / ${rows.length})</i>`, ''];
@@ -2283,6 +2335,26 @@ async function handle(text, state, ctx, chatId, fromId) {
       // Optional integer arg = page number (1-indexed for the user)
       const page = Math.max(1, Number(arg) || 1) - 1;
       const reply = renderListPage(cmdName, page, state);
+      if (!reply) return '未知命令';
+      return reply;
+    }
+
+    case '/new': {
+      // /new          → last 24h
+      // /new 7d|48h   → custom window (duration parsed; max 30d)
+      // /new <page>   → bare number = page index (1-indexed), keeps default 24h
+      const parts = arg.split(/\s+/).filter(Boolean);
+      let windowMs = 24 * 3600 * 1000;
+      let page = 0;
+      for (const p of parts) {
+        const dur = parseDuration(p);
+        if (dur != null && dur > 0) {
+          windowMs = Math.min(dur, 30 * 24 * 3600 * 1000);
+        } else if (/^\d+$/.test(p)) {
+          page = Math.max(0, Number(p) - 1);
+        }
+      }
+      const reply = renderListPage('new', page, state, { windowMs });
       if (!reply) return '未知命令';
       return reply;
     }

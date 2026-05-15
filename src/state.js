@@ -17,6 +17,7 @@ function emptyState() {
     snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
     chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
     chatDigests: {},      // chatId -> { intervalMs, queue, lastFlushAt } batched-alert mode
+    marketFirstSeen: {},  // marketId -> { ms, title, rate, endMs } — first time we saw it as rewarded (powers /new)
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHistoryPruneAt: 0,
@@ -48,6 +49,7 @@ export async function loadState() {
       snapshots: json.snapshots ?? {},
       chatRouting: json.chatRouting ?? {},
       chatDigests: json.chatDigests ?? {},
+      marketFirstSeen: json.marketFirstSeen ?? {},
       filters: json.filters ?? {},
     };
   } catch (err) {
@@ -133,6 +135,43 @@ export function removeAllowedChat(state, chatId) {
   if (idx < 0) return false;
   state.allowedChats.splice(idx, 1);
   return true;
+}
+
+// Record first-sighting timestamps for newly-discovered rewarded markets so
+// /new can surface "what came online today". On the very first call (empty
+// map) every market is tagged with ms=0 instead of now() — a fresh install
+// would otherwise flag thousands of pre-existing markets as "new today".
+// Prunes entries older than 14d (and not bootstrap=0) to keep the map lean.
+export function recordMarketFirstSeen(state, markets) {
+  if (!Array.isArray(markets) || !markets.length) return { added: 0, pruned: 0 };
+  const map = state.marketFirstSeen ?? {};
+  const bootstrap = Object.keys(map).length === 0;
+  const now = Date.now();
+  let added = 0;
+  for (const m of markets) {
+    const id = String(m?.id ?? '');
+    if (!id) continue;
+    if (map[id] != null) continue;
+    map[id] = {
+      ms: bootstrap ? 0 : now,
+      title: m?.title ?? null,
+      rate: Number.isFinite(m?.hourlyRate) ? m.hourlyRate : null,
+      endMs: Number.isFinite(m?.endMs) ? m.endMs : null,
+    };
+    if (!bootstrap) added += 1;
+  }
+  const cutoff = now - 14 * 24 * 3600 * 1000;
+  let pruned = 0;
+  for (const [id, info] of Object.entries(map)) {
+    const ms = typeof info === 'number' ? info : info?.ms;
+    if (!Number.isFinite(ms) || ms === 0) continue; // keep bootstrap sentinels
+    if (ms < cutoff) {
+      delete map[id];
+      pruned += 1;
+    }
+  }
+  state.marketFirstSeen = map;
+  return { added, pruned };
 }
 
 export function activeMarketIds(state) {

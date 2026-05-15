@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
-import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats } from './state.js';
+import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats, recordMarketFirstSeen } from './state.js';
 import { checkMarket, flushChatDigests } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
@@ -30,8 +30,12 @@ async function maybeDiscover(state) {
   try {
     const rewarded = await discoverRewardedMarkets();
     state.autoIds = rewarded.map((m) => String(m.id));
+    const firstSeenDelta = recordMarketFirstSeen(state, rewarded);
     state.lastDiscoveryAt = Date.now();
-    log(`discovery: ${rewarded.length} rewarded markets`);
+    log(
+      `discovery: ${rewarded.length} rewarded markets`,
+      `(first-seen: +${firstSeenDelta.added} new, -${firstSeenDelta.pruned} pruned)`,
+    );
     if (rewarded.length) {
       const preview = rewarded
         .slice(0, 10)
