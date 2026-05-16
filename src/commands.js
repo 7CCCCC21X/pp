@@ -2038,11 +2038,12 @@ function freshnessLines(state, { compact = false } = {}) {
   return lines;
 }
 
-// Two-line opportunity row used by every list command. Top line is
+// Two-/three-line opportunity row used by every list command. Top line is
 // the comparable metric strip (PP/h, remaining, gap, spread, depth,
-// per-list extra); second line is the clickable title. extra is an
-// optional suffix appended to the metric strip — typically a list-
-// specific value like "spread 5.20¢" for /wide.
+// per-list extra); second line is the clickable option title; third line
+// (when question differs from title) is the parent event question in
+// italic — for outcome-name markets like "NVIDIA" / "Argentina" the
+// option alone doesn't tell the user what the bet is actually about.
 function compactOpportunityRow(id, slot, extra = '') {
   const linked = marketLink(id, slot?.title, slot?.question, slot?.slug);
   const rate = Number.isFinite(slot?.lastHourlyRate) ? slot.lastHourlyRate : 0;
@@ -2066,7 +2067,16 @@ function compactOpportunityRow(id, slot, extra = '') {
   if (Number.isFinite(slot?.lastTopUsd) && slot.lastTopUsd > 0) parts.push(`top $${slot.lastTopUsd.toFixed(0)}`);
   if (extra) parts.push(htmlEscape(extra));
 
-  return `${parts.join(' · ')}\n   ${linked}`;
+  const titleRaw = slot?.title ?? '';
+  const questionRaw = slot?.question ?? '';
+  // Suppress the event line when it's the same as the title or empty —
+  // otherwise it's just visual noise.
+  const showQuestion = questionRaw && questionRaw !== titleRaw;
+  const lines = [parts.join(' · '), `   ${linked}`];
+  if (showQuestion) {
+    lines.push(`   <i>${htmlEscape(shortTitle(questionRaw, 80))}</i>`);
+  }
+  return lines.join('\n');
 }
 
 // --- Pagination helpers for /top /gaps /wide /empty /opportunities ---
