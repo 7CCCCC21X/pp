@@ -738,45 +738,63 @@ const LIST_DIRS = ['le', 'ge'];
 const LIST_DIR_LABELS = { le: '≤ (薄)', ge: '≥ (厚)' };
 const LIST_DIR_OP = { le: '≤', ge: '≥' };
 
-// "极端价" filter — drops markets where one side of the binary is heavily
-// favored (the market is effectively decided and the orderbook is locked
-// near a boundary). For threshold T in cents, a market is "extreme" iff
-// best-ask >= T¢ OR best-bid <= (100-T)¢; both bid and ask must be present
-// for the check (single-sided books pass through).
-const LIST_EXT_PRESETS = ['off', '94', '90', '85'];
+// "极端价" filter — a market is "extreme" iff one side of the binary is
+// already near a boundary (best-ask >= N¢ OR best-bid <= (100-N)¢, so the
+// market is effectively decided). Two modes:
+//   '94'   → 排除 ≥94¢ — drop extreme markets (default mode)
+//   'i94'  → 仅 ≥94¢   — show ONLY extreme markets (the "find decided
+//                        markets I can market-make on" use case)
+//   'off'  → no filter
+// Single-sided / empty books pass through either way (/empty handles those).
+const LIST_EXT_VALUES = ['94', '90', '85']; // numeric presets, mode-agnostic
+
+function parseExtRaw(e) {
+  if (e == null || e === '' || e === 'off') return { mode: 'off', val: null };
+  const m = String(e).match(/^(i)?(\d{1,2})$/);
+  if (!m) return { mode: 'off', val: null };
+  const val = Number(m[2]);
+  if (!Number.isFinite(val) || val < 1 || val > 99) return { mode: 'off', val: null };
+  return { mode: m[1] ? 'in' : 'ex', val };
+}
+
+function formatExt(mode, val) {
+  if (mode === 'off' || val == null) return 'off';
+  return mode === 'in' ? `i${val}` : String(val);
+}
+
+function normalizeExt(e) {
+  const p = parseExtRaw(e);
+  return p.mode === 'off' ? 'off' : formatExt(p.mode, p.val);
+}
 
 function isCustomExt(e) {
-  if (typeof e !== 'string' || e === 'off') return false;
-  if (!/^\d{1,2}$/.test(e)) return false;
-  const n = Number(e);
-  return n >= 1 && n <= 99;
+  const p = parseExtRaw(e);
+  if (p.mode === 'off') return false;
+  return !LIST_EXT_VALUES.includes(String(p.val));
 }
 
 function extLabel(e) {
-  if (e === 'off' || !isCustomExt(e) && !LIST_EXT_PRESETS.includes(e)) return '不限';
-  const n = Number(e);
-  if (!Number.isFinite(n) || n <= 0) return '不限';
-  return `排除 ≥${n}¢`;
+  const p = parseExtRaw(e);
+  if (p.mode === 'off') return '不限';
+  return p.mode === 'in' ? `仅 ≥${p.val}¢` : `排除 ≥${p.val}¢`;
 }
 
 function extFilterActive(e) {
-  return e !== 'off' && (LIST_EXT_PRESETS.includes(e) || isCustomExt(e));
+  return parseExtRaw(e).mode !== 'off';
 }
 
 function passesExtFilter(slot, ext) {
-  if (!extFilterActive(ext)) return true;
-  const n = Number(ext);
-  if (!Number.isFinite(n)) return true;
-  const hi = n / 100;
-  const lo = (100 - n) / 100;
+  const p = parseExtRaw(ext);
+  if (p.mode === 'off') return true;
+  const hi = p.val / 100;
+  const lo = (100 - p.val) / 100;
   const bid = slot?.baseline?.bidPrice;
   const ask = slot?.baseline?.askPrice;
-  // ask >= hi or bid <= lo means one side is at/past the extreme — drop it.
-  // Single-sided / empty books pass through; the /empty leaderboard exists
-  // for those.
-  if (Number.isFinite(ask) && ask >= hi) return false;
-  if (Number.isFinite(bid) && bid <= lo) return false;
-  return true;
+  const askExt = Number.isFinite(ask) && ask >= hi;
+  const bidExt = Number.isFinite(bid) && bid <= lo;
+  const isExtreme = askExt || bidExt;
+  // 'in' = only show extreme markets; 'ex' = exclude extreme markets.
+  return p.mode === 'in' ? isExtreme : !isExtreme;
 }
 
 const LIST_KINDS = {
@@ -1058,7 +1076,7 @@ function listWizardText(kind, bits, thresh, sort, dir, ext = 'off') {
     '',
     '<i>点 🚀 后:有盘口过滤 → 重抓 orderbook 实时数据再筛+排序;</i>',
     '<i>没盘口过滤(默认) → 直接用现有数据排序,瞬间完成。</i>',
-    '<i>极端价: 排除买1/卖1 已锁在 ≥N¢ 或 ≤(100-N)¢ 的市场(基本已决断)。</i>',
+    '<i>极端价: 一边 ≥N¢ 或 ≤(100-N)¢ 的市场基本已决断。"排除" 隐藏 / "仅" 只显示这类。</i>',
     '<i>自定义: 点 ✏ 后回复数字(总额 USD / 极端价 1-99)。</i>',
   ];
   return lines.join('\n');
@@ -1069,15 +1087,12 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
   const sel = parseStaleBits(bits);
   const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const dirKey = LIST_DIRS.includes(dir) ? dir : 'le';
-  const extKey = (LIST_EXT_PRESETS.includes(ext) || isCustomExt(ext)) ? ext : 'off';
+  const extKey = normalizeExt(ext);
   const mark = (on, label) => on ? `✅ ${label}` : `⬜ ${label}`;
   const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t, dirKey)}` : staleThreshLabel(t, dirKey);
   const sortMark = (s) => s === sortKey ? `✅ ${LIST_SORT_LABELS[s]}` : LIST_SORT_LABELS[s];
   const dirMark = (d) => d === dirKey ? `✅ ${LIST_DIR_LABELS[d]}` : LIST_DIR_LABELS[d];
-  const extMark = (e) => {
-    const label = e === 'off' ? '关' : `≥${e}¢`;
-    return e === extKey ? `✅ ${label}` : label;
-  };
+  const extMark = (e, label) => e === extKey ? `✅ ${label}` : label;
   // 8-part callback: kind:action:bits:thresh:sort:dir:ext:page
   const cb = (action, b = bits, t = thresh, s = sortKey, d = dirKey, e = extKey) =>
     `${kind}:${action}:${b}:${t}:${s}:${d}:${e}:0`;
@@ -1094,6 +1109,26 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
   // Split threshold buttons into two rows so they fit comfortably on mobile.
   const threshRow1 = threshButtons.slice(0, 4);
   const threshRow2 = [...threshButtons.slice(4), customButton];
+  // Extreme-price filter: two rows, one per mode.
+  // Row 1: off + exclude presets ("排除≥N¢" — hide near-resolved markets).
+  // Row 2: include presets + custom ("仅≥N¢" — show ONLY near-resolved).
+  const extExcludeRow = [
+    { text: extMark('off', '关'), callback_data: cb('set', bits, thresh, sortKey, dirKey, 'off') },
+    ...LIST_EXT_VALUES.map((v) => ({
+      text: extMark(v, `排除≥${v}¢`),
+      callback_data: cb('set', bits, thresh, sortKey, dirKey, v),
+    })),
+  ];
+  const extIncludeRow = [
+    ...LIST_EXT_VALUES.map((v) => ({
+      text: extMark(`i${v}`, `仅≥${v}¢`),
+      callback_data: cb('set', bits, thresh, sortKey, dirKey, `i${v}`),
+    })),
+    {
+      text: isCustomExt(extKey) ? `✅ ✏ (${extLabel(extKey)})` : '✏ 自定义…',
+      callback_data: cb('custom-ext'),
+    },
+  ];
   return {
     inline_keyboard: [
       [
@@ -1112,16 +1147,8 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
         text: dirMark(d),
         callback_data: cb('set', bits, thresh, sortKey, d),
       })),
-      [
-        ...LIST_EXT_PRESETS.map((e) => ({
-          text: extMark(e),
-          callback_data: cb('set', bits, thresh, sortKey, dirKey, e),
-        })),
-        {
-          text: isCustomExt(extKey) ? `✅ ✏ (≥${extKey}¢)` : '✏ 自定义…',
-          callback_data: cb('custom-ext'),
-        },
-      ],
+      extExcludeRow,
+      extIncludeRow,
       LIST_SORTS.map((s) => ({
         text: sortMark(s),
         callback_data: cb('set', bits, thresh, s),
@@ -1327,7 +1354,7 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     ? thresh : 'inf';
   const safeSort = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const safeDir = LIST_DIRS.includes(dir) ? dir : 'le';
-  const safeExt = (LIST_EXT_PRESETS.includes(ext) || isCustomExt(ext)) ? ext : 'off';
+  const safeExt = normalizeExt(ext);
   const page = Math.max(0, Number(pageStr) || 0);
   const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir, ext: safeExt };
 
@@ -2056,7 +2083,7 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
   const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
   const dir = LIST_DIRS.includes(opts.dir) ? opts.dir : 'le';
-  const ext = (LIST_EXT_PRESETS.includes(opts.ext) || isCustomExt(opts.ext)) ? opts.ext : 'off';
+  const ext = normalizeExt(opts.ext);
   // /new encodes its full filter (winH, minRate, minRem, bits, thresh, dir,
   // sort) so pagination preserves the active filter without per-message
   // state.
@@ -2471,7 +2498,7 @@ function renderListPage(cmd, page, state, filter = null) {
       thresh: filter.thresh ?? 'inf',
       sort: filter.sort ?? (LIST_KINDS[cmd]?.defaultSort ?? 't'),
       dir: filter.dir ?? 'le',
-      ext: (LIST_EXT_PRESETS.includes(filter.ext) || isCustomExt(filter.ext)) ? filter.ext : 'off',
+      ext: normalizeExt(filter.ext),
     };
   } else if (cmd === 'new') {
     kbOpts = {
@@ -3626,9 +3653,14 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 if (field === 'thresh') {
                   nextThresh = num != null && num > 0 ? String(num) : 'inf';
                 } else {
-                  // ext: clamp 1-99, anything else reverts to 'off'.
-                  if (num != null && num >= 1 && num <= 99) nextExt = String(num);
-                  else nextExt = 'off';
+                  // ext: clamp 1-99 and preserve the current mode (ex/in),
+                  // so ✏ while in "仅显示" mode stays in "仅显示".
+                  if (num != null && num >= 1 && num <= 99) {
+                    const currentMode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+                    nextExt = formatExt(currentMode, num);
+                  } else {
+                    nextExt = 'off';
+                  }
                 }
                 try {
                   await editTelegramMessage(
