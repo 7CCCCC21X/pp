@@ -738,6 +738,47 @@ const LIST_DIRS = ['le', 'ge'];
 const LIST_DIR_LABELS = { le: '≤ (薄)', ge: '≥ (厚)' };
 const LIST_DIR_OP = { le: '≤', ge: '≥' };
 
+// "极端价" filter — drops markets where one side of the binary is heavily
+// favored (the market is effectively decided and the orderbook is locked
+// near a boundary). For threshold T in cents, a market is "extreme" iff
+// best-ask >= T¢ OR best-bid <= (100-T)¢; both bid and ask must be present
+// for the check (single-sided books pass through).
+const LIST_EXT_PRESETS = ['off', '94', '90', '85'];
+
+function isCustomExt(e) {
+  if (typeof e !== 'string' || e === 'off') return false;
+  if (!/^\d{1,2}$/.test(e)) return false;
+  const n = Number(e);
+  return n >= 1 && n <= 99;
+}
+
+function extLabel(e) {
+  if (e === 'off' || !isCustomExt(e) && !LIST_EXT_PRESETS.includes(e)) return '不限';
+  const n = Number(e);
+  if (!Number.isFinite(n) || n <= 0) return '不限';
+  return `排除 ≥${n}¢`;
+}
+
+function extFilterActive(e) {
+  return e !== 'off' && (LIST_EXT_PRESETS.includes(e) || isCustomExt(e));
+}
+
+function passesExtFilter(slot, ext) {
+  if (!extFilterActive(ext)) return true;
+  const n = Number(ext);
+  if (!Number.isFinite(n)) return true;
+  const hi = n / 100;
+  const lo = (100 - n) / 100;
+  const bid = slot?.baseline?.bidPrice;
+  const ask = slot?.baseline?.askPrice;
+  // ask >= hi or bid <= lo means one side is at/past the extreme — drop it.
+  // Single-sided / empty books pass through; the /empty leaderboard exists
+  // for those.
+  if (Number.isFinite(ask) && ask >= hi) return false;
+  if (Number.isFinite(bid) && bid <= lo) return false;
+  return true;
+}
+
 const LIST_KINDS = {
   stale: { title: '⏱ 停滞排名', defaultSort: 't' },
   all:   { title: '📋 全部市场', defaultSort: 'p' },
@@ -999,39 +1040,47 @@ function sumLevels(book, sel) {
   return sum;
 }
 
-function listWizardText(kind, bits, thresh, sort, dir) {
+function listWizardText(kind, bits, thresh, sort, dir, ext = 'off') {
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
   const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]);
   const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const dirKey = LIST_DIRS.includes(dir) ? dir : 'le';
   const customTag = isCustomThresh(thresh) ? ' <i>(自定义)</i>' : '';
+  const extTag = isCustomExt(ext) ? ' <i>(自定义)</i>' : '';
   const lines = [
     `<b>${meta.title} · 过滤设置</b>`,
     '',
     `📐 累加层级: ${picked.length ? `<b>${picked.join(' + ')}</b>` : '<i>未选 (=不过滤)</i>'}`,
     `💵 总额阈值: <b>${staleThreshLabel(thresh, dirKey)}</b>${customTag}`,
+    `📈 极端价: <b>${extLabel(ext)}</b>${extTag}`,
     `📊 排序: <b>${LIST_SORT_LABELS[sortKey]}</b>`,
     '',
-    '<i>点 🚀 后:有过滤条件 → 重抓 orderbook 实时数据再筛+排序;</i>',
-    '<i>没过滤条件(默认) → 直接用现有数据排序,瞬间完成。</i>',
-    '<i>自定义阈值: 点 ✏ 后回复一个数字(例如 350)即可。</i>',
+    '<i>点 🚀 后:有盘口过滤 → 重抓 orderbook 实时数据再筛+排序;</i>',
+    '<i>没盘口过滤(默认) → 直接用现有数据排序,瞬间完成。</i>',
+    '<i>极端价: 排除买1/卖1 已锁在 ≥N¢ 或 ≤(100-N)¢ 的市场(基本已决断)。</i>',
+    '<i>自定义: 点 ✏ 后回复数字(总额 USD / 极端价 1-99)。</i>',
   ];
   return lines.join('\n');
 }
 
-function listWizardKeyboard(kind, bits, thresh, sort, dir) {
+function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
   const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const dirKey = LIST_DIRS.includes(dir) ? dir : 'le';
+  const extKey = (LIST_EXT_PRESETS.includes(ext) || isCustomExt(ext)) ? ext : 'off';
   const mark = (on, label) => on ? `✅ ${label}` : `⬜ ${label}`;
   const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t, dirKey)}` : staleThreshLabel(t, dirKey);
   const sortMark = (s) => s === sortKey ? `✅ ${LIST_SORT_LABELS[s]}` : LIST_SORT_LABELS[s];
   const dirMark = (d) => d === dirKey ? `✅ ${LIST_DIR_LABELS[d]}` : LIST_DIR_LABELS[d];
-  // 7-part callback: kind:action:bits:thresh:sort:dir:page
-  const cb = (action, b = bits, t = thresh, s = sortKey, d = dirKey) =>
-    `${kind}:${action}:${b}:${t}:${s}:${d}:0`;
+  const extMark = (e) => {
+    const label = e === 'off' ? '关' : `≥${e}¢`;
+    return e === extKey ? `✅ ${label}` : label;
+  };
+  // 8-part callback: kind:action:bits:thresh:sort:dir:ext:page
+  const cb = (action, b = bits, t = thresh, s = sortKey, d = dirKey, e = extKey) =>
+    `${kind}:${action}:${b}:${t}:${s}:${d}:${e}:0`;
   // Threshold row gets the "✏ 自定义" affordance + the current custom value
   // (if any) shown as a checkmarked button so the user can see what's set.
   const threshButtons = LIST_THRESHOLDS.map((t) => ({
@@ -1063,6 +1112,16 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir) {
         text: dirMark(d),
         callback_data: cb('set', bits, thresh, sortKey, d),
       })),
+      [
+        ...LIST_EXT_PRESETS.map((e) => ({
+          text: extMark(e),
+          callback_data: cb('set', bits, thresh, sortKey, dirKey, e),
+        })),
+        {
+          text: isCustomExt(extKey) ? `✅ ✏ (≥${extKey}¢)` : '✏ 自定义…',
+          callback_data: cb('custom-ext'),
+        },
+      ],
       LIST_SORTS.map((s) => ({
         text: sortMark(s),
         callback_data: cb('set', bits, thresh, s),
@@ -1237,24 +1296,30 @@ function consumePendingFilterInput(chatId, userId) {
 }
 
 export async function handleListFilterCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
-  // data shape: <kind>:<action>:<bits>:<thresh>:<sort>:<dir>:<page>
+  // data shape: <kind>:<action>:<bits>:<thresh>:<sort>:<dir>:<ext>:<page>
   // Back-compat:
+  //   7-part (pre-ext): <kind>:<action>:<bits>:<thresh>:<sort>:<dir>:<page>
   //   6-part (pre-dir): <kind>:<action>:<bits>:<thresh>:<sort>:<page>
   //   5-part (pre-sort/pre-dir): stale:<action>:<bits>:<thresh>:<page>
   const parts = data.split(':');
   const kind = parts[0];
   if (!(kind in LIST_KINDS)) return false;
   const meta = LIST_KINDS[kind];
-  let action, bits, thresh, sort, dir, pageStr;
-  if (parts.length >= 7) {
+  let action, bits, thresh, sort, dir, ext, pageStr;
+  if (parts.length >= 8) {
+    [, action, bits, thresh, sort, dir, ext, pageStr] = parts;
+  } else if (parts.length >= 7) {
     [, action, bits, thresh, sort, dir, pageStr] = parts;
+    ext = 'off';
   } else if (parts.length >= 6) {
     [, action, bits, thresh, sort, pageStr] = parts;
     dir = 'le';
+    ext = 'off';
   } else {
     [, action, bits, thresh, pageStr] = parts;
     sort = meta.defaultSort;
     dir = 'le';
+    ext = 'off';
   }
   const safeBits = /^[01]{6}$/.test(bits) ? bits : '100100';
   // Accept preset OR custom (positive integer string).
@@ -1262,16 +1327,17 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     ? thresh : 'inf';
   const safeSort = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
   const safeDir = LIST_DIRS.includes(dir) ? dir : 'le';
+  const safeExt = (LIST_EXT_PRESETS.includes(ext) || isCustomExt(ext)) ? ext : 'off';
   const page = Math.max(0, Number(pageStr) || 0);
-  const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir };
+  const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir, ext: safeExt };
 
   if (action === 'wizard' || action === 'set') {
     try {
       await editTelegramMessage(
         chatId,
         messageId,
-        listWizardText(kind, safeBits, safeThresh, safeSort, safeDir),
-        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir),
+        listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, safeExt),
+        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt),
       );
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
@@ -1281,28 +1347,33 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     return true;
   }
 
-  if (action === 'custom') {
+  if (action === 'custom' || action === 'custom-ext') {
     // Stash pending-input state and edit wizard with a "waiting for input" hint.
     // Next plain message in this chat from this user gets treated as the new
-    // threshold (parsed as a positive integer).
+    // value (parsed as a positive integer). field=thresh for the $ knob,
+    // field=ext for the 极端价 knob.
+    const field = action === 'custom-ext' ? 'ext' : 'thresh';
     setPendingFilterInput(chatId, fromId, {
-      kind, bits: safeBits, sort: safeSort, dir: safeDir, messageId,
+      kind, field, bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir, ext: safeExt, messageId,
     });
     try {
       const meta2 = LIST_KINDS[kind] ?? LIST_KINDS.stale;
+      const promptUnit = field === 'ext'
+        ? '极端价百分位(1-99,例如 94 = 排除 ≥94¢ 或 ≤6¢ 的市场)'
+        : 'USD 金额,例如 350';
       const hint = [
-        `<b>${meta2.title} · 等待自定义阈值…</b>`,
+        `<b>${meta2.title} · 等待自定义${field === 'ext' ? '极端价' : '阈值'}…</b>`,
         '',
-        '请直接在这个 chat <b>回复一个数字</b>(USD 金额,例如 350)。',
+        `请直接在这个 chat <b>回复一个数字</b>(${promptUnit})。`,
         '',
-        `当前选: 📐 ${LIST_LEVELS.filter((k) => parseStaleBits(safeBits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 📊 ${LIST_SORT_LABELS[safeSort]} · ${LIST_DIR_LABELS[safeDir]}`,
+        `当前选: 📐 ${LIST_LEVELS.filter((k) => parseStaleBits(safeBits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(safeThresh, safeDir)} · 📈 ${extLabel(safeExt)} · 📊 ${LIST_SORT_LABELS[safeSort]}`,
         '',
         '<i>5 分钟内有效。想取消就发任何非数字。</i>',
       ].join('\n');
       const cancelKb = {
         inline_keyboard: [[{
           text: '✖ 取消(回到向导)',
-          callback_data: `${kind}:wizard:${safeBits}:${safeThresh}:${safeSort}:${safeDir}:0`,
+          callback_data: `${kind}:wizard:${safeBits}:${safeThresh}:${safeSort}:${safeDir}:${safeExt}:0`,
         }]],
       };
       await editTelegramMessage(chatId, messageId, hint, cancelKb);
@@ -1336,10 +1407,9 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
   }
 
   if (action === 'run') {
-    // No filter active → just re-render with the chosen sort. No refetch
-    // needed; the leaderboard data is already fresh (5-min poll). This
-    // makes "switch sort" a 1-tap instant operation instead of a 1-2
-    // minute wait.
+    // No depth filter active → just re-render with the chosen sort + ext
+    // filter (cache-only knobs). Skips the orderbook refetch. This makes
+    // "switch sort" / "toggle 极端价" a 1-tap instant operation.
     if (!staleFilterIsActive(safeBits, safeThresh)) {
       const reply = renderListPage(kind, 0, state, filter);
       if (reply) {
@@ -1986,6 +2056,7 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
   const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
   const dir = LIST_DIRS.includes(opts.dir) ? opts.dir : 'le';
+  const ext = (LIST_EXT_PRESETS.includes(opts.ext) || isCustomExt(opts.ext)) ? opts.ext : 'off';
   // /new encodes its full filter (winH, minRate, minRem, bits, thresh, dir,
   // sort) so pagination preserves the active filter without per-message
   // state.
@@ -2001,7 +2072,7 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
     sort: NEW_SORTS.includes(opts.sort) ? opts.sort : NEW_DEFAULT.sort,
   };
   const pageCb = (p) => {
-    if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${p}`;
+    if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${ext}:${p}`;
     if (isNewCmd) {
       const [w, r, m, b, t, d, s] = newFilterToCbParts(newF);
       return `new:page:${w}:${r}:${m}:${b}:${t}:${d}:${s}:${p}`;
@@ -2018,12 +2089,16 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   }
   if (isWizardCmd) {
     const filterActive = staleFilterIsActive(bits, thresh);
-    const sortTag = sort !== defaultSort ? ` · 排序 ${LIST_SORT_LABELS[sort]}` : '';
+    const extActive = extFilterActive(ext);
+    const tagParts = [];
+    if (filterActive) tagParts.push(staleThreshLabel(thresh, dir));
+    if (extActive) tagParts.push(extLabel(ext));
+    if (sort !== defaultSort) tagParts.push(`排序 ${LIST_SORT_LABELS[sort]}`);
     rows.push([{
-      text: filterActive
-        ? `🎚 调整 (${staleThreshLabel(thresh, dir)}${sortTag})`
-        : `🎚 过滤 / 排序${sortTag}`,
-      callback_data: `${cmd}:wizard:${bits}:${thresh}:${sort}:${dir}:0`,
+      text: tagParts.length
+        ? `🎚 调整 (${tagParts.join(' · ')})`
+        : `🎚 过滤 / 排序`,
+      callback_data: `${cmd}:wizard:${bits}:${thresh}:${sort}:${dir}:${ext}:0`,
     }]);
   }
   if (isNewCmd) {
@@ -2254,7 +2329,9 @@ function renderListPage(cmd, page, state, filter = null) {
       const filterBits = filter?.bits ?? null;
       const filterThresh = filter?.thresh ?? null;
       const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
+      const filterExt = filter?.ext ?? 'off';
       const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
+      const extOn = extFilterActive(filterExt);
       const sel = filterBits ? parseStaleBits(filterBits) : null;
       const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
       const passesThresh = (sumUsd) => {
@@ -2270,6 +2347,7 @@ function renderListPage(cmd, page, state, filter = null) {
           return { id, slot, sinceMs, thresholdH, sumUsd };
         })
         .filter((r) => {
+          if (extOn && !passesExtFilter(r.slot, filterExt)) return false;
           if (!filterOn) return true;
           // Drop markets that haven't been refetched in this session — without
           // recentBook we can't honor the level-sum filter.
@@ -2287,11 +2365,14 @@ function renderListPage(cmd, page, state, filter = null) {
       }
       const headerLabel = sortKey === 'p' ? '⏱ 停滞排名 · 按 PP/h' : '⏱ 停滞时长排名';
       const headerParts = [`<b>${headerLabel}</b>`];
+      const tagBits = [];
       if (filterOn) {
         const picked = STALE_LEVELS.filter((k) => sel[k]).map((k) => STALE_LEVEL_LABELS[k]).join('+');
         const op = LIST_DIR_OP[filterDir] ?? '≤';
-        headerParts.push(`<i>· 过滤: ${picked} ${op} $${threshUsd}</i>`);
+        tagBits.push(`${picked} ${op} $${threshUsd}`);
       }
+      if (extOn) tagBits.push(extLabel(filterExt));
+      if (tagBits.length) headerParts.push(`<i>· 过滤: ${tagBits.join(' · ')}</i>`);
       header = headerParts.join(' ');
       extraFn = (slot, row) => {
         const elapsed = fmtElapsed(row.sinceMs);
@@ -2317,7 +2398,9 @@ function renderListPage(cmd, page, state, filter = null) {
       const filterBits = filter?.bits ?? null;
       const filterThresh = filter?.thresh ?? null;
       const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
+      const filterExt = filter?.ext ?? 'off';
       const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
+      const extOn = extFilterActive(filterExt);
       const sel = filterBits ? parseStaleBits(filterBits) : null;
       const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
       const passesThresh = (sumUsd) => {
@@ -2340,6 +2423,7 @@ function renderListPage(cmd, page, state, filter = null) {
           return { id, slot: slot ?? {}, sinceMs, sumUsd, status, statusTag };
         })
         .filter((r) => {
+          if (extOn && !passesExtFilter(r.slot, filterExt)) return false;
           if (!filterOn) return true;
           if (!r.slot.recentBook) return false;
           return passesThresh(r.sumUsd);
@@ -2356,11 +2440,14 @@ function renderListPage(cmd, page, state, filter = null) {
       }
       const headerLabel = sortKey === 't' ? '📋 全部市场 · 按停滞时长' : '📋 全部市场 · 按 PP/h';
       const headerParts = [`<b>${headerLabel}</b>`];
+      const tagBits = [];
       if (filterOn) {
         const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
         const op = LIST_DIR_OP[filterDir] ?? '≤';
-        headerParts.push(`<i>· 过滤: ${picked} ${op} $${threshUsd}</i>`);
+        tagBits.push(`${picked} ${op} $${threshUsd}`);
       }
+      if (extOn) tagBits.push(extLabel(filterExt));
+      if (tagBits.length) headerParts.push(`<i>· 过滤: ${tagBits.join(' · ')}</i>`);
       header = headerParts.join(' ');
       extraFn = (_slot, row) => {
         const parts = [];
@@ -2384,6 +2471,7 @@ function renderListPage(cmd, page, state, filter = null) {
       thresh: filter.thresh ?? 'inf',
       sort: filter.sort ?? (LIST_KINDS[cmd]?.defaultSort ?? 't'),
       dir: filter.dir ?? 'le',
+      ext: (LIST_EXT_PRESETS.includes(filter.ext) || isCustomExt(filter.ext)) ? filter.ext : 'off',
     };
   } else if (cmd === 'new') {
     kbOpts = {
@@ -3528,14 +3616,26 @@ export function startCommandLoop({ getState, persist, ctx }) {
                   warn(`new custom-input apply edit failed: ${err.message}`);
                 }
               } else {
-                // /stale or /all wizard.
-                const newThresh = num != null && num > 0 ? String(num) : 'inf';
+                // /stale or /all wizard. pending.field tells us which knob —
+                // 'thresh' for sum threshold ($), 'ext' for 极端价 (1-99).
+                // 'thresh' is the legacy default for callbacks that didn't
+                // populate field (the wizard's only custom input pre-ext).
+                const field = pending.field === 'ext' ? 'ext' : 'thresh';
+                let nextThresh = pending.thresh ?? 'inf';
+                let nextExt = pending.ext ?? 'off';
+                if (field === 'thresh') {
+                  nextThresh = num != null && num > 0 ? String(num) : 'inf';
+                } else {
+                  // ext: clamp 1-99, anything else reverts to 'off'.
+                  if (num != null && num >= 1 && num <= 99) nextExt = String(num);
+                  else nextExt = 'off';
+                }
                 try {
                   await editTelegramMessage(
                     chatId,
                     pending.messageId,
-                    listWizardText(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
-                    listWizardKeyboard(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
+                    listWizardText(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt),
+                    listWizardKeyboard(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt),
                   );
                 } catch (err) {
                   warn(`custom-thresh apply edit failed: ${err.message}`);
