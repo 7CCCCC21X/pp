@@ -2824,19 +2824,13 @@ async function handle(text, state, ctx, chatId, fromId) {
     }
 
     case '/new': {
-      // /new                 → wizard (interactive)
+      // /new                 → result list with default filter (底部 🎚 进向导)
       // /new 24h             → window arg (parses 30m / 2h / 7d, max 30d)
       // /new 24h 500         → window + minRate
       // /new 24h 500 6h      → window + minRate + minRem
       // Bare numeric arg (no unit) = page index (1-indexed) for back-compat
       // with the original /new release.
       const parts = arg.split(/\s+/).filter(Boolean);
-      if (!parts.length) {
-        return {
-          text: newWizardText(NEW_DEFAULT),
-          replyMarkup: newWizardKeyboard(NEW_DEFAULT),
-        };
-      }
       const f = { ...NEW_DEFAULT };
       let page = 0;
       const numericFields = ['winH', 'minRate', 'minRem'];
