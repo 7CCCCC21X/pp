@@ -18,7 +18,7 @@ import {
   broadcastChats,
   effectiveOverride,
 } from './state.js';
-import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink } from './format.js';
+import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
 import { getMarketRewardSummary, getOrderbook, resolveSlugToId, getCacheStats, refreshAllCaches } from './predict.js';
 import { slugifyMarketTitle } from './format.js';
@@ -2147,6 +2147,22 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
       callback_data: `new:wizard:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
     }]);
   }
+  // "🌐 N" url buttons — one per market on the current page. Each is a
+  // direct-URL button so a single tap opens that market in the browser
+  // without going through the inline title link in the text (much easier
+  // to hit on mobile, where tapping a small inline <a> is fiddly).
+  // Telegram has no multi-URL button, so true "one tap → 10 tabs" isn't
+  // possible; this is the next-best approximation.
+  if (Array.isArray(opts.openUrls) && opts.openUrls.length) {
+    const CHUNK = 5;
+    for (let i = 0; i < opts.openUrls.length; i += CHUNK) {
+      const chunk = opts.openUrls.slice(i, i + CHUNK);
+      rows.push(chunk.map((u, j) => ({
+        text: `🌐 ${i + j + 1}`,
+        url: u,
+      })));
+    }
+  }
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
@@ -2531,9 +2547,15 @@ function renderListPage(cmd, page, state, filter = null) {
     lines.push('');
     lines.push(`<i>📅 ${fresh.join(' · ')}</i>`);
   }
+  // One-tap-per-market open buttons under the keyboard. The position in
+  // `items` matches the visible row number in the message, so 🌐 3 opens
+  // the third row.
+  const openUrls = items.map((row) => marketUrl(
+    row.id, row.slot?.title, row.slot?.question, row.slot?.slug,
+  ));
   return {
     text: lines.join('\n'),
-    replyMarkup: pageKeyboard(cmd, safePage, totalPages, kbOpts),
+    replyMarkup: pageKeyboard(cmd, safePage, totalPages, { ...kbOpts, openUrls }),
   };
 }
 

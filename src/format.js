@@ -78,9 +78,7 @@ export function slugifyMarketTitle(title) {
 // title as a best-effort fallback. URL pattern keeps the /zh-cn/
 // prefix the user confirmed works in browsers — predict.fun's no-lang
 // path inconsistently 302s in some clients.
-export function marketLink(marketId, title, question, slug) {
-  const display = title || question || `Market ${marketId}`;
-  const safeTitle = htmlEscape(shortTitle(display, 72));
+export function marketUrl(marketId, title, question, slug) {
   const urlSlug = slug
     || (question ? slugifyMarketTitle(question) : null)
     || (title ? slugifyMarketTitle(title) : null);
@@ -88,7 +86,13 @@ export function marketLink(marketId, title, question, slug) {
     ? `https://predict.fun/zh-cn/market/${urlSlug}`
     : `https://predict.fun/zh-cn/market/${encodeURIComponent(marketId)}`;
   const ref = config.predictRefCode;
-  const url = ref ? `${base}?ref=${ref}` : base;
+  return ref ? `${base}?ref=${ref}` : base;
+}
+
+export function marketLink(marketId, title, question, slug) {
+  const display = title || question || `Market ${marketId}`;
+  const safeTitle = htmlEscape(shortTitle(display, 72));
+  const url = marketUrl(marketId, title, question, slug);
   return `<a href="${url}">${safeTitle}</a>`;
 }
 
