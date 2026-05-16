@@ -44,7 +44,7 @@ const PRIVATE_MENU = [
   { command: 'empty', description: '当前单边/空簿的市场' },
   { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
-  { command: 'new', description: '今日新上的有奖励市场（默认 24h；可加参数如 /new 7d）' },
+  { command: 'new', description: '今日新上的有奖励市场（默认 24h；底部按钮可调窗口/PP/h/剩余/排序）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -743,6 +743,152 @@ const LIST_KINDS = {
   all:   { title: '📋 全部市场', defaultSort: 'p' },
 };
 
+// /new wizard — separate filter dimensions from /stale and /all:
+//   winH  — time window (hours) for "first seen within last N hours"
+//   minRate — PP/h floor (markets paying less are hidden)
+//   minRem  — minimum remaining lifetime (hours); 0 = no limit
+//   sort    — t (上榜时间 desc), p (PP/h desc)
+// All four are encoded into the callback so /new pagination + filter
+// re-render preserve state. No orderbook refetch needed — all knobs work
+// off cached PP/h + endMs from the firstSeen snapshot.
+const NEW_WIN_PRESETS = ['24', '72', '168', '336', '720'];   // hours
+const NEW_RATE_PRESETS = ['0', '100', '500', '1000', '5000']; // PP/h
+const NEW_REM_PRESETS = ['0', '6', '24', '72', '168'];        // hours
+const NEW_SORTS = ['t', 'p'];
+const NEW_SORT_LABELS = { t: '上榜时间', p: 'PP/h' };
+const NEW_DEFAULT = { winH: 24, minRate: 0, minRem: 0, sort: 't' };
+
+function fmtHoursLabel(h) {
+  const n = Number(h);
+  if (!Number.isFinite(n) || n <= 0) return '不限';
+  if (n < 24) return `${n}h`;
+  if (n % 24 === 0) return `${n / 24}d`;
+  return `${n}h`;
+}
+
+function fmtRateLabel(r) {
+  const n = Number(r);
+  if (!Number.isFinite(n) || n <= 0) return '不限';
+  if (n >= 1000) return `≥${n / 1000}k/h`;
+  return `≥${n}/h`;
+}
+
+function isPositiveIntStr(s) {
+  return typeof s === 'string' && /^\d+$/.test(s) && Number(s) >= 0;
+}
+
+function parseNewFilter(parts) {
+  // parts: [winH, minRate, minRem, sort] from callback string
+  const winH = isPositiveIntStr(parts[0]) ? Number(parts[0]) : NEW_DEFAULT.winH;
+  const minRate = isPositiveIntStr(parts[1]) ? Number(parts[1]) : NEW_DEFAULT.minRate;
+  const minRem = isPositiveIntStr(parts[2]) ? Number(parts[2]) : NEW_DEFAULT.minRem;
+  const sort = NEW_SORTS.includes(parts[3]) ? parts[3] : NEW_DEFAULT.sort;
+  return { winH: Math.min(720 * 24, Math.max(1, winH)), minRate, minRem, sort };
+}
+
+function newFilterToCbParts(f) {
+  return [String(f.winH), String(f.minRate), String(f.minRem), f.sort];
+}
+
+function newWizardText(f) {
+  const lines = [
+    `<b>🆕 新上市场 · 过滤设置</b>`,
+    '',
+    `⏰ 窗口: <b>${fmtHoursLabel(f.winH)}</b>`,
+    `💰 最低 PP/h: <b>${fmtRateLabel(f.minRate)}</b>`,
+    `⌛ 最短剩余: <b>${fmtHoursLabel(f.minRem)}</b>`,
+    `📊 排序: <b>${NEW_SORT_LABELS[f.sort]}</b>`,
+    '',
+    '<i>点 🚀 应用筛选;✏ 后回复数字可设自定义值(窗口/剩余为小时,PP/h 为数值)。</i>',
+  ];
+  return lines.join('\n');
+}
+
+function newWizardKeyboard(f) {
+  const cb = (action, override = {}) => {
+    const merged = { ...f, ...override };
+    const [w, r, m, s] = newFilterToCbParts(merged);
+    return `new:${action}:${w}:${r}:${m}:${s}:0`;
+  };
+  const winMark = (h) => Number(h) === f.winH ? `✅ ${fmtHoursLabel(h)}` : fmtHoursLabel(h);
+  const rateMark = (r) => Number(r) === f.minRate ? `✅ ${fmtRateLabel(r)}` : fmtRateLabel(r);
+  const remMark = (h) => Number(h) === f.minRem ? `✅ ${fmtHoursLabel(h)}` : fmtHoursLabel(h);
+  const sortMark = (s) => s === f.sort ? `✅ ${NEW_SORT_LABELS[s]}` : NEW_SORT_LABELS[s];
+  const isCustomWin = !NEW_WIN_PRESETS.includes(String(f.winH));
+  const isCustomRate = !NEW_RATE_PRESETS.includes(String(f.minRate));
+  const isCustomRem = !NEW_REM_PRESETS.includes(String(f.minRem));
+  return {
+    inline_keyboard: [
+      [{ text: '— ⏰ 窗口 —', callback_data: 'page:noop' }],
+      [
+        ...NEW_WIN_PRESETS.slice(0, 3).map((h) => ({
+          text: winMark(h),
+          callback_data: cb('set', { winH: Number(h) }),
+        })),
+      ],
+      [
+        ...NEW_WIN_PRESETS.slice(3).map((h) => ({
+          text: winMark(h),
+          callback_data: cb('set', { winH: Number(h) }),
+        })),
+        {
+          text: isCustomWin ? `✅ ✏ (${fmtHoursLabel(f.winH)})` : '✏ 自定义…',
+          callback_data: cb('custom-win'),
+        },
+      ],
+      [{ text: '— 💰 最低 PP/h —', callback_data: 'page:noop' }],
+      [
+        ...NEW_RATE_PRESETS.slice(0, 3).map((r) => ({
+          text: rateMark(r),
+          callback_data: cb('set', { minRate: Number(r) }),
+        })),
+      ],
+      [
+        ...NEW_RATE_PRESETS.slice(3).map((r) => ({
+          text: rateMark(r),
+          callback_data: cb('set', { minRate: Number(r) }),
+        })),
+        {
+          text: isCustomRate ? `✅ ✏ (${fmtRateLabel(f.minRate)})` : '✏ 自定义…',
+          callback_data: cb('custom-rate'),
+        },
+      ],
+      [{ text: '— ⌛ 最短剩余 —', callback_data: 'page:noop' }],
+      [
+        ...NEW_REM_PRESETS.slice(0, 3).map((h) => ({
+          text: remMark(h),
+          callback_data: cb('set', { minRem: Number(h) }),
+        })),
+      ],
+      [
+        ...NEW_REM_PRESETS.slice(3).map((h) => ({
+          text: remMark(h),
+          callback_data: cb('set', { minRem: Number(h) }),
+        })),
+        {
+          text: isCustomRem ? `✅ ✏ (${fmtHoursLabel(f.minRem)})` : '✏ 自定义…',
+          callback_data: cb('custom-rem'),
+        },
+      ],
+      [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
+      NEW_SORTS.map((s) => ({ text: sortMark(s), callback_data: cb('set', { sort: s }) })),
+      [
+        { text: '🚀 应用', callback_data: cb('run') },
+        { text: '✖ 取消', callback_data: cb('cancel') },
+      ],
+    ],
+  };
+}
+
+function newFilterIsActive(f) {
+  // "Active" = anything other than the defaults that would change visible
+  // rows. Pure sort changes also count as active so 🚀 reflects the change.
+  return f.winH !== NEW_DEFAULT.winH
+    || f.minRate !== NEW_DEFAULT.minRate
+    || f.minRem !== NEW_DEFAULT.minRem
+    || f.sort !== NEW_DEFAULT.sort;
+}
+
 // Back-compat aliases for code that still imports the stale-prefixed names.
 const STALE_THRESHOLDS = LIST_THRESHOLDS;
 const STALE_LEVELS = LIST_LEVELS;
@@ -1243,6 +1389,87 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
 // before /all existed. Keep this alias so the old import keeps working.
 export const handleStaleFilterCallback = handleListFilterCallback;
 
+// Edit-in-place callback handler for the /new wizard. Callback shape:
+//   new:<action>:<winH>:<minRate>:<minRem>:<sort>:<page>
+// Actions: wizard / set / custom-win / custom-rate / custom-rem / page /
+//          run / cancel.
+export async function handleNewWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
+  if (!data.startsWith('new:')) return false;
+  const parts = data.split(':');
+  if (parts.length < 7) return true;
+  const [, action, winStr, rateStr, remStr, sortStr, pageStr] = parts;
+  const f = parseNewFilter([winStr, rateStr, remStr, sortStr]);
+  const page = Math.max(0, Number(pageStr) || 0);
+
+  if (action === 'wizard' || action === 'set') {
+    try {
+      await editTelegramMessage(chatId, messageId, newWizardText(f), newWizardKeyboard(f));
+    } catch (err) {
+      if (!/message is not modified/i.test(err.message ?? '')) {
+        warn('new wizard edit failed:', err.message);
+      }
+    }
+    return true;
+  }
+
+  if (action === 'custom-win' || action === 'custom-rate' || action === 'custom-rem') {
+    // Stash pending-input state; next plain message from this user in this
+    // chat is parsed as the value. Field tells the input handler which knob
+    // to update.
+    const field = action.replace('custom-', ''); // 'win' | 'rate' | 'rem'
+    setPendingFilterInput(chatId, fromId, {
+      kind: 'new', field, winH: f.winH, minRate: f.minRate, minRem: f.minRem, sort: f.sort, messageId,
+    });
+    const unit = field === 'rate' ? 'PP/h 数值(如 750)' : '小时(如 36, 最长 720)';
+    try {
+      const hint = [
+        '<b>🆕 新上市场 · 等待自定义值…</b>',
+        '',
+        `请在这个 chat <b>回复一个数字</b>(${unit})。`,
+        '',
+        `当前: ⏰ ${fmtHoursLabel(f.winH)} · 💰 ${fmtRateLabel(f.minRate)} · ⌛ ${fmtHoursLabel(f.minRem)} · 📊 ${NEW_SORT_LABELS[f.sort]}`,
+        '',
+        '<i>5 分钟内有效。想取消就发任何非数字。</i>',
+      ].join('\n');
+      const [w, r, m, s] = newFilterToCbParts(f);
+      const cancelKb = {
+        inline_keyboard: [[{
+          text: '✖ 取消(回到向导)',
+          callback_data: `new:wizard:${w}:${r}:${m}:${s}:0`,
+        }]],
+      };
+      await editTelegramMessage(chatId, messageId, hint, cancelKb);
+    } catch {}
+    return true;
+  }
+
+  if (action === 'cancel') {
+    const reply = renderListPage('new', 0, state);
+    if (reply) {
+      try {
+        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+      } catch {}
+    }
+    return true;
+  }
+
+  if (action === 'page' || action === 'run') {
+    const reply = renderListPage('new', page, state, f);
+    if (reply) {
+      try {
+        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+      } catch (err) {
+        if (!/message is not modified/i.test(err.message ?? '')) {
+          warn('new page/run edit failed:', err.message);
+        }
+      }
+    }
+    return true;
+  }
+
+  return true;
+}
+
 const HELP = [
   '<b>📊 核心</b>',
   '/menu — 快捷按钮菜单',
@@ -1259,7 +1486,7 @@ const HELP = [
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
-  '/new [窗口] — 今日新上的有奖励市场（默认 24h；支持 /new 48h, /new 7d, 最长 30d）',
+  '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 调窗口/最低 PP/h/最短剩余/排序，或 /new 48h 500 6h）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -1590,12 +1817,21 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
   const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
   const dir = LIST_DIRS.includes(opts.dir) ? opts.dir : 'le';
-  // /new encodes its time window so pagination preserves the active range.
+  // /new encodes its filter (winH, minRate, minRem, sort) so pagination
+  // preserves the active filter without needing per-message state.
   const isNewCmd = cmd === 'new';
-  const windowMs = Number.isFinite(opts.windowMs) ? opts.windowMs : 24 * 3600 * 1000;
+  const newF = {
+    winH: Number.isFinite(opts.winH) ? opts.winH : NEW_DEFAULT.winH,
+    minRate: Number.isFinite(opts.minRate) ? opts.minRate : NEW_DEFAULT.minRate,
+    minRem: Number.isFinite(opts.minRem) ? opts.minRem : NEW_DEFAULT.minRem,
+    sort: NEW_SORTS.includes(opts.sort) ? opts.sort : NEW_DEFAULT.sort,
+  };
   const pageCb = (p) => {
     if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${p}`;
-    if (isNewCmd) return `page:new:${p}:${windowMs}`;
+    if (isNewCmd) {
+      const [w, r, m, s] = newFilterToCbParts(newF);
+      return `new:page:${w}:${r}:${m}:${s}:${p}`;
+    }
     return `page:${cmd}:${p}`;
   };
   const rows = [];
@@ -1616,24 +1852,31 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
       callback_data: `${cmd}:wizard:${bits}:${thresh}:${sort}:${dir}:0`,
     }]);
   }
+  if (isNewCmd) {
+    const active = newFilterIsActive(newF);
+    const tagBits = [];
+    if (newF.winH !== NEW_DEFAULT.winH) tagBits.push(fmtHoursLabel(newF.winH));
+    if (newF.minRate > 0) tagBits.push(fmtRateLabel(newF.minRate));
+    if (newF.minRem > 0) tagBits.push(`剩${fmtHoursLabel(newF.minRem)}`);
+    if (newF.sort !== NEW_DEFAULT.sort) tagBits.push(NEW_SORT_LABELS[newF.sort]);
+    const [w, r, m, s] = newFilterToCbParts(newF);
+    rows.push([{
+      text: active ? `🎚 调整 (${tagBits.join(' · ')})` : '🎚 过滤 / 排序',
+      callback_data: `new:wizard:${w}:${r}:${m}:${s}:0`,
+    }]);
+  }
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
 // Edit-in-place callback handler for page:* buttons.
 export async function handlePageCallback(data, { chatId, messageId, state, fullCtx }) {
   if (!data.startsWith('page:')) return false;
-  const [, cmd, pageStr, extra] = data.split(':');
+  const [, cmd, pageStr] = data.split(':');
   if (cmd === 'noop') return true; // page indicator button
   const page = Number(pageStr);
   if (!Number.isFinite(page) || page < 0) return true;
-  // /new encodes the time window as a 4th field so pagination preserves it.
-  let filter = null;
-  if (cmd === 'new' && extra != null) {
-    const windowMs = Number(extra);
-    if (Number.isFinite(windowMs) && windowMs > 0) filter = { windowMs };
-  }
   // Re-run the list command at the requested page and edit the message.
-  const reply = await renderListPage(cmd, page, state, filter);
+  const reply = await renderListPage(cmd, page, state);
   if (!reply) return true;
   try {
     await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
@@ -1669,11 +1912,19 @@ function renderListPage(cmd, page, state, filter = null) {
       header = '<b>🔥 PP/h Top</b>';
       break;
     case 'new': {
-      // Markets first seen (as rewarded) within [now - windowMs, now]. Slot
+      // Markets first seen (as rewarded) within [now - winH, now]. Slot
       // may be null for markets discovered after the most recent tick — we
       // synthesize one from the firstSeen snapshot so they still render.
-      const windowMs = Number.isFinite(filter?.windowMs) ? filter.windowMs : 24 * 3600 * 1000;
-      const cutoff = Date.now() - windowMs;
+      // Filter knobs (all optional): winH, minRate (PP/h floor), minRem
+      // (min remaining hours), sort ('t' firstSeen desc / 'p' rate desc).
+      const f = {
+        winH: Number.isFinite(filter?.winH) ? filter.winH : NEW_DEFAULT.winH,
+        minRate: Number.isFinite(filter?.minRate) ? filter.minRate : NEW_DEFAULT.minRate,
+        minRem: Number.isFinite(filter?.minRem) ? filter.minRem : NEW_DEFAULT.minRem,
+        sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
+      };
+      const cutoff = Date.now() - f.winH * 3600 * 1000;
+      const remCutoff = f.minRem > 0 ? Date.now() + f.minRem * 3600 * 1000 : null;
       const firstSeen = state.marketFirstSeen ?? {};
       rows = [];
       for (const [id, info] of Object.entries(firstSeen)) {
@@ -1685,15 +1936,29 @@ function renderListPage(cmd, page, state, filter = null) {
           lastHourlyRate: info?.rate ?? null,
           endMs: info?.endMs ?? null,
         };
+        const rate = Number.isFinite(synthSlot.lastHourlyRate) ? synthSlot.lastHourlyRate : 0;
+        if (f.minRate > 0 && rate < f.minRate) continue;
+        if (remCutoff != null) {
+          const endMs = Number.isFinite(synthSlot.endMs) ? synthSlot.endMs : null;
+          // No endMs means we can't verify — drop conservatively so the
+          // filter doesn't lie. (Most rewarded markets have an endMs.)
+          if (endMs == null || endMs < remCutoff) continue;
+        }
         rows.push({ id, slot: synthSlot, firstSeenMs: ms, hasSlot: !!slot });
       }
-      rows.sort((a, b) => b.firstSeenMs - a.firstSeenMs);
-      const windowLabel = windowMs <= 24 * 3600 * 1000
-        ? '24h'
-        : windowMs >= 24 * 3600 * 1000
-          ? `${(windowMs / (24 * 3600 * 1000)).toFixed(0)}d`
-          : `${(windowMs / 3600000).toFixed(0)}h`;
-      header = `<b>🆕 近 ${windowLabel} 新上奖励市场</b>`;
+      if (f.sort === 'p') {
+        const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
+        rows.sort((a, b) => (rateOf(b) - rateOf(a)) || (b.firstSeenMs - a.firstSeenMs));
+      } else {
+        rows.sort((a, b) => b.firstSeenMs - a.firstSeenMs);
+      }
+      const headerParts = [`<b>🆕 近 ${fmtHoursLabel(f.winH)} 新上奖励市场</b>`];
+      const filterTags = [];
+      if (f.minRate > 0) filterTags.push(`💰 ${fmtRateLabel(f.minRate)}`);
+      if (f.minRem > 0) filterTags.push(`⌛ ≥${fmtHoursLabel(f.minRem)}`);
+      if (f.sort !== NEW_DEFAULT.sort) filterTags.push(`📊 ${NEW_SORT_LABELS[f.sort]}`);
+      if (filterTags.length) headerParts.push(`<i>· ${filterTags.join(' · ')}</i>`);
+      header = headerParts.join(' ');
       extraFn = (_slot, row) => {
         const ago = fmtAgo(Date.now() - row.firstSeenMs);
         return row.hasSlot ? `🆕 ${ago}` : `🆕 ${ago} · ⏳ 等首抓`;
@@ -1911,7 +2176,12 @@ function renderListPage(cmd, page, state, filter = null) {
       dir: filter.dir ?? 'le',
     };
   } else if (cmd === 'new') {
-    kbOpts = { windowMs: filter?.windowMs ?? 24 * 3600 * 1000 };
+    kbOpts = {
+      winH: Number.isFinite(filter?.winH) ? filter.winH : NEW_DEFAULT.winH,
+      minRate: Number.isFinite(filter?.minRate) ? filter.minRate : NEW_DEFAULT.minRate,
+      minRem: Number.isFinite(filter?.minRem) ? filter.minRem : NEW_DEFAULT.minRem,
+      sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
+    };
   }
   if (!rows.length) {
     const kb = pageKeyboard(cmd, 0, 1, kbOpts);
@@ -2340,21 +2610,51 @@ async function handle(text, state, ctx, chatId, fromId) {
     }
 
     case '/new': {
-      // /new          → last 24h
-      // /new 7d|48h   → custom window (duration parsed; max 30d)
-      // /new <page>   → bare number = page index (1-indexed), keeps default 24h
+      // /new                 → wizard (interactive)
+      // /new 24h             → window arg (parses 30m / 2h / 7d, max 30d)
+      // /new 24h 500         → window + minRate
+      // /new 24h 500 6h      → window + minRate + minRem
+      // Bare numeric arg (no unit) = page index (1-indexed) for back-compat
+      // with the original /new release.
       const parts = arg.split(/\s+/).filter(Boolean);
-      let windowMs = 24 * 3600 * 1000;
+      if (!parts.length) {
+        return {
+          text: newWizardText(NEW_DEFAULT),
+          replyMarkup: newWizardKeyboard(NEW_DEFAULT),
+        };
+      }
+      const f = { ...NEW_DEFAULT };
       let page = 0;
+      const numericFields = ['winH', 'minRate', 'minRem'];
+      let fieldIdx = 0;
       for (const p of parts) {
         const dur = parseDuration(p);
-        if (dur != null && dur > 0) {
-          windowMs = Math.min(dur, 30 * 24 * 3600 * 1000);
-        } else if (/^\d+$/.test(p)) {
+        if (/^\d+$/.test(p) && p === parts[parts.length - 1] && parts.length > 1) {
+          // Trailing bare integer = page index when other args precede it.
           page = Math.max(0, Number(p) - 1);
+          continue;
+        }
+        if (dur != null && dur > 0) {
+          const hours = Math.round(dur / 3600000);
+          const key = numericFields[fieldIdx];
+          if (key === 'winH') f.winH = Math.min(720 * 24, Math.max(1, hours));
+          else if (key === 'minRem') f.minRem = Math.min(720 * 24, hours);
+          fieldIdx += 1;
+        } else if (/^\d+$/.test(p)) {
+          // Bare number — could be minRate (if we've already parsed window)
+          // or a page index (if it's the only arg).
+          if (fieldIdx === 0 && parts.length === 1) {
+            page = Math.max(0, Number(p) - 1);
+          } else {
+            const key = numericFields[fieldIdx];
+            if (key === 'winH') f.winH = Math.min(720 * 24, Math.max(1, Number(p)));
+            else if (key === 'minRate') f.minRate = Math.max(0, Number(p));
+            else if (key === 'minRem') f.minRem = Math.min(720 * 24, Number(p));
+            fieldIdx += 1;
+          }
         }
       }
-      const reply = renderListPage('new', page, state, { windowMs });
+      const reply = renderListPage('new', page, state, f);
       if (!reply) return '未知命令';
       return reply;
     }
@@ -2985,24 +3285,47 @@ export function startCommandLoop({ getState, persist, ctx }) {
               continue;
             }
             // Pending custom-threshold input: if the user just clicked
-            // "✏ 自定义" in a /stale or /all wizard, the next plain
-            // message in this chat from this user is interpreted as the
-            // new threshold. Numeric → apply + re-render wizard.
-            // Non-numeric → cancel + restore wizard at default (inf).
+            // "✏ 自定义" in a wizard, the next plain message in this chat
+            // from this user is interpreted as the value. Routes back to
+            // whichever wizard set the pending entry (kind field).
             const pending = consumePendingFilterInput(chatId, fromId);
             if (pending) {
               const trimmed = text.trim();
               const num = /^\d+$/.test(trimmed) ? Number(trimmed) : null;
-              const newThresh = num != null && num > 0 ? String(num) : 'inf';
-              try {
-                await editTelegramMessage(
-                  chatId,
-                  pending.messageId,
-                  listWizardText(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
-                  listWizardKeyboard(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
-                );
-              } catch (err) {
-                warn(`custom-thresh apply edit failed: ${err.message}`);
+              if (pending.kind === 'new') {
+                // /new wizard: pending.field tells us which knob to update.
+                // Non-numeric / 0 → revert that field to its default.
+                const next = {
+                  winH: pending.winH, minRate: pending.minRate, minRem: pending.minRem, sort: pending.sort,
+                };
+                if (pending.field === 'win') {
+                  next.winH = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.winH;
+                } else if (pending.field === 'rate') {
+                  next.minRate = (num != null && num > 0) ? num : NEW_DEFAULT.minRate;
+                } else if (pending.field === 'rem') {
+                  next.minRem = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.minRem;
+                }
+                try {
+                  await editTelegramMessage(
+                    chatId, pending.messageId,
+                    newWizardText(next), newWizardKeyboard(next),
+                  );
+                } catch (err) {
+                  warn(`new custom-input apply edit failed: ${err.message}`);
+                }
+              } else {
+                // /stale or /all wizard.
+                const newThresh = num != null && num > 0 ? String(num) : 'inf';
+                try {
+                  await editTelegramMessage(
+                    chatId,
+                    pending.messageId,
+                    listWizardText(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
+                    listWizardKeyboard(pending.kind, pending.bits, newThresh, pending.sort, pending.dir),
+                  );
+                } catch (err) {
+                  warn(`custom-thresh apply edit failed: ${err.message}`);
+                }
               }
               continue;
             }
@@ -3050,6 +3373,10 @@ export function startCommandLoop({ getState, persist, ctx }) {
             } else if (data.startsWith('stale:') || data.startsWith('all:')) {
               await handleListFilterCallback(data, { chatId, messageId, fromId, state, fullCtx }).catch((err) => {
                 warn('list filter error:', err.message);
+              });
+            } else if (data.startsWith('new:')) {
+              await handleNewWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }).catch((err) => {
+                warn('new wizard error:', err.message);
               });
             } else if (data.startsWith('page:')) {
               await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
