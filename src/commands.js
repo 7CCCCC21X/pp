@@ -741,22 +741,31 @@ const LIST_DIR_OP = { le: '≤', ge: '≥' };
 const LIST_KINDS = {
   stale: { title: '⏱ 停滞排名', defaultSort: 't' },
   all:   { title: '📋 全部市场', defaultSort: 'p' },
+  new:   { title: '🆕 新上市场', defaultSort: 't' },
 };
 
-// /new wizard — separate filter dimensions from /stale and /all:
-//   winH  — time window (hours) for "first seen within last N hours"
-//   minRate — PP/h floor (markets paying less are hidden)
+// /new wizard knobs (shares LIST_LEVELS / LIST_THRESHOLDS / LIST_DIRS with
+// /stale + /all for the depth filter):
+//   winH    — time window (hours) for "first seen within last N hours"
+//   minRate — PP/h floor; markets paying less are hidden
 //   minRem  — minimum remaining lifetime (hours); 0 = no limit
-//   sort    — t (上榜时间 desc), p (PP/h desc)
-// All four are encoded into the callback so /new pagination + filter
-// re-render preserve state. No orderbook refetch needed — all knobs work
-// off cached PP/h + endMs from the firstSeen snapshot.
+//   bits    — 6-char mask of selected b1/b2/b3 + a1/a2/a3 levels
+//   thresh  — sum threshold (USD) for selected levels; 'inf' = off
+//   dir     — 'le' (≤, 薄盘) or 'ge' (≥, 厚盘)
+//   sort    — 't' (上榜时间 desc), 'p' (PP/h desc)
+// When (bits has 1 selected) AND (thresh ≠ 'inf'), the depth filter is
+// active and 🚀 triggers a parallel orderbook refetch — same flow as
+// /stale and /all use. Other knobs work off cached PP/h + endMs alone.
 const NEW_WIN_PRESETS = ['24', '72', '168', '336', '720'];   // hours
 const NEW_RATE_PRESETS = ['0', '100', '500', '1000', '5000']; // PP/h
 const NEW_REM_PRESETS = ['0', '6', '24', '72', '168'];        // hours
 const NEW_SORTS = ['t', 'p'];
 const NEW_SORT_LABELS = { t: '上榜时间', p: 'PP/h' };
-const NEW_DEFAULT = { winH: 24, minRate: 0, minRem: 0, sort: 't' };
+const NEW_DEFAULT = {
+  winH: 24, minRate: 0, minRem: 0,
+  bits: '100100', thresh: 'inf', dir: 'le',
+  sort: 't',
+};
 
 function fmtHoursLabel(h) {
   const n = Number(h);
@@ -778,28 +787,53 @@ function isPositiveIntStr(s) {
 }
 
 function parseNewFilter(parts) {
-  // parts: [winH, minRate, minRem, sort] from callback string
+  // parts: [winH, minRate, minRem, bits, thresh, dir, sort]
   const winH = isPositiveIntStr(parts[0]) ? Number(parts[0]) : NEW_DEFAULT.winH;
   const minRate = isPositiveIntStr(parts[1]) ? Number(parts[1]) : NEW_DEFAULT.minRate;
   const minRem = isPositiveIntStr(parts[2]) ? Number(parts[2]) : NEW_DEFAULT.minRem;
-  const sort = NEW_SORTS.includes(parts[3]) ? parts[3] : NEW_DEFAULT.sort;
-  return { winH: Math.min(720 * 24, Math.max(1, winH)), minRate, minRem, sort };
+  const bits = /^[01]{6}$/.test(parts[3]) ? parts[3] : NEW_DEFAULT.bits;
+  const thresh = (LIST_THRESHOLDS.includes(parts[4]) || isCustomThresh(parts[4]))
+    ? parts[4] : NEW_DEFAULT.thresh;
+  const dir = LIST_DIRS.includes(parts[5]) ? parts[5] : NEW_DEFAULT.dir;
+  const sort = NEW_SORTS.includes(parts[6]) ? parts[6] : NEW_DEFAULT.sort;
+  return {
+    winH: Math.min(720 * 24, Math.max(1, winH)),
+    minRate, minRem, bits, thresh, dir, sort,
+  };
 }
 
 function newFilterToCbParts(f) {
-  return [String(f.winH), String(f.minRate), String(f.minRem), f.sort];
+  return [
+    String(f.winH), String(f.minRate), String(f.minRem),
+    f.bits, f.thresh, f.dir, f.sort,
+  ];
+}
+
+function newDepthFilterActive(f) {
+  // Depth filter triggers the orderbook refetch path. "Active" means at
+  // least one level is selected AND a threshold is set.
+  return f.thresh !== 'inf' && /1/.test(f.bits)
+    && (LIST_THRESHOLDS.includes(f.thresh) || isCustomThresh(f.thresh));
 }
 
 function newWizardText(f) {
+  const sel = parseStaleBits(f.bits);
+  const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]);
+  const dirOp = LIST_DIR_OP[f.dir] ?? '≤';
+  const threshLabel = f.thresh === 'inf' ? '不限' : `${dirOp}$${f.thresh}`;
+  const customThreshTag = isCustomThresh(f.thresh) ? ' <i>(自定义)</i>' : '';
   const lines = [
     `<b>🆕 新上市场 · 过滤设置</b>`,
     '',
     `⏰ 窗口: <b>${fmtHoursLabel(f.winH)}</b>`,
     `💰 最低 PP/h: <b>${fmtRateLabel(f.minRate)}</b>`,
     `⌛ 最短剩余: <b>${fmtHoursLabel(f.minRem)}</b>`,
+    `📐 累加层级: ${picked.length ? `<b>${picked.join(' + ')}</b>` : '<i>未选 (=不过滤盘口)</i>'}`,
+    `💵 盘口总额: <b>${threshLabel}</b>${customThreshTag}`,
     `📊 排序: <b>${NEW_SORT_LABELS[f.sort]}</b>`,
     '',
-    '<i>点 🚀 应用筛选;✏ 后回复数字可设自定义值(窗口/剩余为小时,PP/h 为数值)。</i>',
+    '<i>盘口过滤 (层级 + 总额) 开启时 🚀 会重抓 orderbook,可能耗时几十秒;</i>',
+    '<i>不开盘口过滤时 🚀 瞬间返回。✏ 后回复一个数字设置自定义值。</i>',
   ];
   return lines.join('\n');
 }
@@ -807,69 +841,89 @@ function newWizardText(f) {
 function newWizardKeyboard(f) {
   const cb = (action, override = {}) => {
     const merged = { ...f, ...override };
-    const [w, r, m, s] = newFilterToCbParts(merged);
-    return `new:${action}:${w}:${r}:${m}:${s}:0`;
+    const [w, r, m, b, t, d, s] = newFilterToCbParts(merged);
+    return `new:${action}:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`;
   };
+  const sel = parseStaleBits(f.bits);
   const winMark = (h) => Number(h) === f.winH ? `✅ ${fmtHoursLabel(h)}` : fmtHoursLabel(h);
   const rateMark = (r) => Number(r) === f.minRate ? `✅ ${fmtRateLabel(r)}` : fmtRateLabel(r);
   const remMark = (h) => Number(h) === f.minRem ? `✅ ${fmtHoursLabel(h)}` : fmtHoursLabel(h);
   const sortMark = (s) => s === f.sort ? `✅ ${NEW_SORT_LABELS[s]}` : NEW_SORT_LABELS[s];
+  const mark = (on, label) => on ? `✅ ${label}` : `⬜ ${label}`;
+  const threshMark = (t) => t === f.thresh
+    ? `✅ ${staleThreshLabel(t, f.dir)}`
+    : staleThreshLabel(t, f.dir);
+  const dirMark = (d) => d === f.dir ? `✅ ${LIST_DIR_LABELS[d]}` : LIST_DIR_LABELS[d];
   const isCustomWin = !NEW_WIN_PRESETS.includes(String(f.winH));
   const isCustomRate = !NEW_RATE_PRESETS.includes(String(f.minRate));
   const isCustomRem = !NEW_REM_PRESETS.includes(String(f.minRem));
   return {
     inline_keyboard: [
       [{ text: '— ⏰ 窗口 —', callback_data: 'page:noop' }],
-      [
-        ...NEW_WIN_PRESETS.slice(0, 3).map((h) => ({
-          text: winMark(h),
-          callback_data: cb('set', { winH: Number(h) }),
-        })),
-      ],
+      NEW_WIN_PRESETS.slice(0, 3).map((h) => ({
+        text: winMark(h), callback_data: cb('set', { winH: Number(h) }),
+      })),
       [
         ...NEW_WIN_PRESETS.slice(3).map((h) => ({
-          text: winMark(h),
-          callback_data: cb('set', { winH: Number(h) }),
+          text: winMark(h), callback_data: cb('set', { winH: Number(h) }),
         })),
         {
           text: isCustomWin ? `✅ ✏ (${fmtHoursLabel(f.winH)})` : '✏ 自定义…',
           callback_data: cb('custom-win'),
         },
       ],
-      [{ text: '— 💰 最低 PP/h —', callback_data: 'page:noop' }],
-      [
-        ...NEW_RATE_PRESETS.slice(0, 3).map((r) => ({
-          text: rateMark(r),
-          callback_data: cb('set', { minRate: Number(r) }),
-        })),
-      ],
+      [{ text: '— 💰 最低 PP/h · ⌛ 最短剩余 —', callback_data: 'page:noop' }],
+      NEW_RATE_PRESETS.slice(0, 3).map((r) => ({
+        text: rateMark(r), callback_data: cb('set', { minRate: Number(r) }),
+      })),
       [
         ...NEW_RATE_PRESETS.slice(3).map((r) => ({
-          text: rateMark(r),
-          callback_data: cb('set', { minRate: Number(r) }),
+          text: rateMark(r), callback_data: cb('set', { minRate: Number(r) }),
         })),
         {
           text: isCustomRate ? `✅ ✏ (${fmtRateLabel(f.minRate)})` : '✏ 自定义…',
           callback_data: cb('custom-rate'),
         },
       ],
-      [{ text: '— ⌛ 最短剩余 —', callback_data: 'page:noop' }],
-      [
-        ...NEW_REM_PRESETS.slice(0, 3).map((h) => ({
-          text: remMark(h),
-          callback_data: cb('set', { minRem: Number(h) }),
-        })),
-      ],
+      NEW_REM_PRESETS.slice(0, 3).map((h) => ({
+        text: remMark(h), callback_data: cb('set', { minRem: Number(h) }),
+      })),
       [
         ...NEW_REM_PRESETS.slice(3).map((h) => ({
-          text: remMark(h),
-          callback_data: cb('set', { minRem: Number(h) }),
+          text: remMark(h), callback_data: cb('set', { minRem: Number(h) }),
         })),
         {
           text: isCustomRem ? `✅ ✏ (${fmtHoursLabel(f.minRem)})` : '✏ 自定义…',
           callback_data: cb('custom-rem'),
         },
       ],
+      [{ text: '— 📐 盘口层级 (会触发 orderbook 重抓) —', callback_data: 'page:noop' }],
+      [
+        { text: mark(sel.b1, '买1'), callback_data: cb('set', { bits: flipStaleBit(f.bits, 'b1') }) },
+        { text: mark(sel.b2, '买2'), callback_data: cb('set', { bits: flipStaleBit(f.bits, 'b2') }) },
+        { text: mark(sel.b3, '买3'), callback_data: cb('set', { bits: flipStaleBit(f.bits, 'b3') }) },
+      ],
+      [
+        { text: mark(sel.a1, '卖1'), callback_data: cb('set', { bits: flipStaleBit(f.bits, 'a1') }) },
+        { text: mark(sel.a2, '卖2'), callback_data: cb('set', { bits: flipStaleBit(f.bits, 'a2') }) },
+        { text: mark(sel.a3, '卖3'), callback_data: cb('set', { bits: flipStaleBit(f.bits, 'a3') }) },
+      ],
+      [
+        { text: threshMark('inf'), callback_data: cb('set', { thresh: 'inf' }) },
+        { text: threshMark('50'), callback_data: cb('set', { thresh: '50' }) },
+        { text: threshMark('100'), callback_data: cb('set', { thresh: '100' }) },
+        { text: threshMark('200'), callback_data: cb('set', { thresh: '200' }) },
+      ],
+      [
+        { text: threshMark('500'), callback_data: cb('set', { thresh: '500' }) },
+        { text: threshMark('1000'), callback_data: cb('set', { thresh: '1000' }) },
+        { text: threshMark('5000'), callback_data: cb('set', { thresh: '5000' }) },
+        {
+          text: isCustomThresh(f.thresh) ? `✅ ✏ ($${f.thresh})` : '✏ 自定义…',
+          callback_data: cb('custom-thresh'),
+        },
+      ],
+      LIST_DIRS.map((d) => ({ text: dirMark(d), callback_data: cb('set', { dir: d }) })),
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
       NEW_SORTS.map((s) => ({ text: sortMark(s), callback_data: cb('set', { sort: s }) })),
       [
@@ -881,11 +935,12 @@ function newWizardKeyboard(f) {
 }
 
 function newFilterIsActive(f) {
-  // "Active" = anything other than the defaults that would change visible
-  // rows. Pure sort changes also count as active so 🚀 reflects the change.
   return f.winH !== NEW_DEFAULT.winH
     || f.minRate !== NEW_DEFAULT.minRate
     || f.minRem !== NEW_DEFAULT.minRem
+    || f.bits !== NEW_DEFAULT.bits
+    || f.thresh !== NEW_DEFAULT.thresh
+    || f.dir !== NEW_DEFAULT.dir
     || f.sort !== NEW_DEFAULT.sort;
 }
 
@@ -1037,7 +1092,7 @@ const STALE_PROGRESS_EDIT_MIN_MS = 900;
 const STALE_PER_MARKET_TIMEOUT_MS = 20_000;
 const STALE_REFETCH_DEADLINE_MS = 5 * 60 * 1000;
 
-async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh }) {
+async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh, cancelCb }) {
   const { getOrderbook } = await import('./predict.js');
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const total = ids.length;
@@ -1068,7 +1123,10 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
   };
 
   const cancelKb = {
-    inline_keyboard: [[{ text: '⏳ 取消（完成后忽略）', callback_data: `${kind}:cancel:${bits}:${thresh}:0` }]],
+    inline_keyboard: [[{
+      text: '⏳ 取消（完成后忽略）',
+      callback_data: cancelCb ?? `${kind}:cancel:${bits}:${thresh}:0`,
+    }]],
   };
 
   // Initial paint so user sees the bar immediately
@@ -1395,11 +1453,15 @@ export const handleStaleFilterCallback = handleListFilterCallback;
 //          run / cancel.
 export async function handleNewWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
   if (!data.startsWith('new:')) return false;
+  // Callback shape: new:<action>:<winH>:<minRate>:<minRem>:<bits>:<thresh>:<dir>:<sort>:<page>
+  // (10 parts) — older 7-part callbacks from pre-depth-filter releases still
+  // parse via parseNewFilter's default fallbacks.
   const parts = data.split(':');
-  if (parts.length < 7) return true;
-  const [, action, winStr, rateStr, remStr, sortStr, pageStr] = parts;
-  const f = parseNewFilter([winStr, rateStr, remStr, sortStr]);
-  const page = Math.max(0, Number(pageStr) || 0);
+  if (parts.length < 3) return true;
+  const action = parts[1];
+  // Slot positions: parts[2..8] = [winH, minRate, minRem, bits, thresh, dir, sort]; parts[9] = page.
+  const f = parseNewFilter(parts.slice(2, 9));
+  const page = Math.max(0, Number(parts[9]) || 0);
 
   if (action === 'wizard' || action === 'set') {
     try {
@@ -1412,30 +1474,37 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
     return true;
   }
 
-  if (action === 'custom-win' || action === 'custom-rate' || action === 'custom-rem') {
+  if (action === 'custom-win' || action === 'custom-rate' || action === 'custom-rem' || action === 'custom-thresh') {
     // Stash pending-input state; next plain message from this user in this
     // chat is parsed as the value. Field tells the input handler which knob
     // to update.
-    const field = action.replace('custom-', ''); // 'win' | 'rate' | 'rem'
+    const field = action.replace('custom-', ''); // 'win' | 'rate' | 'rem' | 'thresh'
     setPendingFilterInput(chatId, fromId, {
-      kind: 'new', field, winH: f.winH, minRate: f.minRate, minRem: f.minRem, sort: f.sort, messageId,
+      kind: 'new', field, messageId,
+      winH: f.winH, minRate: f.minRate, minRem: f.minRem,
+      bits: f.bits, thresh: f.thresh, dir: f.dir, sort: f.sort,
     });
-    const unit = field === 'rate' ? 'PP/h 数值(如 750)' : '小时(如 36, 最长 720)';
+    let unit;
+    if (field === 'rate') unit = 'PP/h 数值(如 750)';
+    else if (field === 'thresh') unit = 'USD 金额(如 350)';
+    else unit = '小时(如 36, 最长 720)';
     try {
+      const dirOp = LIST_DIR_OP[f.dir] ?? '≤';
+      const threshLabel = f.thresh === 'inf' ? '不限' : `${dirOp}$${f.thresh}`;
       const hint = [
         '<b>🆕 新上市场 · 等待自定义值…</b>',
         '',
         `请在这个 chat <b>回复一个数字</b>(${unit})。`,
         '',
-        `当前: ⏰ ${fmtHoursLabel(f.winH)} · 💰 ${fmtRateLabel(f.minRate)} · ⌛ ${fmtHoursLabel(f.minRem)} · 📊 ${NEW_SORT_LABELS[f.sort]}`,
+        `当前: ⏰ ${fmtHoursLabel(f.winH)} · 💰 ${fmtRateLabel(f.minRate)} · ⌛ ${fmtHoursLabel(f.minRem)} · 💵 ${threshLabel} · 📊 ${NEW_SORT_LABELS[f.sort]}`,
         '',
         '<i>5 分钟内有效。想取消就发任何非数字。</i>',
       ].join('\n');
-      const [w, r, m, s] = newFilterToCbParts(f);
+      const [w, r, m, b, t, d, s] = newFilterToCbParts(f);
       const cancelKb = {
         inline_keyboard: [[{
           text: '✖ 取消(回到向导)',
-          callback_data: `new:wizard:${w}:${r}:${m}:${s}:0`,
+          callback_data: `new:wizard:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
         }]],
       };
       await editTelegramMessage(chatId, messageId, hint, cancelKb);
@@ -1453,15 +1522,115 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
     return true;
   }
 
-  if (action === 'page' || action === 'run') {
+  if (action === 'page') {
     const reply = renderListPage('new', page, state, f);
     if (reply) {
       try {
         await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
       } catch (err) {
         if (!/message is not modified/i.test(err.message ?? '')) {
-          warn('new page/run edit failed:', err.message);
+          warn('new page edit failed:', err.message);
         }
+      }
+    }
+    return true;
+  }
+
+  if (action === 'run') {
+    // No depth filter → render straight from cached data. Window + minRate
+    // + minRem + sort all work off firstSeen snapshot + slot, no refetch.
+    if (!newDepthFilterActive(f)) {
+      const reply = renderListPage('new', 0, state, f);
+      if (reply) {
+        try {
+          await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+        } catch (err) {
+          if (!/message is not modified/i.test(err.message ?? '')) {
+            warn('new sort-only render failed:', err.message);
+          }
+        }
+      }
+      return true;
+    }
+    // Depth filter active — refetch orderbooks for markets in the time
+    // window only (narrower than /stale which refetches everything). Then
+    // render with the depth filter applied via renderListPage.
+    const cutoff = Date.now() - f.winH * 3600 * 1000;
+    const firstSeen = state.marketFirstSeen ?? {};
+    const ids = Object.entries(firstSeen)
+      .filter(([, info]) => {
+        const ms = typeof info === 'number' ? info : info?.ms;
+        return Number.isFinite(ms) && ms > 0 && ms >= cutoff;
+      })
+      .map(([id]) => id)
+      .filter((id) => state.markets[id] != null); // need slot for orderbookCache
+    if (!ids.length) {
+      try {
+        await editTelegramMessage(
+          chatId, messageId,
+          `<b>🆕 新上市场</b>\n\n近 ${fmtHoursLabel(f.winH)} 没有可重抓的新市场(可能都还在等首抓)。`,
+          undefined,
+        );
+      } catch {}
+      return true;
+    }
+    const [w, r, m, b, t, d, s] = newFilterToCbParts(f);
+    const refetch = await refetchOrderbooksWithProgress({
+      ids, state, chatId, messageId,
+      kind: 'new', bits: f.bits, thresh: f.thresh,
+      cancelCb: `new:cancel:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
+    });
+    try {
+      const tagsMid = [];
+      if (refetch.timedOut) tagsMid.push(`${refetch.timedOut} 超时`);
+      if (refetch.failed) tagsMid.push(`${refetch.failed} 错误`);
+      const tail = tagsMid.length ? ` · ${tagsMid.join(' · ')} 跳过` : '';
+      await editTelegramMessage(
+        chatId, messageId,
+        `<b>🆕 新上市场 · 重抓完成</b>\n\n进度 ${refetch.results.size + (refetch.timedOut ?? 0) + (refetch.failed ?? 0)} / ${ids.length}${tail}\n\n<i>正在筛选 + 排序 + 渲染…</i>`,
+        undefined,
+      );
+    } catch {}
+    if (fullCtx?.persist) {
+      fullCtx.persist().catch((err) => warn(`new persist failed:`, err.message));
+    }
+    let reply;
+    try {
+      reply = renderListPage('new', 0, state, f);
+    } catch (err) {
+      warn(`new renderListPage threw:`, err.message);
+      try {
+        await editTelegramMessage(
+          chatId, messageId,
+          `<b>⚠ 渲染失败</b>\n\n重抓本身完成 (${ids.length} 个),但生成列表时报错: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /new 查看(数据已存)。`,
+          undefined,
+        );
+      } catch {}
+      return true;
+    }
+    if (reply) {
+      const tags = [];
+      if (refetch.timedOut) tags.push(`${refetch.timedOut} 超时`);
+      if (refetch.failed) tags.push(`${refetch.failed} 错误`);
+      const prefix = tags.length
+        ? `<i>⚠ 重抓: ${tags.join(' · ')} 跳过 (这些市场不会出现在筛选结果里)</i>\n\n`
+        : '';
+      const editPromise = editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
+      const timeoutPromise = new Promise((_, rej) => setTimeout(
+        () => rej(new Error('post-refetch edit timeout (30s)')),
+        30_000,
+      ));
+      try {
+        await Promise.race([editPromise, timeoutPromise]);
+      } catch (err) {
+        warn(`new post-refetch render failed:`, err.message);
+        try {
+          await editTelegramMessage(
+            chatId, messageId,
+            `<b>⚠ 渲染超时</b>\n\n重抓完成 (${ids.length} 个),但 Telegram edit 失败: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /new 查看。`,
+            undefined,
+          );
+        } catch {}
       }
     }
     return true;
@@ -1486,7 +1655,7 @@ const HELP = [
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
-  '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 调窗口/最低 PP/h/最短剩余/排序，或 /new 48h 500 6h）',
+  '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 可调窗口/最低 PP/h/最短剩余/盘口层级×总额/排序；开盘口过滤会重抓 orderbook）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -1817,20 +1986,25 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   const defaultSort = LIST_KINDS[cmd]?.defaultSort ?? 't';
   const sort = LIST_SORTS.includes(opts.sort) ? opts.sort : defaultSort;
   const dir = LIST_DIRS.includes(opts.dir) ? opts.dir : 'le';
-  // /new encodes its filter (winH, minRate, minRem, sort) so pagination
-  // preserves the active filter without needing per-message state.
+  // /new encodes its full filter (winH, minRate, minRem, bits, thresh, dir,
+  // sort) so pagination preserves the active filter without per-message
+  // state.
   const isNewCmd = cmd === 'new';
   const newF = {
     winH: Number.isFinite(opts.winH) ? opts.winH : NEW_DEFAULT.winH,
     minRate: Number.isFinite(opts.minRate) ? opts.minRate : NEW_DEFAULT.minRate,
     minRem: Number.isFinite(opts.minRem) ? opts.minRem : NEW_DEFAULT.minRem,
+    bits: /^[01]{6}$/.test(opts.bits) ? opts.bits : NEW_DEFAULT.bits,
+    thresh: (LIST_THRESHOLDS.includes(opts.thresh) || isCustomThresh(opts.thresh))
+      ? opts.thresh : NEW_DEFAULT.thresh,
+    dir: LIST_DIRS.includes(opts.dir) ? opts.dir : NEW_DEFAULT.dir,
     sort: NEW_SORTS.includes(opts.sort) ? opts.sort : NEW_DEFAULT.sort,
   };
   const pageCb = (p) => {
     if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${p}`;
     if (isNewCmd) {
-      const [w, r, m, s] = newFilterToCbParts(newF);
-      return `new:page:${w}:${r}:${m}:${s}:${p}`;
+      const [w, r, m, b, t, d, s] = newFilterToCbParts(newF);
+      return `new:page:${w}:${r}:${m}:${b}:${t}:${d}:${s}:${p}`;
     }
     return `page:${cmd}:${p}`;
   };
@@ -1858,11 +2032,17 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
     if (newF.winH !== NEW_DEFAULT.winH) tagBits.push(fmtHoursLabel(newF.winH));
     if (newF.minRate > 0) tagBits.push(fmtRateLabel(newF.minRate));
     if (newF.minRem > 0) tagBits.push(`剩${fmtHoursLabel(newF.minRem)}`);
+    if (newDepthFilterActive(newF)) {
+      const sel = parseStaleBits(newF.bits);
+      const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
+      const op = LIST_DIR_OP[newF.dir] ?? '≤';
+      tagBits.push(`${picked} ${op} $${newF.thresh}`);
+    }
     if (newF.sort !== NEW_DEFAULT.sort) tagBits.push(NEW_SORT_LABELS[newF.sort]);
-    const [w, r, m, s] = newFilterToCbParts(newF);
+    const [w, r, m, b, t, d, s] = newFilterToCbParts(newF);
     rows.push([{
       text: active ? `🎚 调整 (${tagBits.join(' · ')})` : '🎚 过滤 / 排序',
-      callback_data: `new:wizard:${w}:${r}:${m}:${s}:0`,
+      callback_data: `new:wizard:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
     }]);
   }
   return rows.length ? { inline_keyboard: rows } : undefined;
@@ -1915,16 +2095,27 @@ function renderListPage(cmd, page, state, filter = null) {
       // Markets first seen (as rewarded) within [now - winH, now]. Slot
       // may be null for markets discovered after the most recent tick — we
       // synthesize one from the firstSeen snapshot so they still render.
-      // Filter knobs (all optional): winH, minRate (PP/h floor), minRem
-      // (min remaining hours), sort ('t' firstSeen desc / 'p' rate desc).
+      // Knobs:
+      //   winH / minRate / minRem    — pure metadata filters, no refetch
+      //   bits + thresh + dir        — depth-sum filter; requires recentBook
+      //                                (populated by the wizard's refetch)
+      //   sort                       — 't' firstSeen desc / 'p' PP/h desc
       const f = {
         winH: Number.isFinite(filter?.winH) ? filter.winH : NEW_DEFAULT.winH,
         minRate: Number.isFinite(filter?.minRate) ? filter.minRate : NEW_DEFAULT.minRate,
         minRem: Number.isFinite(filter?.minRem) ? filter.minRem : NEW_DEFAULT.minRem,
+        bits: typeof filter?.bits === 'string' && /^[01]{6}$/.test(filter.bits)
+          ? filter.bits : NEW_DEFAULT.bits,
+        thresh: (LIST_THRESHOLDS.includes(filter?.thresh) || isCustomThresh(filter?.thresh))
+          ? filter.thresh : NEW_DEFAULT.thresh,
+        dir: LIST_DIRS.includes(filter?.dir) ? filter.dir : NEW_DEFAULT.dir,
         sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
       };
       const cutoff = Date.now() - f.winH * 3600 * 1000;
       const remCutoff = f.minRem > 0 ? Date.now() + f.minRem * 3600 * 1000 : null;
+      const depthOn = newDepthFilterActive(f);
+      const sel = depthOn ? parseStaleBits(f.bits) : null;
+      const threshUsd = depthOn && f.thresh !== 'inf' ? Number(f.thresh) : null;
       const firstSeen = state.marketFirstSeen ?? {};
       rows = [];
       for (const [id, info] of Object.entries(firstSeen)) {
@@ -1944,7 +2135,19 @@ function renderListPage(cmd, page, state, filter = null) {
           // filter doesn't lie. (Most rewarded markets have an endMs.)
           if (endMs == null || endMs < remCutoff) continue;
         }
-        rows.push({ id, slot: synthSlot, firstSeenMs: ms, hasSlot: !!slot });
+        let sumUsd = null;
+        if (depthOn) {
+          // Need recentBook — populated by the wizard's refetch. Markets
+          // discovered after the most recent refetch (or that errored out
+          // mid-refetch) drop here so the result list always reflects the
+          // chosen threshold honestly.
+          if (!slot?.recentBook) continue;
+          sumUsd = sumLevels(slot.recentBook, sel);
+          if (sumUsd == null) continue;
+          const passes = f.dir === 'ge' ? sumUsd >= threshUsd : sumUsd <= threshUsd;
+          if (!passes) continue;
+        }
+        rows.push({ id, slot: synthSlot, firstSeenMs: ms, hasSlot: !!slot, sumUsd });
       }
       if (f.sort === 'p') {
         const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
@@ -1956,12 +2159,19 @@ function renderListPage(cmd, page, state, filter = null) {
       const filterTags = [];
       if (f.minRate > 0) filterTags.push(`💰 ${fmtRateLabel(f.minRate)}`);
       if (f.minRem > 0) filterTags.push(`⌛ ≥${fmtHoursLabel(f.minRem)}`);
+      if (depthOn) {
+        const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
+        const op = LIST_DIR_OP[f.dir] ?? '≤';
+        filterTags.push(`📐 ${picked} ${op} $${f.thresh}`);
+      }
       if (f.sort !== NEW_DEFAULT.sort) filterTags.push(`📊 ${NEW_SORT_LABELS[f.sort]}`);
       if (filterTags.length) headerParts.push(`<i>· ${filterTags.join(' · ')}</i>`);
       header = headerParts.join(' ');
       extraFn = (_slot, row) => {
         const ago = fmtAgo(Date.now() - row.firstSeenMs);
-        return row.hasSlot ? `🆕 ${ago}` : `🆕 ${ago} · ⏳ 等首抓`;
+        const tag = row.hasSlot ? `🆕 ${ago}` : `🆕 ${ago} · ⏳ 等首抓`;
+        if (depthOn && row.sumUsd != null) return `${tag} · sum $${row.sumUsd.toFixed(0)}`;
+        return tag;
       };
       break;
     }
@@ -2180,6 +2390,10 @@ function renderListPage(cmd, page, state, filter = null) {
       winH: Number.isFinite(filter?.winH) ? filter.winH : NEW_DEFAULT.winH,
       minRate: Number.isFinite(filter?.minRate) ? filter.minRate : NEW_DEFAULT.minRate,
       minRem: Number.isFinite(filter?.minRem) ? filter.minRem : NEW_DEFAULT.minRem,
+      bits: /^[01]{6}$/.test(filter?.bits) ? filter.bits : NEW_DEFAULT.bits,
+      thresh: (LIST_THRESHOLDS.includes(filter?.thresh) || isCustomThresh(filter?.thresh))
+        ? filter.thresh : NEW_DEFAULT.thresh,
+      dir: LIST_DIRS.includes(filter?.dir) ? filter.dir : NEW_DEFAULT.dir,
       sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
     };
   }
@@ -3296,7 +3510,11 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 // /new wizard: pending.field tells us which knob to update.
                 // Non-numeric / 0 → revert that field to its default.
                 const next = {
-                  winH: pending.winH, minRate: pending.minRate, minRem: pending.minRem, sort: pending.sort,
+                  winH: pending.winH, minRate: pending.minRate, minRem: pending.minRem,
+                  bits: pending.bits ?? NEW_DEFAULT.bits,
+                  thresh: pending.thresh ?? NEW_DEFAULT.thresh,
+                  dir: pending.dir ?? NEW_DEFAULT.dir,
+                  sort: pending.sort,
                 };
                 if (pending.field === 'win') {
                   next.winH = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.winH;
@@ -3304,6 +3522,8 @@ export function startCommandLoop({ getState, persist, ctx }) {
                   next.minRate = (num != null && num > 0) ? num : NEW_DEFAULT.minRate;
                 } else if (pending.field === 'rem') {
                   next.minRem = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.minRem;
+                } else if (pending.field === 'thresh') {
+                  next.thresh = (num != null && num > 0) ? String(num) : NEW_DEFAULT.thresh;
                 }
                 try {
                   await editTelegramMessage(
