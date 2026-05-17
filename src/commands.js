@@ -62,6 +62,7 @@ const PRIVATE_MENU = [
   { command: 'diagdiscover', description: '对比 REST/GraphQL 两个发现源的数量' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
+  { command: 'hourly', description: '触发整点摘要(每小时自动发,可手动加发一次)' },
   { command: 'config', description: '查看当前监控条件 / 阈值 / 过滤器' },
   { command: 'activate', description: '在群里激活机器人（仅 admin）' },
   { command: 'whitelist', description: '管理白名单（仅 admin）' },
@@ -1787,6 +1788,7 @@ const HELP = [
   '/diagdiscover — 对比 REST/GraphQL 两个发现源（监控数量看着不对时用）',
   '/refresh — 立即刷新 PP/h 缓存',
   '/digest — 立即发送 24h 摘要',
+  '/hourly — 立即触发一次整点摘要(默认每 UTC 整点自动发)',
   '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
   '',
   '<b>👥 权限 / 群组</b>',
@@ -2951,6 +2953,17 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/digest': {
       ctx.requestDigest();
       return '已触发 24 小时摘要。';
+    }
+
+    case '/hourly': {
+      // Manually trigger the hourly pulse — bypasses the wall-clock-hour
+      // gate but reuses the same render. Useful for "I want a snapshot
+      // right now without waiting for the top of the hour".
+      if (typeof ctx.requestHourlyDigest === 'function') {
+        ctx.requestHourlyDigest();
+        return '已触发整点摘要(下一 tick 发出)。';
+      }
+      return '当前进程不支持手动触发整点摘要。';
     }
 
     case '/top':

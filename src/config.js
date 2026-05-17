@@ -182,6 +182,10 @@ export const config = {
   historyKeepDays: num('HISTORY_KEEP_DAYS', 14),
   digestEnabled: bool('DAILY_DIGEST_ENABLED', true),
   digestHourUtc: num('DAILY_DIGEST_HOUR_UTC', 12),
+  // Hourly pulse — compact "what's happening in the pool this hour" message
+  // sent once per UTC clock-hour. Aimed at "save me from polling each
+  // market manually" use; mute via env or /hourlydigest off.
+  hourlyDigestEnabled: bool('HOURLY_DIGEST_ENABLED', true),
 
   stateFile: process.env.STATE_FILE ?? './state.json',
   graphqlUrl: process.env.GRAPHQL_URL ?? 'https://graphql.predict.fun/graphql',

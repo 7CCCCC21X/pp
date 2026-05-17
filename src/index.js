@@ -4,7 +4,7 @@ import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats, recor
 import { checkMarket, flushChatDigests } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
-import { sendDailyDigest, shouldSendDigest } from './digest.js';
+import { sendDailyDigest, shouldSendDigest, sendHourlyDigest, shouldSendHourlyDigest } from './digest.js';
 import { broadcastTelegramMessage } from './telegram.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[main]', ...args);
@@ -12,6 +12,7 @@ const warn = (...args) => console.warn(new Date().toISOString(), '[main]', ...ar
 
 let pendingDiscovery = false;
 let pendingDigest = false;
+let pendingHourlyDigest = false;
 
 // Serialize state writes so the command loop and the tick loop don't clobber.
 // Each caller awaits its own save and sees its own failure (so command
@@ -59,6 +60,25 @@ async function maybeDigest(state) {
     state.lastDigestSentAt = Date.now();
   } catch (err) {
     warn('digest failed:', err.message);
+  }
+}
+
+async function maybeHourlyDigest(state) {
+  if (!pendingHourlyDigest && !shouldSendHourlyDigest(state)) return;
+  // Record the boundary BEFORE sending so a failed send still advances
+  // the lastHourlyDigestAt cursor — otherwise a flaky push would cause
+  // us to retry every tick until success, potentially spamming.
+  const now = new Date();
+  const boundary = Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+    now.getUTCHours(), 0, 0, 0,
+  );
+  pendingHourlyDigest = false;
+  state.lastHourlyDigestAt = boundary;
+  try {
+    await sendHourlyDigest(state);
+  } catch (err) {
+    warn('hourly digest failed:', err.message);
   }
 }
 
@@ -123,6 +143,7 @@ async function tick(state) {
     if (!ids.includes(id)) delete state.markets[id];
   }
   await maybeDigest(state);
+  await maybeHourlyDigest(state);
   await flushChatDigests(state).catch((err) => warn('digest flush failed:', err.message));
   await persist(state);
 }
@@ -154,6 +175,9 @@ async function main() {
       },
       requestDigest: () => {
         pendingDigest = true;
+      },
+      requestHourlyDigest: () => {
+        pendingHourlyDigest = true;
       },
     },
   });

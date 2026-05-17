@@ -50,3 +50,29 @@ test('flushChatDigests: skips chats without intervalMs / empty queue', async () 
   assert.equal(state.chatDigests['222'].queue.length, 0);
   assert.equal(state.chatDigests['333'].queue.length, 1, 'recent flush → leave queue alone');
 });
+
+const { shouldSendHourlyDigest } = await import('../src/digest.js');
+
+test('shouldSendHourlyDigest: fires when lastHourlyDigestAt is older than current hour boundary', () => {
+  // Fresh state (lastHourlyDigestAt=0) → always due, regardless of clock.
+  assert.equal(shouldSendHourlyDigest({ lastHourlyDigestAt: 0 }), true);
+});
+
+test('shouldSendHourlyDigest: suppressed if already sent for this hour', () => {
+  // Pin lastHourlyDigestAt to the current UTC hour boundary → no second send.
+  const now = new Date();
+  const boundary = Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+    now.getUTCHours(), 0, 0, 0,
+  );
+  assert.equal(shouldSendHourlyDigest({ lastHourlyDigestAt: boundary }), false);
+});
+
+test('shouldSendHourlyDigest: fires when last send was an hour ago', () => {
+  const now = new Date();
+  const prevBoundary = Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+    now.getUTCHours() - 1, 0, 0, 0,
+  );
+  assert.equal(shouldSendHourlyDigest({ lastHourlyDigestAt: prevBoundary }), true);
+});

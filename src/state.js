@@ -20,6 +20,7 @@ function emptyState() {
     marketFirstSeen: {},  // marketId -> { ms, title, rate, endMs } — first time we saw it as rewarded (powers /new)
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
+    lastHourlyDigestAt: 0,
     lastHistoryPruneAt: 0,
     telegramOffset: 0,
     filters: {},
