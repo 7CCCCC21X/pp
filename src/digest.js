@@ -82,16 +82,26 @@ export function shouldSendDigest(state) {
   return now.getUTCHours() >= config.digestHourUtc && todayKey !== lastKey;
 }
 
-// One-hour pulse. Compact "what just happened" message so the user
-// doesn't have to flip through /top, /gaps, /new manually every hour.
-// Triggered on the wall-clock hour boundary (top of hour, UTC). Window
-// is [previous hour, current hour) so each pulse covers exactly 1h
-// without overlap and aligns nicely with "the hour just ending".
+function fmtElapsedCompact(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '?';
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h${m}m`;
+}
+
+// One-hour pulse. Primary content is the **stall-alerts roll-up** —
+// every market whose 订单簿停滞超过 N 小时 alert fired in the just-
+// finished hour gets one compact row (id · title · stall · PP/h ·
+// depth) so the user has a single "what's worth grabbing right now"
+// list instead of N individual alert messages. New-market sightings
+// + pool snapshot ride along as secondary context.
+// Window is [previous UTC hour, current UTC hour).
 export async function sendHourlyDigest(state) {
   const chatIds = broadcastChats(state);
   if (!chatIds.length) return;
   const now = new Date();
-  // Window end = current top-of-hour, start = 1h before.
   const endMs = Date.UTC(
     now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
     now.getUTCHours(), 0, 0, 0,
@@ -100,18 +110,64 @@ export async function sendHourlyDigest(state) {
   const records = await readHistorySince(startMs).then(
     (recs) => recs.filter((r) => r.ts < endMs),
   );
-  const summary = summarize24h(records);
-  summary.sort((a, b) => (b.ppEarned ?? 0) - (a.ppEarned ?? 0));
+
+  // Collect stall alerts that fired in this hour. One row per market
+  // (max elapsed if duplicates). Joined against live state.markets to
+  // render current PP/h + depth + reward-zone status — fresher than
+  // whatever the alert snapshot captured.
+  const stallByMarket = new Map();
+  for (const r of records) {
+    if (r.event !== 'alert' || r.kind !== 'stall') continue;
+    const id = String(r.marketId ?? '');
+    if (!id) continue;
+    const prev = stallByMarket.get(id);
+    const elapsed = Number.isFinite(r.elapsedMs) ? r.elapsedMs : 0;
+    if (!prev || elapsed > prev.elapsedMs) {
+      stallByMarket.set(id, {
+        id,
+        title: r.title ?? prev?.title ?? null,
+        elapsedMs: elapsed,
+        ts: r.ts,
+      });
+    }
+  }
+  // Enrich with live data — current PP/h, depth, gap status.
+  const stallRows = [];
+  for (const m of stallByMarket.values()) {
+    const slot = state.markets?.[m.id] ?? null;
+    const rate = Number.isFinite(slot?.lastHourlyRate) ? slot.lastHourlyRate : 0;
+    const topUsd = Number.isFinite(slot?.lastTopUsd) && slot.lastTopUsd > 0 ? slot.lastTopUsd : null;
+    const z = slot?.zoneStatus;
+    const gaps = [];
+    if (z) {
+      if (!z.bidActivated) gaps.push('买');
+      if (!z.askActivated) gaps.push('卖');
+    }
+    stallRows.push({
+      id: m.id,
+      title: m.title ?? slot?.title ?? null,
+      elapsedMs: m.elapsedMs,
+      rate,
+      topUsd,
+      gap: gaps.length ? gaps.join('/') : null,
+    });
+  }
+  // Sort by PP/h desc so the most lucrative stalls float to the top —
+  // this is the "go make markets HERE" triage signal.
+  stallRows.sort((a, b) => (b.rate || 0) - (a.rate || 0));
 
   // Pool snapshot from live state.
   const ids = activeMarketIds(state);
   const slots = ids.map((id) => state.markets?.[id]).filter(Boolean);
   const live = slots.filter((s) => !s.lastError && !s.lastSkipReason);
-  const totalRate = live.reduce((acc, s) => acc + (Number.isFinite(s.lastHourlyRate) ? s.lastHourlyRate : 0), 0);
+  const totalRate = live.reduce(
+    (acc, s) => acc + (Number.isFinite(s.lastHourlyRate) ? s.lastHourlyRate : 0),
+    0,
+  );
   const gapsCount = live.filter((s) => s.zoneStatus
     && (!s.zoneStatus.bidActivated || !s.zoneStatus.askActivated)).length;
 
-  // New-rewarded sightings in this hour window (firstSeenMs falls inside [start, end)).
+  // New-rewarded sightings in this hour window.
   const firstSeen = state.marketFirstSeen ?? {};
   const newlySeen = [];
   for (const [id, info] of Object.entries(firstSeen)) {
@@ -127,19 +183,8 @@ export async function sendHourlyDigest(state) {
   }
   newlySeen.sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0));
 
-  const totalPP = sumKey(summary, 'ppEarned');
-  const alertCounts = {
-    stall: sumKey(summary, 'stallAlerts'),
-    jump: sumKey(summary, 'jumpAlerts'),
-    wide: sumKey(summary, 'wideSpreadAlerts'),
-    empty: sumKey(summary, 'emptyBookAlerts'),
-    zone: sumKey(summary, 'rewardZoneAlerts'),
-  };
-  const totalAlerts = Object.values(alertCounts).reduce((a, b) => a + b, 0);
-
-  // Suppress no-op hours — if nothing happened (no PP, no alerts, no new
-  // markets), skip the push. Avoids spamming idle channels every hour.
-  if (totalPP === 0 && totalAlerts === 0 && newlySeen.length === 0) {
+  // Suppress no-op hours: nothing stalled, nothing new → skip the push.
+  if (stallRows.length === 0 && newlySeen.length === 0) {
     log(`skipped hourly digest (idle hour ${new Date(startMs).toISOString()})`);
     return;
   }
@@ -153,37 +198,28 @@ export async function sendHourlyDigest(state) {
     `⏱ <b>整点摘要</b> ${fmtHourUTC(startMs)} – ${fmtHourUTC(endMs)} UTC`,
   ];
 
+  // Compact pool snapshot line — context, not the main signal.
   const pool = [`池子 <b>${ids.length}</b>`];
   if (totalRate > 0) pool.push(`总 <b>${totalRate.toFixed(0)}</b> PP/h`);
-  if (gapsCount > 0) pool.push(`空缺 <b>${gapsCount}</b>`);
-  if (newlySeen.length > 0) pool.push(`新上 <b>${newlySeen.length}</b>`);
+  if (gapsCount > 0) pool.push(`空缺 ${gapsCount}`);
   lines.push(`📊 ${pool.join(' · ')}`);
 
-  if (totalPP > 0) {
-    lines.push(`💰 上小时入账 <b>${totalPP.toFixed(0)} PP</b>`);
-  }
-
-  if (totalAlerts > 0) {
-    const alertParts = [
-      alertCounts.stall > 0 ? `停滞×${alertCounts.stall}` : '',
-      alertCounts.jump > 0 ? `跳变×${alertCounts.jump}` : '',
-      alertCounts.wide > 0 ? `阔差×${alertCounts.wide}` : '',
-      alertCounts.empty > 0 ? `空簿×${alertCounts.empty}` : '',
-      alertCounts.zone > 0 ? `区外×${alertCounts.zone}` : '',
-    ].filter(Boolean);
-    lines.push(`🔔 ${alertParts.join(' · ')}`);
-  }
-
-  // Top PP earners in this hour.
-  const topPP = summary.filter((m) => (m.ppEarned ?? 0) > 0).slice(0, 5);
-  if (topPP.length) {
+  // Main section: stall alerts that fired this hour.
+  if (stallRows.length) {
     lines.push('');
-    lines.push('🏆 <b>上小时 PP 贡献</b>');
-    for (const [i, m] of topPP.entries()) {
-      const medal = i < 3 ? MEDALS[i] : `${i + 1}.`;
-      const title = m.title ? htmlEscape(shortTitle(m.title, 36)) : `Market ${m.marketId}`;
-      const rate = Number.isFinite(m.lastHourlyRate) ? ` · ${m.lastHourlyRate.toFixed(0)}/h` : '';
-      lines.push(`${medal} <code>#${htmlEscape(m.marketId)}</code> ${title} — <b>${(m.ppEarned ?? 0).toFixed(0)} PP</b>${rate}`);
+    lines.push(`🟡 <b>上小时新出停滞</b> (${stallRows.length} 个)`);
+    const SHOW = 15;
+    for (const r of stallRows.slice(0, SHOW)) {
+      const title = r.title ? htmlEscape(shortTitle(r.title, 36)) : `Market ${r.id}`;
+      const parts = [`停滞 ${fmtElapsedCompact(r.elapsedMs)}`];
+      if (r.rate > 0) parts.push(`<b>${r.rate.toFixed(0)}/h</b>`);
+      if (r.topUsd != null) parts.push(`top $${r.topUsd.toFixed(0)}`);
+      if (r.gap) parts.push(`gap:${r.gap}`);
+      lines.push(`<code>#${htmlEscape(r.id)}</code> ${title}`);
+      lines.push(`   ${parts.join(' · ')}`);
+    }
+    if (stallRows.length > SHOW) {
+      lines.push(`<i>……还有 ${stallRows.length - SHOW} 个,/stale 查看全部</i>`);
     }
   }
 
@@ -202,7 +238,7 @@ export async function sendHourlyDigest(state) {
   }
 
   await broadcastTelegramMessage(lines.join('\n'), { chatIds });
-  log(`sent hourly digest (PP=${totalPP.toFixed(0)} alerts=${totalAlerts} new=${newlySeen.length})`);
+  log(`sent hourly digest (stalls=${stallRows.length} new=${newlySeen.length})`);
 }
 
 // Fire on each wall-clock-hour boundary. State.lastHourlyDigestAt tracks
