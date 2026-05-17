@@ -215,6 +215,8 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
     kind,
     marketId,
     title: slot.title ?? null,
+    question: slot.question ?? null,
+    slug: slot.slug ?? null,
     totalHourlyRate: slot.lastHourlyRate,
     priority,
     score: Math.round(score),

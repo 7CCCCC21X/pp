@@ -2,7 +2,7 @@ import { config } from './config.js';
 import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
 import { broadcastChats, activeMarketIds } from './state.js';
 import { readHistorySince, summarize24h } from './history.js';
-import { fmtElapsed, shortTitle } from './format.js';
+import { fmtElapsed, shortTitle, marketUrl } from './format.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[digest]', ...args);
 
@@ -98,23 +98,31 @@ function fmtElapsedCompact(ms) {
 // list instead of N individual alert messages. New-market sightings
 // + pool snapshot ride along as secondary context.
 // Window is [previous UTC hour, current UTC hour).
-export async function sendHourlyDigest(state) {
-  const chatIds = broadcastChats(state);
-  if (!chatIds.length) return;
+// 10 stalls per page = compact but still requires scroll; matches the
+// list-command page size for consistency.
+const HOURLY_PAGE_SIZE = 10;
+
+// Hour boundary used by both the auto-send path and the pagination
+// callback. Returns [startMs, endMs) for the most recently completed
+// UTC hour.
+export function currentHourWindow() {
   const now = new Date();
   const endMs = Date.UTC(
     now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
     now.getUTCHours(), 0, 0, 0,
   );
-  const startMs = endMs - 3600 * 1000;
-  const records = await readHistorySince(startMs).then(
-    (recs) => recs.filter((r) => r.ts < endMs),
-  );
+  return { startMs: endMs - 3600 * 1000, endMs };
+}
 
-  // Collect stall alerts that fired in this hour. One row per market
-  // (max elapsed if duplicates). Joined against live state.markets to
-  // render current PP/h + depth + reward-zone status — fresher than
-  // whatever the alert snapshot captured.
+function fmtHourUTC(ms) {
+  const d = new Date(ms);
+  return `${String(d.getUTCHours()).padStart(2, '0')}:00`;
+}
+
+// Collect + enrich stall alerts that fired inside [startMs, endMs).
+// Pure function — caller supplies records (from history) + state for the
+// live-data join. Sorted by PP/h desc.
+function collectStallRows(records, state) {
   const stallByMarket = new Map();
   for (const r of records) {
     if (r.event !== 'alert' || r.kind !== 'stall') continue;
@@ -126,13 +134,13 @@ export async function sendHourlyDigest(state) {
       stallByMarket.set(id, {
         id,
         title: r.title ?? prev?.title ?? null,
+        question: r.question ?? prev?.question ?? null,
         elapsedMs: elapsed,
         ts: r.ts,
       });
     }
   }
-  // Enrich with live data — current PP/h, depth, gap status.
-  const stallRows = [];
+  const rows = [];
   for (const m of stallByMarket.values()) {
     const slot = state.markets?.[m.id] ?? null;
     const rate = Number.isFinite(slot?.lastHourlyRate) ? slot.lastHourlyRate : 0;
@@ -143,20 +151,55 @@ export async function sendHourlyDigest(state) {
       if (!z.bidActivated) gaps.push('买');
       if (!z.askActivated) gaps.push('卖');
     }
-    stallRows.push({
+    rows.push({
       id: m.id,
       title: m.title ?? slot?.title ?? null,
+      question: m.question ?? slot?.question ?? null,
+      slug: slot?.slug ?? null,
       elapsedMs: m.elapsedMs,
       rate,
       topUsd,
       gap: gaps.length ? gaps.join('/') : null,
     });
   }
-  // Sort by PP/h desc so the most lucrative stalls float to the top —
-  // this is the "go make markets HERE" triage signal.
-  stallRows.sort((a, b) => (b.rate || 0) - (a.rate || 0));
+  rows.sort((a, b) => (b.rate || 0) - (a.rate || 0));
+  return rows;
+}
 
-  // Pool snapshot from live state.
+function collectNewlySeen(state, startMs, endMs) {
+  const firstSeen = state.marketFirstSeen ?? {};
+  const out = [];
+  for (const [id, info] of Object.entries(firstSeen)) {
+    const ms = typeof info === 'number' ? info : info?.ms;
+    if (!Number.isFinite(ms) || ms <= 0) continue;
+    if (ms >= startMs && ms < endMs) {
+      out.push({
+        id, ms,
+        title: (typeof info === 'object' ? info.title : null) ?? state.markets?.[id]?.title ?? null,
+        question: state.markets?.[id]?.question ?? null,
+        slug: state.markets?.[id]?.slug ?? null,
+        rate: (typeof info === 'object' ? info.rate : null) ?? state.markets?.[id]?.lastHourlyRate ?? null,
+      });
+    }
+  }
+  out.sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0));
+  return out;
+}
+
+// Build the page text + keyboard for a specific [startMs, endMs) window.
+// Page index is over the stall list only — newlySeen is always shown on
+// page 0 (it's short, won't repeat across pages).
+export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
+  const records = await readHistorySince(startMs).then(
+    (recs) => recs.filter((r) => r.ts < endMs),
+  );
+  const stallRows = collectStallRows(records, state);
+  const newlySeen = collectNewlySeen(state, startMs, endMs);
+
+  if (stallRows.length === 0 && newlySeen.length === 0) {
+    return { text: null, replyMarkup: undefined, stallCount: 0, newCount: 0 };
+  }
+
   const ids = activeMarketIds(state);
   const slots = ids.map((id) => state.markets?.[id]).filter(Boolean);
   const live = slots.filter((s) => !s.lastError && !s.lastSkipReason);
@@ -167,78 +210,105 @@ export async function sendHourlyDigest(state) {
   const gapsCount = live.filter((s) => s.zoneStatus
     && (!s.zoneStatus.bidActivated || !s.zoneStatus.askActivated)).length;
 
-  // New-rewarded sightings in this hour window.
-  const firstSeen = state.marketFirstSeen ?? {};
-  const newlySeen = [];
-  for (const [id, info] of Object.entries(firstSeen)) {
-    const ms = typeof info === 'number' ? info : info?.ms;
-    if (!Number.isFinite(ms) || ms <= 0) continue;
-    if (ms >= startMs && ms < endMs) {
-      newlySeen.push({
-        id, ms,
-        title: (typeof info === 'object' ? info.title : null) ?? state.markets?.[id]?.title ?? null,
-        rate: (typeof info === 'object' ? info.rate : null) ?? state.markets?.[id]?.lastHourlyRate ?? null,
-      });
-    }
-  }
-  newlySeen.sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0));
-
-  // Suppress no-op hours: nothing stalled, nothing new → skip the push.
-  if (stallRows.length === 0 && newlySeen.length === 0) {
-    log(`skipped hourly digest (idle hour ${new Date(startMs).toISOString()})`);
-    return;
-  }
-
-  const fmtHourUTC = (ms) => {
-    const d = new Date(ms);
-    return `${String(d.getUTCHours()).padStart(2, '0')}:00`;
-  };
+  const totalPages = Math.max(1, Math.ceil(stallRows.length / HOURLY_PAGE_SIZE));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const start = safePage * HOURLY_PAGE_SIZE;
+  const pageRows = stallRows.slice(start, start + HOURLY_PAGE_SIZE);
 
   const lines = [
     `⏱ <b>整点摘要</b> ${fmtHourUTC(startMs)} – ${fmtHourUTC(endMs)} UTC`,
   ];
-
-  // Compact pool snapshot line — context, not the main signal.
   const pool = [`池子 <b>${ids.length}</b>`];
   if (totalRate > 0) pool.push(`总 <b>${totalRate.toFixed(0)}</b> PP/h`);
   if (gapsCount > 0) pool.push(`空缺 ${gapsCount}`);
   lines.push(`📊 ${pool.join(' · ')}`);
 
-  // Main section: stall alerts that fired this hour.
   if (stallRows.length) {
     lines.push('');
-    lines.push(`🟡 <b>上小时新出停滞</b> (${stallRows.length} 个)`);
-    const SHOW = 15;
-    for (const r of stallRows.slice(0, SHOW)) {
-      const title = r.title ? htmlEscape(shortTitle(r.title, 36)) : `Market ${r.id}`;
+    const pageTag = totalPages > 1 ? ` · 第 ${safePage + 1}/${totalPages} 页` : '';
+    lines.push(`🟡 <b>上小时新出停滞</b> (${stallRows.length} 个${pageTag})`);
+    for (const r of pageRows) {
+      const display = r.title || r.question || `Market ${r.id}`;
+      const safeTitle = htmlEscape(shortTitle(display, 40));
+      const url = marketUrl(r.id, r.title, r.question, r.slug);
+      const titleLink = `<a href="${url}">${safeTitle}</a>`;
       const parts = [`停滞 ${fmtElapsedCompact(r.elapsedMs)}`];
       if (r.rate > 0) parts.push(`<b>${r.rate.toFixed(0)}/h</b>`);
       if (r.topUsd != null) parts.push(`top $${r.topUsd.toFixed(0)}`);
       if (r.gap) parts.push(`gap:${r.gap}`);
-      lines.push(`<code>#${htmlEscape(r.id)}</code> ${title}`);
+      lines.push(`<code>#${htmlEscape(r.id)}</code> ${titleLink}`);
+      // Surface the parent event question on outcome-name markets
+      // ("$50M" / "Cleveland Cavaliers") so the user can tell what
+      // the bet is actually about. Suppress when title already is
+      // the question.
+      if (r.question && r.question !== r.title) {
+        lines.push(`   <i>${htmlEscape(shortTitle(r.question, 60))}</i>`);
+      }
       lines.push(`   ${parts.join(' · ')}`);
-    }
-    if (stallRows.length > SHOW) {
-      lines.push(`<i>……还有 ${stallRows.length - SHOW} 个,/stale 查看全部</i>`);
     }
   }
 
-  // Newly-rewarded markets that arrived this hour.
-  if (newlySeen.length) {
+  // New-rewarded section only on the first page — short, doesn't paginate.
+  if (newlySeen.length && safePage === 0) {
     lines.push('');
     lines.push(`🆕 <b>新上奖励 (本小时 ${newlySeen.length})</b>`);
     for (const m of newlySeen.slice(0, 5)) {
-      const title = m.title ? htmlEscape(shortTitle(m.title, 40)) : `Market ${m.id}`;
+      const display = m.title || `Market ${m.id}`;
+      const safeTitle = htmlEscape(shortTitle(display, 40));
+      const url = marketUrl(m.id, m.title, m.question, m.slug);
+      const titleLink = `<a href="${url}">${safeTitle}</a>`;
       const rate = Number.isFinite(m.rate) && m.rate > 0 ? ` — ${m.rate.toFixed(0)}/h` : '';
-      lines.push(`• <code>#${htmlEscape(m.id)}</code> ${title}${rate}`);
+      lines.push(`• <code>#${htmlEscape(m.id)}</code> ${titleLink}${rate}`);
     }
     if (newlySeen.length > 5) {
       lines.push(`<i>……还有 ${newlySeen.length - 5} 个,/new 查看全部</i>`);
     }
   }
 
-  await broadcastTelegramMessage(lines.join('\n'), { chatIds });
-  log(`sent hourly digest (stalls=${stallRows.length} new=${newlySeen.length})`);
+  // Pagination keyboard — only when there's more than one page.
+  let replyMarkup;
+  if (totalPages > 1) {
+    // Encode startMs in base36 to keep the callback short; we only need
+    // 1h granularity but the full ms gives an unambiguous re-derivation
+    // of the window inside the callback handler.
+    const startB36 = startMs.toString(36);
+    const navRow = [];
+    if (safePage > 0) {
+      navRow.push({ text: '⬅️ 上一页', callback_data: `hd:p:${startB36}:${safePage - 1}` });
+    }
+    navRow.push({ text: `${safePage + 1} / ${totalPages}`, callback_data: 'page:noop' });
+    if (safePage < totalPages - 1) {
+      navRow.push({ text: '➡️ 下一页', callback_data: `hd:p:${startB36}:${safePage + 1}` });
+    }
+    replyMarkup = { inline_keyboard: [navRow] };
+  }
+
+  return {
+    text: lines.join('\n'),
+    replyMarkup,
+    stallCount: stallRows.length,
+    newCount: newlySeen.length,
+    totalPages,
+  };
+}
+
+// One-hour pulse. Primary content is the **stall-alerts roll-up** —
+// every market whose 订单簿停滞超过 N 小时 alert fired in the just-
+// finished hour gets one compact row (id · title · stall · PP/h ·
+// depth) so the user has a single "what's worth grabbing right now"
+// list instead of N individual alert messages. New-market sightings
+// + pool snapshot ride along as secondary context.
+export async function sendHourlyDigest(state) {
+  const chatIds = broadcastChats(state);
+  if (!chatIds.length) return;
+  const { startMs, endMs } = currentHourWindow();
+  const page = await buildHourlyDigest(state, startMs, endMs, 0);
+  if (page.text == null) {
+    log(`skipped hourly digest (idle hour ${new Date(startMs).toISOString()})`);
+    return;
+  }
+  await broadcastTelegramMessage(page.text, { chatIds, replyMarkup: page.replyMarkup });
+  log(`sent hourly digest (stalls=${page.stallCount} new=${page.newCount} pages=${page.totalPages})`);
 }
 
 // Fire on each wall-clock-hour boundary. State.lastHourlyDigestAt tracks

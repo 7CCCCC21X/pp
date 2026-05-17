@@ -1545,6 +1545,32 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
 // before /all existed. Keep this alias so the old import keeps working.
 export const handleStaleFilterCallback = handleListFilterCallback;
 
+// Pagination for the hourly digest message. Callback shape:
+//   hd:p:<startMsBase36>:<page>
+// Window is re-derived from the encoded start so flipping pages works
+// even hours after the original digest was sent — we just re-query
+// history for that window.
+export async function handleHourlyDigestCallback(data, { chatId, messageId, state }) {
+  if (!data.startsWith('hd:')) return false;
+  const [, action, startB36, pageStr] = data.split(':');
+  if (action !== 'p') return true;
+  const startMs = parseInt(startB36, 36);
+  const page = Math.max(0, Number(pageStr) || 0);
+  if (!Number.isFinite(startMs) || startMs <= 0) return true;
+  const endMs = startMs + 3600 * 1000;
+  const { buildHourlyDigest } = await import('./digest.js');
+  const built = await buildHourlyDigest(state, startMs, endMs, page);
+  if (built.text == null) return true;
+  try {
+    await editTelegramMessage(chatId, messageId, built.text, built.replyMarkup);
+  } catch (err) {
+    if (!/message is not modified/i.test(err.message ?? '')) {
+      warn('hourly digest page edit failed:', err.message);
+    }
+  }
+  return true;
+}
+
 // Edit-in-place callback handler for the /new wizard. Callback shape:
 //   new:<action>:<winH>:<minRate>:<minRem>:<sort>:<page>
 // Actions: wizard / set / custom-win / custom-rate / custom-rem / page /
@@ -3768,6 +3794,10 @@ export function startCommandLoop({ getState, persist, ctx }) {
             } else if (data.startsWith('new:')) {
               await handleNewWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }).catch((err) => {
                 warn('new wizard error:', err.message);
+              });
+            } else if (data.startsWith('hd:')) {
+              await handleHourlyDigestCallback(data, { chatId, messageId, state }).catch((err) => {
+                warn('hourly digest callback error:', err.message);
               });
             } else if (data.startsWith('page:')) {
               await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
