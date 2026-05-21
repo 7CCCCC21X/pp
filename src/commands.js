@@ -1174,8 +1174,14 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
 // pinned at 99% for minutes. The whole refetch also hits a global
 // deadline to bound worst case.
 const STALE_REFETCH_CONCURRENCY = 3;
-const STALE_PROGRESS_EDIT_EVERY = 8;
-const STALE_PROGRESS_EDIT_MIN_MS = 900;
+// Progress-bar edit throttle. Telegram throttles repeated editMessageText on
+// the same message hard (429 with retry_after up to ~30s once you burst), so
+// we keep edits sparse: at least STALE_PROGRESS_EDIT_MIN_MS apart AND at
+// least STALE_PROGRESS_EDIT_EVERY completions apart. The progress bar is
+// cosmetic — missing an intermediate frame is fine, the final render always
+// fires (force=true).
+const STALE_PROGRESS_EDIT_EVERY = 20;
+const STALE_PROGRESS_EDIT_MIN_MS = 4_000;
 const STALE_PER_MARKET_TIMEOUT_MS = 20_000;
 const STALE_REFETCH_DEADLINE_MS = 5 * 60 * 1000;
 
@@ -1190,6 +1196,7 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
   let failed = 0;
   let lastEditAt = 0;
   let lastEditedDone = -1;
+  let lastEditText = '';
 
   const renderProgress = (extraNote = '') => {
     const filled = Math.round((done / Math.max(1, total)) * 20);
@@ -1218,18 +1225,28 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
 
   // Initial paint so user sees the bar immediately
   try {
-    await editTelegramMessage(chatId, messageId, renderProgress(), cancelKb);
+    const text0 = renderProgress();
+    await editTelegramMessage(chatId, messageId, text0, cancelKb);
     lastEditAt = Date.now();
+    lastEditText = text0;
   } catch {}
 
   const maybeEditProgress = async (force = false) => {
     const now = Date.now();
     if (!force && (now - lastEditAt < STALE_PROGRESS_EDIT_MIN_MS)) return;
     if (!force && done - lastEditedDone < STALE_PROGRESS_EDIT_EVERY) return;
+    const text = renderProgress();
+    // Don't burn an API call (and risk a 429) re-sending identical text.
+    if (text === lastEditText) return;
     lastEditedDone = done;
     lastEditAt = now;
     try {
-      await editTelegramMessage(chatId, messageId, renderProgress(), cancelKb);
+      // retries:0 — progress frames are disposable; if Telegram throttles
+      // this edit, skip it rather than blocking the refetch loop for the
+      // full retry_after window. The next throttled frame (or the forced
+      // final edit) carries the latest state anyway.
+      await editTelegramMessage(chatId, messageId, text, cancelKb, { retries: 0 });
+      lastEditText = text;
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
         warn('stale progress edit failed:', err.message);

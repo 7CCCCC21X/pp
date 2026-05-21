@@ -151,7 +151,12 @@ export async function broadcastTelegramMessage(text, { chatIds, replyMarkup } = 
   return results;
 }
 
-export async function editTelegramMessage(chatId, messageId, text, replyMarkup) {
+// apiOpts is forwarded to tgApi — pass { retries: 0 } for low-value edits
+// (live progress bars) so a 429 throttle is skipped immediately instead of
+// blocking the caller for the full retry_after window. High-value edits
+// (final result render, wizard) keep the default retry so they land even if
+// momentarily throttled.
+export async function editTelegramMessage(chatId, messageId, text, replyMarkup, apiOpts) {
   const payload = {
     chat_id: chatId,
     message_id: messageId,
@@ -160,7 +165,7 @@ export async function editTelegramMessage(chatId, messageId, text, replyMarkup) 
     disable_web_page_preview: true,
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
-  return tgApi('editMessageText', payload);
+  return tgApi('editMessageText', payload, apiOpts);
 }
 
 // scope: optional Telegram BotCommandScope object, e.g.

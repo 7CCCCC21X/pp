@@ -50,6 +50,24 @@ export async function fetchJson(url, {
         err.status = res.status;
         err.body = text;
         err.url = url;
+        if (res.status === 429) {
+          // Telegram (and some other APIs) tell us exactly how long to wait
+          // via the Retry-After header and/or a JSON body
+          // { parameters: { retry_after: <seconds> } }. Honour it instead of
+          // blind exponential backoff — otherwise we keep retrying too soon
+          // and stay throttled. Cap at 60s so a pathological value can't pin
+          // a tick.
+          let retryAfterSec = Number(res.headers.get('retry-after'));
+          if (!Number.isFinite(retryAfterSec) || retryAfterSec <= 0) {
+            try {
+              const parsed = JSON.parse(text);
+              retryAfterSec = Number(parsed?.parameters?.retry_after);
+            } catch { /* body not JSON — ignore */ }
+          }
+          if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+            err.retryAfterMs = Math.min(retryAfterSec, 60) * 1000;
+          }
+        }
         throw err;
       }
       if (!parseJson) return text;
@@ -78,7 +96,11 @@ export async function fetchJson(url, {
       // External cancellation (e.g. SIGINT) -> don't retry
       if (externalSignal?.aborted) break;
       if (!isRetriableError(err) || attempt === retries) break;
-      const delay = retryDelayMs * Math.pow(2, attempt) + Math.random() * 200;
+      // Prefer the server-specified Retry-After (429); otherwise exponential
+      // backoff. The +jitter avoids thundering-herd on shared limits.
+      const delay = Number.isFinite(err.retryAfterMs)
+        ? err.retryAfterMs + Math.random() * 200
+        : retryDelayMs * Math.pow(2, attempt) + Math.random() * 200;
       await new Promise((r) => setTimeout(r, delay));
     } finally {
       clearTimeout(timer);
