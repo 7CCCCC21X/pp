@@ -45,6 +45,7 @@ const PRIVATE_MENU = [
   { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
   { command: 'new', description: '今日新上的有奖励市场（默认 24h；底部按钮可调窗口/PP/h/剩余/排序）' },
+  { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -122,6 +123,9 @@ function menuKeyboard({ isPrivate = true } = {}) {
         { text: '📋 全部市场', callback_data: '/all' },
         { text: '🆕 新上市', callback_data: '/new' },
         { text: '🔍 自定义筛', callback_data: '/find' },
+      ],
+      [
+        { text: '📈 PP 变动', callback_data: '/movers' },
       ],
       // 👁 监控管理
       [
@@ -1558,6 +1562,146 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
   return true;
 }
 
+// ---------- /movers: PP/h rate-change view ----------
+// Reads history 'rate' events over a window, computes baseline (earliest
+// rate in window) vs current (live state, catches drops to 0), and lists
+// markets whose PP/h moved. Window is user-customizable.
+const MOVERS_WIN_PRESETS = [30, 60, 180, 360, 720, 1440]; // minutes
+const MOVERS_DEFAULT_MIN = 60;
+const MOVERS_PAGE_SIZE = 10;
+
+function moversWinLabel(min) {
+  if (min < 60) return `${min}m`;
+  if (min % 60 === 0) {
+    const h = min / 60;
+    return h % 24 === 0 ? `${h / 24}d` : `${h}h`;
+  }
+  return `${(min / 60).toFixed(1)}h`;
+}
+
+async function buildMoversRows(state, windowMin) {
+  const { readHistorySince } = await import('./history.js');
+  const since = Date.now() - windowMin * 60_000;
+  const records = await readHistorySince(since);
+  // Per market: earliest + latest rate sample inside the window.
+  const byMarket = new Map();
+  for (const r of records) {
+    if (r.event !== 'rate' || !Number.isFinite(r.hourlyRate)) continue;
+    const id = String(r.marketId ?? '');
+    if (!id) continue;
+    const e = byMarket.get(id);
+    if (!e) {
+      byMarket.set(id, {
+        id, title: r.title ?? null,
+        first: r.hourlyRate, firstTs: r.ts,
+        last: r.hourlyRate, lastTs: r.ts,
+      });
+    } else {
+      if (r.ts < e.firstTs) { e.first = r.hourlyRate; e.firstTs = r.ts; }
+      if (r.ts > e.lastTs) { e.last = r.hourlyRate; e.lastTs = r.ts; }
+      if (r.title && !e.title) e.title = r.title;
+    }
+  }
+  const rows = [];
+  for (const e of byMarket.values()) {
+    const slot = state.markets?.[e.id] ?? null;
+    // Current rate from live state catches reward windows that ended (rate
+    // dropped to 0 → stops emitting rate events, so history's `last` is the
+    // last non-zero value, not the current 0).
+    const current = Number.isFinite(slot?.lastHourlyRate) ? slot.lastHourlyRate : e.last;
+    const baseline = e.first;
+    const delta = current - baseline;
+    if (Math.abs(delta) < 0.5) continue; // unchanged within rounding
+    rows.push({
+      id: e.id,
+      title: e.title ?? slot?.title ?? null,
+      question: slot?.question ?? null,
+      slug: slot?.slug ?? null,
+      baseline, current, delta,
+    });
+  }
+  // Biggest absolute move first.
+  rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  return rows;
+}
+
+function moversKeyboard(windowMin, page, totalPages, openUrls) {
+  const rows = [];
+  // Window preset row.
+  rows.push(MOVERS_WIN_PRESETS.map((m) => ({
+    text: m === windowMin ? `✅ ${moversWinLabel(m)}` : moversWinLabel(m),
+    callback_data: `mv:win:${m}`,
+  })));
+  // Pagination row.
+  if (totalPages > 1) {
+    const nav = [];
+    if (page > 0) nav.push({ text: '⬅️ 上一页', callback_data: `mv:page:${windowMin}:${page - 1}` });
+    nav.push({ text: `${page + 1} / ${totalPages}`, callback_data: 'page:noop' });
+    if (page < totalPages - 1) nav.push({ text: '➡️ 下一页', callback_data: `mv:page:${windowMin}:${page + 1}` });
+    rows.push(nav);
+  }
+  // Open-in-browser buttons.
+  if (Array.isArray(openUrls) && openUrls.length) {
+    const CHUNK = 5;
+    for (let i = 0; i < openUrls.length; i += CHUNK) {
+      rows.push(openUrls.slice(i, i + CHUNK).map((u, j) => ({ text: `🌐 ${i + j + 1}`, url: u })));
+    }
+  }
+  return { inline_keyboard: rows };
+}
+
+async function renderMoversPage(state, windowMin, page = 0) {
+  const allRows = await buildMoversRows(state, windowMin);
+  const winLabel = moversWinLabel(windowMin);
+  if (!allRows.length) {
+    return {
+      text: `📈 <b>近 ${winLabel} PP/h 变动</b>\n\n<i>这段时间没有费率变动的市场。换个时间窗口试试。</i>`,
+      replyMarkup: moversKeyboard(windowMin, 0, 1, null),
+    };
+  }
+  const totalPages = Math.max(1, Math.ceil(allRows.length / MOVERS_PAGE_SIZE));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const start = safePage * MOVERS_PAGE_SIZE;
+  const items = allRows.slice(start, start + MOVERS_PAGE_SIZE);
+  const pageTag = totalPages > 1 ? ` · 第 ${safePage + 1}/${totalPages} 页` : '';
+  const lines = [`📈 <b>近 ${winLabel} PP/h 变动</b> <i>(${items.length} / ${allRows.length}${pageTag})</i>`, ''];
+  for (const r of items) {
+    const arrow = r.delta > 0 ? '📈' : '📉';
+    const sign = r.delta > 0 ? '+' : '';
+    const display = r.title || r.question || `Market ${r.id}`;
+    const safeTitle = htmlEscape(shortTitle(display, 40));
+    const url = marketUrl(r.id, r.title, r.question, r.slug);
+    lines.push(`<code>#${htmlEscape(r.id)}</code> ${arrow} <b>${r.baseline.toFixed(0)}→${r.current.toFixed(0)}</b>/h (${sign}${r.delta.toFixed(0)})`);
+    lines.push(`   <a href="${url}">${safeTitle}</a>`);
+  }
+  const openUrls = items.map((r) => marketUrl(r.id, r.title, r.question, r.slug));
+  return { text: lines.join('\n'), replyMarkup: moversKeyboard(windowMin, safePage, totalPages, openUrls) };
+}
+
+export async function handleMoversCallback(data, { chatId, messageId, state }) {
+  if (!data.startsWith('mv:')) return false;
+  const [, action, a, b] = data.split(':');
+  let windowMin = MOVERS_DEFAULT_MIN;
+  let page = 0;
+  if (action === 'win') {
+    windowMin = Number(a) || MOVERS_DEFAULT_MIN;
+  } else if (action === 'page') {
+    windowMin = Number(a) || MOVERS_DEFAULT_MIN;
+    page = Math.max(0, Number(b) || 0);
+  } else {
+    return true;
+  }
+  const reply = await renderMoversPage(state, windowMin, page);
+  try {
+    await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
+  } catch (err) {
+    if (!/message is not modified/i.test(err.message ?? '')) {
+      warn('movers callback edit failed:', err.message);
+    }
+  }
+  return true;
+}
+
 // Back-compat export — index.js dispatcher imported handleStaleFilterCallback
 // before /all existed. Keep this alias so the old import keeps working.
 export const handleStaleFilterCallback = handleListFilterCallback;
@@ -1796,7 +1940,8 @@ const HELP = [
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
-  '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 可调窗口/最低 PP/h/最短剩余/盘口层级×总额/排序；开盘口过滤会重抓 orderbook）',
+  '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 可调窗口/最低 PP/h/最短剩余/盘口层级×总额/排序；开盘口过滤会重抓 orderbook；只显示当前有 PP 的）',
+  '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -2301,6 +2446,11 @@ function renderListPage(cmd, page, state, filter = null) {
           endMs: info?.endMs ?? null,
         };
         const rate = Number.isFinite(synthSlot.lastHourlyRate) ? synthSlot.lastHourlyRate : 0;
+        // /new = "新上奖励市场" — only show markets that ACTUALLY pay PP
+        // right now. Short-lived markets (e.g. "Bitcoin Up or Down" 5-min
+        // intervals) were rewarded when first discovered but their reward
+        // window has since expired (rate → 0); hide them as noise.
+        if (rate <= 0) continue;
         if (f.minRate > 0 && rate < f.minRate) continue;
         if (remCutoff != null) {
           const endMs = Number.isFinite(synthSlot.endMs) ? synthSlot.endMs : null;
@@ -3007,6 +3157,22 @@ async function handle(text, state, ctx, chatId, fromId) {
         return '已触发整点摘要(下一 tick 发出)。';
       }
       return '当前进程不支持手动触发整点摘要。';
+    }
+
+    case '/movers': {
+      // PP/h rate-change view. /movers [duration] — default 1h.
+      // Bottom buttons let the user switch window without retyping.
+      let windowMin = MOVERS_DEFAULT_MIN;
+      if (arg) {
+        const dur = parseDuration(arg);
+        if (dur != null && dur > 0) {
+          windowMin = Math.max(5, Math.min(7 * 24 * 60, Math.round(dur / 60_000)));
+        } else if (/^\d+$/.test(arg.trim())) {
+          // Bare number = minutes.
+          windowMin = Math.max(5, Math.min(7 * 24 * 60, Number(arg.trim())));
+        }
+      }
+      return await renderMoversPage(state, windowMin, 0);
     }
 
     case '/top':
@@ -3815,6 +3981,10 @@ export function startCommandLoop({ getState, persist, ctx }) {
             } else if (data.startsWith('hd:')) {
               await handleHourlyDigestCallback(data, { chatId, messageId, state }).catch((err) => {
                 warn('hourly digest callback error:', err.message);
+              });
+            } else if (data.startsWith('mv:')) {
+              await handleMoversCallback(data, { chatId, messageId, state }).catch((err) => {
+                warn('movers callback error:', err.message);
               });
             } else if (data.startsWith('page:')) {
               await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
