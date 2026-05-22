@@ -63,7 +63,7 @@ const PRIVATE_MENU = [
   { command: 'diagdiscover', description: '对比 REST/GraphQL 两个发现源的数量' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
-  { command: 'hourly', description: '整点摘要(发=立即触发;only on/off=只收摘要;ext N/off=排除极端价)' },
+  { command: 'hourly', description: '整点摘要设置面板(只收摘要/排除极端价/立即发送;群里点按钮)' },
   { command: 'config', description: '查看当前监控条件 / 阈值 / 过滤器' },
   { command: 'activate', description: '在群里激活机器人（仅 admin）' },
   { command: 'whitelist', description: '管理白名单（仅 admin）' },
@@ -99,6 +99,10 @@ function menuKeyboard({ isPrivate = true } = {}) {
           { text: '🔍 自定义筛', callback_data: '/find' },
         ],
         [
+          { text: '📈 PP 变动', callback_data: '/movers' },
+          { text: '⏱ 摘要设置', callback_data: '/hourly' },
+        ],
+        [
           { text: '📡 状态', callback_data: '/status' },
           { text: '📈 24h 摘要', callback_data: '/digest' },
           { text: '❓ 帮助', callback_data: '/help' },
@@ -126,6 +130,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
       ],
       [
         { text: '📈 PP 变动', callback_data: '/movers' },
+        { text: '⏱ 摘要设置', callback_data: '/hourly' },
       ],
       // 👁 监控管理
       [
@@ -1657,6 +1662,10 @@ async function renderMoversPage(state, windowMin, page = 0) {
     const url = marketUrl(r.id, r.title, r.question, r.slug);
     lines.push(`<code>#${htmlEscape(r.id)}</code> ${arrow} <b>${r.baseline.toFixed(0)}→${r.current.toFixed(0)}</b>/h (${sign}${r.delta.toFixed(0)})`);
     lines.push(`   <a href="${url}">${safeTitle}</a>`);
+    // Parent event question for outcome-name markets ("$50M" / "Up").
+    if (r.question && r.question !== r.title) {
+      lines.push(`   <i>${htmlEscape(shortTitle(r.question, 56))}</i>`);
+    }
   }
   const openUrls = items.map((r) => marketUrl(r.id, r.title, r.question, r.slug));
   return { text: lines.join('\n'), replyMarkup: moversKeyboard(windowMin, safePage, totalPages, openUrls) };
@@ -1690,17 +1699,87 @@ export async function handleMoversCallback(data, { chatId, messageId, state }) {
 // before /all existed. Keep this alias so the old import keeps working.
 export const handleStaleFilterCallback = handleListFilterCallback;
 
-// Pagination for the hourly digest message. Callback shape:
-//   hd:p:<startMsBase36>:<page>
-// Window is re-derived from the encoded start so flipping pages works
-// even hours after the original digest was sent — we just re-query
-// history for that window.
-export async function handleHourlyDigestCallback(data, { chatId, messageId, state }) {
+// Settings panel for the hourly digest — rendered by /hourly (no arg) and
+// edited in place by the hd:only / hd:ext toggles. Button-driven so it works
+// in groups (callbacks bypass Telegram's group privacy mode, which would
+// otherwise swallow plain "/hourly only on" text without an @botname).
+function hourlySettingsText(state) {
+  const onlyOn = !!state.hourlyDigestOnly;
+  const ext = Number.isFinite(state.hourlyDigestExtExclude) ? state.hourlyDigestExtExclude : 94;
+  return [
+    '⏱ <b>整点摘要设置</b>',
+    '',
+    `🔕 只收摘要(屏蔽逐条提醒): <b>${onlyOn ? '开' : '关'}</b>`,
+    `📈 排除极端价(一边 ≥N¢): <b>${ext > 0 ? `≥${ext}¢` : '关'}</b>`,
+    '',
+    '<i>每 UTC 整点自动汇总一次。下面按钮可调,群里也能点。</i>',
+  ].join('\n');
+}
+
+function hourlySettingsKeyboard(state) {
+  const onlyOn = !!state.hourlyDigestOnly;
+  const ext = Number.isFinite(state.hourlyDigestExtExclude) ? state.hourlyDigestExtExclude : 94;
+  const extMark = (n) => `${n === ext ? '✅ ' : ''}${n === 0 ? '关' : `≥${n}¢`}`;
+  return {
+    inline_keyboard: [
+      [{
+        text: onlyOn ? '✅ 只收摘要(不收逐条)' : '⬜ 只收摘要(不收逐条)',
+        callback_data: `hd:only:${onlyOn ? 0 : 1}`,
+      }],
+      [
+        { text: extMark(0), callback_data: 'hd:ext:0' },
+        { text: extMark(94), callback_data: 'hd:ext:94' },
+        { text: extMark(90), callback_data: 'hd:ext:90' },
+        { text: extMark(85), callback_data: 'hd:ext:85' },
+      ],
+      [{ text: '🚀 立即发送一次', callback_data: 'hd:send' }],
+    ],
+  };
+}
+
+// Callbacks for the hourly digest:
+//   hd:p:<startMsBase36>:<page>  — pagination of an already-sent digest
+//   hd:only:<0|1>                — toggle digest-only mode
+//   hd:ext:<N>                   — set extreme-price exclusion (0 = off)
+//   hd:send                      — trigger a manual pulse now
+export async function handleHourlyDigestCallback(data, { chatId, messageId, state, fullCtx }) {
   if (!data.startsWith('hd:')) return false;
-  const [, action, startB36, pageStr] = data.split(':');
+  const [, action, a, b] = data.split(':');
+
+  if (action === 'only' || action === 'ext') {
+    if (action === 'only') {
+      state.hourlyDigestOnly = a === '1';
+    } else {
+      const n = Number(a);
+      state.hourlyDigestExtExclude = Number.isFinite(n) ? n : 0;
+    }
+    if (fullCtx?.persist) await fullCtx.persist().catch(() => {});
+    try {
+      await editTelegramMessage(chatId, messageId, hourlySettingsText(state), hourlySettingsKeyboard(state));
+    } catch (err) {
+      if (!/message is not modified/i.test(err.message ?? '')) {
+        warn('hourly settings edit failed:', err.message);
+      }
+    }
+    return true;
+  }
+
+  if (action === 'send') {
+    if (typeof fullCtx?.requestHourlyDigest === 'function') fullCtx.requestHourlyDigest();
+    try {
+      await editTelegramMessage(
+        chatId, messageId,
+        `${hourlySettingsText(state)}\n\n<i>已触发,下一 tick 发出整点摘要。</i>`,
+        hourlySettingsKeyboard(state),
+      );
+    } catch {}
+    return true;
+  }
+
+  // Default: pagination (hd:p:<startMsBase36>:<page>).
   if (action !== 'p') return true;
-  const startMs = parseInt(startB36, 36);
-  const page = Math.max(0, Number(pageStr) || 0);
+  const startMs = parseInt(a, 36);
+  const page = Math.max(0, Number(b) || 0);
   if (!Number.isFinite(startMs) || startMs <= 0) return true;
   const endMs = startMs + 3600 * 1000;
   const { buildHourlyDigest } = await import('./digest.js');
@@ -1961,7 +2040,7 @@ const HELP = [
   '/diagdiscover — 对比 REST/GraphQL 两个发现源（监控数量看着不对时用）',
   '/refresh — 立即刷新 PP/h 缓存',
   '/digest — 立即发送 24h 摘要',
-  '/hourly — 立即触发整点摘要(每 UTC 整点自动发)；/hourly only on=只收摘要不收逐条；/hourly ext 94=摘要排除一边≥94¢(默认开)；/hourly cfg=看设置',
+  '/hourly — 整点摘要设置面板(按钮:只收摘要开关 / 排除极端价 / 立即发送)；群里也能点。文字快捷:/hourly only on|off · /hourly ext 94|off · /hourly now',
   '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
   '',
   '<b>👥 权限 / 群组</b>',
@@ -3173,23 +3252,21 @@ async function handle(text, state, ctx, chatId, fromId) {
         }
         return '用法:/hourly ext 94  (排除 ≥94¢ 的)\n     /hourly ext off (不排除)';
       }
-      if (sub === 'cfg' || sub === 'status' || sub === 'config') {
-        const onlyOn = !!state.hourlyDigestOnly;
-        const ext = Number.isFinite(state.hourlyDigestExtExclude) ? state.hourlyDigestExtExclude : 94;
-        return [
-          '⏱ <b>整点摘要设置</b>',
-          `· 只收摘要模式: <b>${onlyOn ? '开' : '关'}</b> (/hourly only on|off)`,
-          `· 极端价排除: <b>${ext > 0 ? `≥${ext}¢` : '关'}</b> (/hourly ext &lt;N&gt;|off)`,
-          '',
-          '发 /hourly 立即触发一次。',
-        ].join('\n');
+      if (sub === 'now' || sub === 'send') {
+        // Manual trigger (text shortcut; the panel has a button too).
+        if (typeof ctx.requestHourlyDigest === 'function') {
+          ctx.requestHourlyDigest();
+          return '已触发整点摘要(下一 tick 发出)。';
+        }
+        return '当前进程不支持手动触发整点摘要。';
       }
-      // No (recognised) arg → trigger a manual pulse.
-      if (typeof ctx.requestHourlyDigest === 'function') {
-        ctx.requestHourlyDigest();
-        return '已触发整点摘要(下一 tick 发出)。';
-      }
-      return '当前进程不支持手动触发整点摘要。';
+      // No (recognised) arg → settings panel with toggle buttons. Buttons
+      // work in groups even under Telegram privacy mode (callbacks always
+      // reach the bot), unlike plain "/hourly only on" text.
+      return {
+        text: hourlySettingsText(state),
+        replyMarkup: hourlySettingsKeyboard(state),
+      };
     }
 
     case '/movers': {
@@ -4012,7 +4089,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 warn('new wizard error:', err.message);
               });
             } else if (data.startsWith('hd:')) {
-              await handleHourlyDigestCallback(data, { chatId, messageId, state }).catch((err) => {
+              await handleHourlyDigestCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
                 warn('hourly digest callback error:', err.message);
               });
             } else if (data.startsWith('mv:')) {
