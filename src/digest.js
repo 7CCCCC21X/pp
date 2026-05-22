@@ -1,7 +1,7 @@
 import { config } from './config.js';
 import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
 import { broadcastChats, activeMarketIds } from './state.js';
-import { readHistorySince, summarize24h } from './history.js';
+import { readHistorySince, summarize24h, rateMovers } from './history.js';
 import { fmtElapsed, shortTitle, marketUrl } from './format.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[digest]', ...args);
@@ -195,9 +195,12 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
   );
   const stallRows = collectStallRows(records, state);
   const newlySeen = collectNewlySeen(state, startMs, endMs);
+  // PP/h movers this hour — same logic as /movers but scoped to the hour
+  // window's records. Live rate override catches reward windows that ended.
+  const moverRows = rateMovers(records, (id) => state.markets?.[id]?.lastHourlyRate);
 
-  if (stallRows.length === 0 && newlySeen.length === 0) {
-    return { text: null, replyMarkup: undefined, stallCount: 0, newCount: 0 };
+  if (stallRows.length === 0 && newlySeen.length === 0 && moverRows.length === 0) {
+    return { text: null, replyMarkup: undefined, stallCount: 0, newCount: 0, moverCount: 0 };
   }
 
   const ids = activeMarketIds(state);
@@ -265,6 +268,24 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
     }
   }
 
+  // PP/h movers this hour — page 1 only (short list, doesn't paginate).
+  if (moverRows.length && safePage === 0) {
+    lines.push('');
+    lines.push(`📈 <b>上小时 PP/h 变动 (${moverRows.length})</b>`);
+    for (const m of moverRows.slice(0, 8)) {
+      const arrow = m.delta > 0 ? '📈' : '📉';
+      const sign = m.delta > 0 ? '+' : '';
+      const slot = state.markets?.[m.id] ?? null;
+      const display = m.title || slot?.question || `Market ${m.id}`;
+      const safeTitle = htmlEscape(shortTitle(display, 32));
+      const url = marketUrl(m.id, m.title, slot?.question, slot?.slug);
+      lines.push(`${arrow} <code>#${htmlEscape(m.id)}</code> <a href="${url}">${safeTitle}</a> <b>${m.baseline.toFixed(0)}→${m.current.toFixed(0)}</b>/h (${sign}${m.delta.toFixed(0)})`);
+    }
+    if (moverRows.length > 8) {
+      lines.push(`<i>……还有 ${moverRows.length - 8} 个,/movers 查看全部</i>`);
+    }
+  }
+
   // Pagination keyboard — only when there's more than one page.
   let replyMarkup;
   if (totalPages > 1) {
@@ -288,6 +309,7 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
     replyMarkup,
     stallCount: stallRows.length,
     newCount: newlySeen.length,
+    moverCount: moverRows.length,
     totalPages,
   };
 }
@@ -308,7 +330,7 @@ export async function sendHourlyDigest(state) {
     return;
   }
   await broadcastTelegramMessage(page.text, { chatIds, replyMarkup: page.replyMarkup });
-  log(`sent hourly digest (stalls=${page.stallCount} new=${page.newCount} pages=${page.totalPages})`);
+  log(`sent hourly digest (stalls=${page.stallCount} new=${page.newCount} movers=${page.moverCount} pages=${page.totalPages})`);
 }
 
 // Fire on each wall-clock-hour boundary. State.lastHourlyDigestAt tracks

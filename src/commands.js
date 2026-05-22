@@ -1580,49 +1580,17 @@ function moversWinLabel(min) {
 }
 
 async function buildMoversRows(state, windowMin) {
-  const { readHistorySince } = await import('./history.js');
+  const { readHistorySince, rateMovers } = await import('./history.js');
   const since = Date.now() - windowMin * 60_000;
   const records = await readHistorySince(since);
-  // Per market: earliest + latest rate sample inside the window.
-  const byMarket = new Map();
-  for (const r of records) {
-    if (r.event !== 'rate' || !Number.isFinite(r.hourlyRate)) continue;
-    const id = String(r.marketId ?? '');
-    if (!id) continue;
-    const e = byMarket.get(id);
-    if (!e) {
-      byMarket.set(id, {
-        id, title: r.title ?? null,
-        first: r.hourlyRate, firstTs: r.ts,
-        last: r.hourlyRate, lastTs: r.ts,
-      });
-    } else {
-      if (r.ts < e.firstTs) { e.first = r.hourlyRate; e.firstTs = r.ts; }
-      if (r.ts > e.lastTs) { e.last = r.hourlyRate; e.lastTs = r.ts; }
-      if (r.title && !e.title) e.title = r.title;
-    }
-  }
-  const rows = [];
-  for (const e of byMarket.values()) {
-    const slot = state.markets?.[e.id] ?? null;
-    // Current rate from live state catches reward windows that ended (rate
-    // dropped to 0 → stops emitting rate events, so history's `last` is the
-    // last non-zero value, not the current 0).
-    const current = Number.isFinite(slot?.lastHourlyRate) ? slot.lastHourlyRate : e.last;
-    const baseline = e.first;
-    const delta = current - baseline;
-    if (Math.abs(delta) < 0.5) continue; // unchanged within rounding
-    rows.push({
-      id: e.id,
-      title: e.title ?? slot?.title ?? null,
-      question: slot?.question ?? null,
-      slug: slot?.slug ?? null,
-      baseline, current, delta,
-    });
-  }
-  // Biggest absolute move first.
-  rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
-  return rows;
+  const movers = rateMovers(records, (id) => state.markets?.[id]?.lastHourlyRate);
+  // Enrich with title/question/slug from live state for rendering links.
+  return movers.map((m) => ({
+    ...m,
+    title: m.title ?? state.markets?.[m.id]?.title ?? null,
+    question: state.markets?.[m.id]?.question ?? null,
+    slug: state.markets?.[m.id]?.slug ?? null,
+  }));
 }
 
 function moversKeyboard(windowMin, page, totalPages, openUrls) {

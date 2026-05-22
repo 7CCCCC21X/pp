@@ -76,3 +76,41 @@ test('shouldSendHourlyDigest: fires when last send was an hour ago', () => {
   );
   assert.equal(shouldSendHourlyDigest({ lastHourlyDigestAt: prevBoundary }), true);
 });
+
+const { rateMovers } = await import('../src/history.js');
+
+test('rateMovers: detects rises, drops, and drop-to-zero via live override', () => {
+  const now = Date.now();
+  const records = [
+    { ts: now - 50 * 60000, event: 'rate', marketId: 'A', title: 'Alpha', hourlyRate: 200 },
+    { ts: now - 5 * 60000, event: 'rate', marketId: 'A', title: 'Alpha', hourlyRate: 500 },
+    { ts: now - 50 * 60000, event: 'rate', marketId: 'B', title: 'Beta', hourlyRate: 500 },
+    { ts: now - 40 * 60000, event: 'rate', marketId: 'B', title: 'Beta', hourlyRate: 500 },
+    { ts: now - 50 * 60000, event: 'rate', marketId: 'C', title: 'Gamma', hourlyRate: 100 },
+    { ts: now - 5 * 60000, event: 'rate', marketId: 'C', title: 'Gamma', hourlyRate: 100 },
+  ];
+  // B's reward window ended → live rate is 0 (history's last sample is 500).
+  const liveRate = { A: 500, B: 0, C: 100 };
+  const movers = rateMovers(records, (id) => liveRate[id]);
+  const byId = Object.fromEntries(movers.map((m) => [m.id, m]));
+  // A rose 200→500
+  assert.equal(byId.A.baseline, 200);
+  assert.equal(byId.A.current, 500);
+  assert.equal(byId.A.delta, 300);
+  // B dropped 500→0 (detected via live override, not history)
+  assert.equal(byId.B.baseline, 500);
+  assert.equal(byId.B.current, 0);
+  assert.equal(byId.B.delta, -500);
+  // C unchanged → excluded
+  assert.equal(byId.C, undefined);
+  // Sorted by |delta| desc → B (500) before A (300)
+  assert.deepEqual(movers.map((m) => m.id), ['B', 'A']);
+});
+
+test('rateMovers: ignores non-rate events and empty input', () => {
+  assert.deepEqual(rateMovers([], () => null), []);
+  assert.deepEqual(
+    rateMovers([{ ts: 1, event: 'alert', marketId: 'X', kind: 'stall' }], () => null),
+    [],
+  );
+});

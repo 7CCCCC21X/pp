@@ -31,6 +31,45 @@ export async function readHistorySince(sinceMs) {
   return out;
 }
 
+// Compute per-market PP/h change across a set of records (typically a
+// time window from readHistorySince). Baseline = earliest 'rate' sample
+// in the set; current = currentRateOf(id) when finite, else the latest
+// sample. The live override matters because a reward window that ends
+// drops rate→0 and STOPS emitting rate events — so history's latest
+// sample is the last non-zero value, not the current 0. Returns
+// [{ id, title, baseline, current, delta }] sorted by |delta| desc,
+// excluding markets whose rate didn't move (|delta| < 0.5).
+export function rateMovers(records, currentRateOf) {
+  const byMarket = new Map();
+  for (const r of records) {
+    if (r.event !== 'rate' || !Number.isFinite(r.hourlyRate)) continue;
+    const id = String(r.marketId ?? '');
+    if (!id) continue;
+    const e = byMarket.get(id);
+    if (!e) {
+      byMarket.set(id, {
+        id, title: r.title ?? null,
+        first: r.hourlyRate, firstTs: r.ts,
+        last: r.hourlyRate, lastTs: r.ts,
+      });
+    } else {
+      if (r.ts < e.firstTs) { e.first = r.hourlyRate; e.firstTs = r.ts; }
+      if (r.ts > e.lastTs) { e.last = r.hourlyRate; e.lastTs = r.ts; }
+      if (r.title && !e.title) e.title = r.title;
+    }
+  }
+  const rows = [];
+  for (const e of byMarket.values()) {
+    const live = typeof currentRateOf === 'function' ? currentRateOf(e.id) : null;
+    const current = Number.isFinite(live) ? live : e.last;
+    const delta = current - e.first;
+    if (Math.abs(delta) < 0.5) continue;
+    rows.push({ id: e.id, title: e.title, baseline: e.first, current, delta });
+  }
+  rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  return rows;
+}
+
 export function summarize24h(records) {
   const byMarket = new Map();
   for (const r of records) {
