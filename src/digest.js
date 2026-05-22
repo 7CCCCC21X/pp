@@ -91,6 +91,20 @@ function fmtElapsedCompact(ms) {
   return `${h}h${m}m`;
 }
 
+// "Extreme price" check for the digest's exclude filter: one side of the
+// binary already locked near a boundary (best-ask ≥ N¢ OR best-bid ≤
+// (100-N)¢) → the market is effectively decided. cents<=0 disables.
+function isExtremePriceSlot(slot, cents) {
+  if (!Number.isFinite(cents) || cents <= 0) return false;
+  const hi = cents / 100;
+  const lo = (100 - cents) / 100;
+  const bid = slot?.baseline?.bidPrice;
+  const ask = slot?.baseline?.askPrice;
+  if (Number.isFinite(ask) && ask >= hi) return true;
+  if (Number.isFinite(bid) && bid <= lo) return true;
+  return false;
+}
+
 // One-hour pulse. Primary content is the **stall-alerts roll-up** —
 // every market whose 订单簿停滞超过 N 小时 alert fired in the just-
 // finished hour gets one compact row (id · title · stall · PP/h ·
@@ -193,11 +207,22 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
   const records = await readHistorySince(startMs).then(
     (recs) => recs.filter((r) => r.ts < endMs),
   );
-  const stallRows = collectStallRows(records, state);
-  const newlySeen = collectNewlySeen(state, startMs, endMs);
+  let stallRows = collectStallRows(records, state);
+  let newlySeen = collectNewlySeen(state, startMs, endMs);
   // PP/h movers this hour — same logic as /movers but scoped to the hour
   // window's records. Live rate override catches reward windows that ended.
-  const moverRows = rateMovers(records, (id) => state.markets?.[id]?.lastHourlyRate);
+  let moverRows = rateMovers(records, (id) => state.markets?.[id]?.lastHourlyRate);
+
+  // Extreme-price exclusion (default ≥94¢ on). Drops markets where one side
+  // is already locked near a boundary — they're effectively decided and not
+  // worth surfacing in the hourly triage. 0 disables.
+  const extCents = Number.isFinite(state.hourlyDigestExtExclude) ? state.hourlyDigestExtExclude : 94;
+  if (extCents > 0) {
+    const keep = (id) => !isExtremePriceSlot(state.markets?.[id], extCents);
+    stallRows = stallRows.filter((r) => keep(r.id));
+    moverRows = moverRows.filter((r) => keep(r.id));
+    newlySeen = newlySeen.filter((m) => keep(m.id));
+  }
 
   if (stallRows.length === 0 && newlySeen.length === 0 && moverRows.length === 0) {
     return { text: null, replyMarkup: undefined, stallCount: 0, newCount: 0, moverCount: 0 };

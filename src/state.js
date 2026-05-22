@@ -18,6 +18,8 @@ function emptyState() {
     chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
     chatDigests: {},      // chatId -> { intervalMs, queue, lastFlushAt } batched-alert mode
     marketFirstSeen: {},  // marketId -> { ms, title, rate, endMs } — first time we saw it as rewarded (powers /new)
+    hourlyDigestOnly: false,   // true = suppress per-alert sends, keep only the hourly summary
+    hourlyDigestExtExclude: 94, // exclude markets with a side ≥N¢ (or ≤(100-N)¢) from the hourly digest; 0 = off
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHourlyDigestAt: 0,

@@ -170,41 +170,50 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
   const badge = PRIORITY_BADGE[priority];
   const decorated = badge ? `${badge} ${message}` : message;
   const tagged = `${decorated}\n\n#${kind} #market_${marketId}${badge ? ` #${priority}` : ''}`;
+  // Digest-only mode (/hourly only on): suppress the individual send but
+  // still log to history so the hourly summary rolls it up. Exempt kinds
+  // (watch / snapshot / *_recovered) are explicit follows / low-volume
+  // positive pings — those still go through.
+  const digestOnly = !isExempt && !!state.hourlyDigestOnly;
   try {
-    const chatIds = chatsForKind(state, kind);
-    if (chatIds.length === 0) {
-      log(`[${marketId}] suppress ${kind} (no eligible chats — admin chat unset?)`);
-      return false;
-    }
-    // Split chats into "send now" vs "queue for digest". watch / snapshot
-    // (ADMIN_ONLY_KINDS) are never digested — user explicitly registered
-    // those for immediate per-market follow.
-    const baseKind = kind.replace(/_recovered$/, '');
-    const isDigestable = !ADMIN_ONLY_KINDS.has(baseKind);
-    const immediate = [];
-    if (isDigestable) {
-      for (const cid of chatIds) {
-        const d = state.chatDigests?.[cid];
-        if (d?.intervalMs > 0) {
-          if (!Array.isArray(d.queue)) d.queue = [];
-          d.queue.push({
-            kind, marketId,
-            title: slot.title ?? null,
-            rate: slot.lastHourlyRate ?? 0,
-            priority,
-            ts: Date.now(),
-          });
-          // Cap to avoid unbounded growth between flushes.
-          if (d.queue.length > 100) d.queue = d.queue.slice(-100);
-        } else {
-          immediate.push(cid);
-        }
-      }
+    if (digestOnly) {
+      log(`[${marketId}] suppress ${kind} send (digest-only mode; logged for hourly summary)`);
     } else {
-      immediate.push(...chatIds);
-    }
-    if (immediate.length) {
-      await broadcastTelegramMessage(tagged, { chatIds: immediate, replyMarkup: alertKeyboard(marketId) });
+      const chatIds = chatsForKind(state, kind);
+      if (chatIds.length === 0) {
+        log(`[${marketId}] suppress ${kind} (no eligible chats — admin chat unset?)`);
+        return false;
+      }
+      // Split chats into "send now" vs "queue for digest". watch / snapshot
+      // (ADMIN_ONLY_KINDS) are never digested — user explicitly registered
+      // those for immediate per-market follow.
+      const baseKind = kind.replace(/_recovered$/, '');
+      const isDigestable = !ADMIN_ONLY_KINDS.has(baseKind);
+      const immediate = [];
+      if (isDigestable) {
+        for (const cid of chatIds) {
+          const d = state.chatDigests?.[cid];
+          if (d?.intervalMs > 0) {
+            if (!Array.isArray(d.queue)) d.queue = [];
+            d.queue.push({
+              kind, marketId,
+              title: slot.title ?? null,
+              rate: slot.lastHourlyRate ?? 0,
+              priority,
+              ts: Date.now(),
+            });
+            // Cap to avoid unbounded growth between flushes.
+            if (d.queue.length > 100) d.queue = d.queue.slice(-100);
+          } else {
+            immediate.push(cid);
+          }
+        }
+      } else {
+        immediate.push(...chatIds);
+      }
+      if (immediate.length) {
+        await broadcastTelegramMessage(tagged, { chatIds: immediate, replyMarkup: alertKeyboard(marketId) });
+      }
     }
   } catch (err) {
     warn(`[${marketId}] telegram send (${kind}) failed:`, err.message);

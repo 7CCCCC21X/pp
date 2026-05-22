@@ -63,7 +63,7 @@ const PRIVATE_MENU = [
   { command: 'diagdiscover', description: '对比 REST/GraphQL 两个发现源的数量' },
   { command: 'refresh', description: '立即刷新 PP/h 缓存（显示耗时）' },
   { command: 'digest', description: '发送 24 小时摘要' },
-  { command: 'hourly', description: '触发整点摘要(每小时自动发,可手动加发一次)' },
+  { command: 'hourly', description: '整点摘要(发=立即触发;only on/off=只收摘要;ext N/off=排除极端价)' },
   { command: 'config', description: '查看当前监控条件 / 阈值 / 过滤器' },
   { command: 'activate', description: '在群里激活机器人（仅 admin）' },
   { command: 'whitelist', description: '管理白名单（仅 admin）' },
@@ -1961,7 +1961,7 @@ const HELP = [
   '/diagdiscover — 对比 REST/GraphQL 两个发现源（监控数量看着不对时用）',
   '/refresh — 立即刷新 PP/h 缓存',
   '/digest — 立即发送 24h 摘要',
-  '/hourly — 立即触发一次整点摘要(默认每 UTC 整点自动发)',
+  '/hourly — 立即触发整点摘要(每 UTC 整点自动发)；/hourly only on=只收摘要不收逐条；/hourly ext 94=摘要排除一边≥94¢(默认开)；/hourly cfg=看设置',
   '/scan &lt;minRate&gt; &lt;minRem&gt; — 自定义筛选 + 替换 watchlist',
   '',
   '<b>👥 权限 / 群组</b>',
@@ -3141,9 +3141,50 @@ async function handle(text, state, ctx, chatId, fromId) {
     }
 
     case '/hourly': {
-      // Manually trigger the hourly pulse — bypasses the wall-clock-hour
-      // gate but reuses the same render. Useful for "I want a snapshot
-      // right now without waiting for the top of the hour".
+      const parts = arg.split(/\s+/).filter(Boolean);
+      const sub = (parts[0] ?? '').toLowerCase();
+      // /hourly only on|off  — digest-only mode (mute per-alert sends)
+      // /hourly ext <N>|off  — exclude markets with a side ≥N¢ from digest
+      // /hourly cfg          — show current settings
+      // /hourly (no arg)     — trigger one now
+      if (sub === 'only') {
+        const v = (parts[1] ?? '').toLowerCase();
+        if (v === 'on' || v === 'off') {
+          state.hourlyDigestOnly = v === 'on';
+          await ctx.persist();
+          return state.hourlyDigestOnly
+            ? '🔕 已开启<b>只收整点摘要</b>模式:逐条提醒不再推送,仍按小时汇总。\n(watch / snapshot / 恢复提醒不受影响)'
+            : '🔔 已关闭只收整点摘要模式,恢复逐条实时提醒。';
+        }
+        return '用法:/hourly only on  开启只收摘要\n     /hourly only off 关闭';
+      }
+      if (sub === 'ext') {
+        const v = (parts[1] ?? '').toLowerCase();
+        if (v === 'off' || v === '0') {
+          state.hourlyDigestExtExclude = 0;
+          await ctx.persist();
+          return '📈 整点摘要:已关闭极端价排除(显示全部)。';
+        }
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 1 && n <= 99) {
+          state.hourlyDigestExtExclude = Math.round(n);
+          await ctx.persist();
+          return `📈 整点摘要:已设为排除 一边 ≥${Math.round(n)}¢ 或 ≤${100 - Math.round(n)}¢ 的市场。`;
+        }
+        return '用法:/hourly ext 94  (排除 ≥94¢ 的)\n     /hourly ext off (不排除)';
+      }
+      if (sub === 'cfg' || sub === 'status' || sub === 'config') {
+        const onlyOn = !!state.hourlyDigestOnly;
+        const ext = Number.isFinite(state.hourlyDigestExtExclude) ? state.hourlyDigestExtExclude : 94;
+        return [
+          '⏱ <b>整点摘要设置</b>',
+          `· 只收摘要模式: <b>${onlyOn ? '开' : '关'}</b> (/hourly only on|off)`,
+          `· 极端价排除: <b>${ext > 0 ? `≥${ext}¢` : '关'}</b> (/hourly ext &lt;N&gt;|off)`,
+          '',
+          '发 /hourly 立即触发一次。',
+        ].join('\n');
+      }
+      // No (recognised) arg → trigger a manual pulse.
       if (typeof ctx.requestHourlyDigest === 'function') {
         ctx.requestHourlyDigest();
         return '已触发整点摘要(下一 tick 发出)。';
