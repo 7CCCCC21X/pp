@@ -39,6 +39,7 @@ export async function discoverRewardedMarkets() {
     rewarded.push({
       id: String(m.id),
       title: m.title ?? m.question ?? null,
+      question: m.question ?? null,
       hourlyRate: rate,
       endMs: marketEndMs(m),
     });

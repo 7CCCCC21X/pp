@@ -156,6 +156,7 @@ export function recordMarketFirstSeen(state, markets) {
     map[id] = {
       ms: bootstrap ? 0 : now,
       title: m?.title ?? null,
+      question: m?.question ?? null,
       rate: Number.isFinite(m?.hourlyRate) ? m.hourlyRate : null,
       endMs: Number.isFinite(m?.endMs) ? m.endMs : null,
     };

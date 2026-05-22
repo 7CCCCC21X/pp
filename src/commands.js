@@ -829,7 +829,16 @@ const NEW_DEFAULT = {
   winH: 24, minRate: 0, minRem: 0,
   bits: '100100', thresh: 'inf', dir: 'le',
   sort: 't',
+  noUpDown: true, // hide "Bitcoin/ETH Up or Down" recurring intraday spam by default
 };
+
+// "Up or Down" intraday markets (Bitcoin/ETH/SOL ...) are auto-generated
+// every few minutes and flood /new — match them by title/question text so
+// the noUpDown filter can drop them.
+function isUpOrDownMarket(slot) {
+  const t = `${slot?.title ?? ''} ${slot?.question ?? ''}`;
+  return /up or down/i.test(t);
+}
 
 function fmtHoursLabel(h) {
   const n = Number(h);
@@ -851,7 +860,7 @@ function isPositiveIntStr(s) {
 }
 
 function parseNewFilter(parts) {
-  // parts: [winH, minRate, minRem, bits, thresh, dir, sort]
+  // parts: [winH, minRate, minRem, bits, thresh, dir, sort, noUpDown]
   const winH = isPositiveIntStr(parts[0]) ? Number(parts[0]) : NEW_DEFAULT.winH;
   const minRate = isPositiveIntStr(parts[1]) ? Number(parts[1]) : NEW_DEFAULT.minRate;
   const minRem = isPositiveIntStr(parts[2]) ? Number(parts[2]) : NEW_DEFAULT.minRem;
@@ -860,16 +869,18 @@ function parseNewFilter(parts) {
     ? parts[4] : NEW_DEFAULT.thresh;
   const dir = LIST_DIRS.includes(parts[5]) ? parts[5] : NEW_DEFAULT.dir;
   const sort = NEW_SORTS.includes(parts[6]) ? parts[6] : NEW_DEFAULT.sort;
+  // noUpDown: '1'/'0'. Absent (old callbacks) → default (hide).
+  const noUpDown = parts[7] == null ? NEW_DEFAULT.noUpDown : parts[7] === '1';
   return {
     winH: Math.min(720 * 24, Math.max(1, winH)),
-    minRate, minRem, bits, thresh, dir, sort,
+    minRate, minRem, bits, thresh, dir, sort, noUpDown,
   };
 }
 
 function newFilterToCbParts(f) {
   return [
     String(f.winH), String(f.minRate), String(f.minRem),
-    f.bits, f.thresh, f.dir, f.sort,
+    f.bits, f.thresh, f.dir, f.sort, f.noUpDown ? '1' : '0',
   ];
 }
 
@@ -894,6 +905,7 @@ function newWizardText(f) {
     `⌛ 最短剩余: <b>${fmtHoursLabel(f.minRem)}</b>`,
     `📐 累加层级: ${picked.length ? `<b>${picked.join(' + ')}</b>` : '<i>未选 (=不过滤盘口)</i>'}`,
     `💵 盘口总额: <b>${threshLabel}</b>${customThreshTag}`,
+    `🪙 比特币涨跌类: <b>${f.noUpDown ? '隐藏' : '显示'}</b>`,
     `📊 排序: <b>${NEW_SORT_LABELS[f.sort]}</b>`,
     '',
     '<i>盘口过滤 (层级 + 总额) 开启时 🚀 会重抓 orderbook,可能耗时几十秒;</i>',
@@ -905,8 +917,7 @@ function newWizardText(f) {
 function newWizardKeyboard(f) {
   const cb = (action, override = {}) => {
     const merged = { ...f, ...override };
-    const [w, r, m, b, t, d, s] = newFilterToCbParts(merged);
-    return `new:${action}:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`;
+    return `new:${action}:${newFilterToCbParts(merged).join(':')}:0`;
   };
   const sel = parseStaleBits(f.bits);
   const winMark = (h) => Number(h) === f.winH ? `✅ ${fmtHoursLabel(h)}` : fmtHoursLabel(h);
@@ -988,7 +999,11 @@ function newWizardKeyboard(f) {
         },
       ],
       LIST_DIRS.map((d) => ({ text: dirMark(d), callback_data: cb('set', { dir: d }) })),
-      [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
+      [{ text: '— 🪙 比特币涨跌 · 📊 排序 —', callback_data: 'page:noop' }],
+      [{
+        text: f.noUpDown ? '✅ 隐藏 比特币涨跌类' : '⬜ 隐藏 比特币涨跌类',
+        callback_data: cb('set', { noUpDown: !f.noUpDown }),
+      }],
       NEW_SORTS.map((s) => ({ text: sortMark(s), callback_data: cb('set', { sort: s }) })),
       [
         { text: '🚀 应用', callback_data: cb('run') },
@@ -1005,7 +1020,8 @@ function newFilterIsActive(f) {
     || f.bits !== NEW_DEFAULT.bits
     || f.thresh !== NEW_DEFAULT.thresh
     || f.dir !== NEW_DEFAULT.dir
-    || f.sort !== NEW_DEFAULT.sort;
+    || f.sort !== NEW_DEFAULT.sort
+    || f.noUpDown !== NEW_DEFAULT.noUpDown;
 }
 
 // Back-compat aliases for code that still imports the stale-prefixed names.
@@ -1706,15 +1722,16 @@ export async function handleHourlyDigestCallback(data, { chatId, messageId, stat
 //          run / cancel.
 export async function handleNewWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
   if (!data.startsWith('new:')) return false;
-  // Callback shape: new:<action>:<winH>:<minRate>:<minRem>:<bits>:<thresh>:<dir>:<sort>:<page>
-  // (10 parts) — older 7-part callbacks from pre-depth-filter releases still
-  // parse via parseNewFilter's default fallbacks.
+  // Callback shape:
+  //   new:<action>:<winH>:<minRate>:<minRem>:<bits>:<thresh>:<dir>:<sort>:<noUpDown>:<page>
+  // (11 parts). Older callbacks with fewer fields still parse via
+  // parseNewFilter's default fallbacks; the page is always the LAST part.
   const parts = data.split(':');
   if (parts.length < 3) return true;
   const action = parts[1];
-  // Slot positions: parts[2..8] = [winH, minRate, minRem, bits, thresh, dir, sort]; parts[9] = page.
-  const f = parseNewFilter(parts.slice(2, 9));
-  const page = Math.max(0, Number(parts[9]) || 0);
+  // Filter fields are everything between the action and the trailing page.
+  const f = parseNewFilter(parts.slice(2, parts.length - 1));
+  const page = Math.max(0, Number(parts[parts.length - 1]) || 0);
 
   if (action === 'wizard' || action === 'set') {
     try {
@@ -2265,12 +2282,12 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
       ? opts.thresh : NEW_DEFAULT.thresh,
     dir: LIST_DIRS.includes(opts.dir) ? opts.dir : NEW_DEFAULT.dir,
     sort: NEW_SORTS.includes(opts.sort) ? opts.sort : NEW_DEFAULT.sort,
+    noUpDown: typeof opts.noUpDown === 'boolean' ? opts.noUpDown : NEW_DEFAULT.noUpDown,
   };
   const pageCb = (p) => {
     if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${ext}:${p}`;
     if (isNewCmd) {
-      const [w, r, m, b, t, d, s] = newFilterToCbParts(newF);
-      return `new:page:${w}:${r}:${m}:${b}:${t}:${d}:${s}:${p}`;
+      return `new:page:${newFilterToCbParts(newF).join(':')}:${p}`;
     }
     return `page:${cmd}:${p}`;
   };
@@ -2309,10 +2326,10 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
       tagBits.push(`${picked} ${op} $${newF.thresh}`);
     }
     if (newF.sort !== NEW_DEFAULT.sort) tagBits.push(NEW_SORT_LABELS[newF.sort]);
-    const [w, r, m, b, t, d, s] = newFilterToCbParts(newF);
+    if (!newF.noUpDown) tagBits.push('含涨跌类');
     rows.push([{
       text: active ? `🎚 调整 (${tagBits.join(' · ')})` : '🎚 过滤 / 排序',
-      callback_data: `new:wizard:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
+      callback_data: `new:wizard:${newFilterToCbParts(newF).join(':')}:0`,
     }]);
   }
   // "🌐 N" url buttons — one per market on the current page. Each is a
@@ -2396,6 +2413,7 @@ function renderListPage(cmd, page, state, filter = null) {
           ? filter.thresh : NEW_DEFAULT.thresh,
         dir: LIST_DIRS.includes(filter?.dir) ? filter.dir : NEW_DEFAULT.dir,
         sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
+        noUpDown: typeof filter?.noUpDown === 'boolean' ? filter.noUpDown : NEW_DEFAULT.noUpDown,
       };
       const cutoff = Date.now() - f.winH * 3600 * 1000;
       const remCutoff = f.minRem > 0 ? Date.now() + f.minRem * 3600 * 1000 : null;
@@ -2410,9 +2428,14 @@ function renderListPage(cmd, page, state, filter = null) {
         const slot = state.markets[id] ?? null;
         const synthSlot = slot ?? {
           title: info?.title ?? null,
+          question: info?.question ?? null,
           lastHourlyRate: info?.rate ?? null,
           endMs: info?.endMs ?? null,
         };
+        // Drop "Bitcoin/ETH Up or Down" recurring intraday markets when the
+        // noUpDown filter is on (default) — they're auto-generated every few
+        // minutes and otherwise flood the feed.
+        if (f.noUpDown && isUpOrDownMarket(synthSlot)) continue;
         const rate = Number.isFinite(synthSlot.lastHourlyRate) ? synthSlot.lastHourlyRate : 0;
         // /new = "新上奖励市场" — only show markets that ACTUALLY pay PP
         // right now. Short-lived markets (e.g. "Bitcoin Up or Down" 5-min
@@ -2699,6 +2722,7 @@ function renderListPage(cmd, page, state, filter = null) {
         ? filter.thresh : NEW_DEFAULT.thresh,
       dir: LIST_DIRS.includes(filter?.dir) ? filter.dir : NEW_DEFAULT.dir,
       sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
+      noUpDown: typeof filter?.noUpDown === 'boolean' ? filter.noUpDown : NEW_DEFAULT.noUpDown,
     };
   }
   if (!rows.length) {
