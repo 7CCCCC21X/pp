@@ -70,6 +70,36 @@ test('isSnoozed: cleans expired entry', () => {
   assert.equal(state.snoozes['999'], undefined);
 });
 
+const { stallDurationMs } = await import('../src/state.js');
+const POLL = 300000; // POLL_INTERVAL_MS default
+const CAP = 2 * POLL;
+
+test('stallDurationMs: uses the accumulator plus a capped live sliver', () => {
+  const now = 10_000_000;
+  // Observed 3h ago at this tick; one poll interval has elapsed since.
+  const slot = { stallMs: 3 * 3600 * 1000, lastObservedAt: now - POLL };
+  assert.equal(stallDurationMs(slot, now), 3 * 3600 * 1000 + POLL);
+});
+
+test('stallDurationMs: live sliver is capped so a gap does not inflate it', () => {
+  const now = 10_000_000;
+  // Bot has been dark for 6h since the last successful observation — the
+  // displayed stall must only grow by the cap, not the whole 6h gap.
+  const slot = { stallMs: 3600 * 1000, lastObservedAt: now - 6 * 3600 * 1000 };
+  assert.equal(stallDurationMs(slot, now), 3600 * 1000 + CAP);
+});
+
+test('stallDurationMs: falls back to lastChangeAt for legacy slots', () => {
+  const now = 10_000_000;
+  const slot = { lastChangeAt: now - 2 * 3600 * 1000 };
+  assert.equal(stallDurationMs(slot, now), 2 * 3600 * 1000);
+});
+
+test('stallDurationMs: null when there is nothing to measure', () => {
+  assert.equal(stallDurationMs(null, 1), null);
+  assert.equal(stallDurationMs({}, 1), null);
+});
+
 const { isAdminChat, isAdminUser, isPermittedChat, addAllowedChat, removeAllowedChat, broadcastChats } = await import('../src/state.js');
 
 test('isAdminChat: matches TELEGRAM_CHAT_ID env', () => {

@@ -17,6 +17,7 @@ import {
   removeAllowedChat,
   broadcastChats,
   effectiveOverride,
+  stallDurationMs,
 } from './state.js';
 import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
@@ -2659,7 +2660,7 @@ function renderListPage(cmd, page, state, filter = null) {
       rows = allRows
         .filter(({ slot }) => isLive(slot) && Number.isFinite(slot.lastChangeAt))
         .map(({ id, slot }) => {
-          const sinceMs = Date.now() - slot.lastChangeAt;
+          const sinceMs = stallDurationMs(slot) ?? 0;
           const thresholdH = effectiveOverride(state, id, 'staleHours', config.staleHours);
           const sumUsd = sel ? sumLevels(slot.recentBook, sel) : null;
           return { id, slot, sinceMs, thresholdH, sumUsd };
@@ -2729,7 +2730,7 @@ function renderListPage(cmd, page, state, filter = null) {
       rows = allRows
         .map(({ id, slot }) => {
           const sinceMs = Number.isFinite(slot?.lastChangeAt)
-            ? Date.now() - slot.lastChangeAt
+            ? stallDurationMs(slot)
             : null;
           const sumUsd = sel ? sumLevels(slot?.recentBook, sel) : null;
           let status = 'alive';
@@ -2930,7 +2931,7 @@ async function buildStatusDashboard(state) {
   if (ppRows.length) {
     lines.push('🔥 <b>PP/h Top</b>');
     for (const { id, slot } of ppRows.slice(0, 10)) {
-      const since = slot.lastChangeAt ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}` : '';
+      const since = slot.lastChangeAt ? `停滞 ${fmtElapsed(stallDurationMs(slot) ?? 0)}` : '';
       lines.push(compactOpportunityRow(id, slot, since));
     }
   }
@@ -2964,7 +2965,7 @@ function statusLine(state, id) {
   if (slot.lastError) return `#${id}${tag} ${title} — ⚠ ${slot.lastError}`;
   if (slot.lastSkipReason) return `#${id}${tag} ${title} — ⏭ ${slot.lastSkipReason}`;
   if (slot.lastChangeAt == null) return `#${id}${tag} ${title} — 等待首次抓取`;
-  const since = Date.now() - slot.lastChangeAt;
+  const since = stallDurationMs(slot) ?? 0;
   const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
 
   // Remaining time + estimated total PP available for the rest of the market.
@@ -3718,7 +3719,7 @@ async function handle(text, state, ctx, chatId, fromId) {
           ? `${slot.lastHourlyRate.toFixed(0)}/h`
           : '?/h';
         const since = slot?.lastChangeAt
-          ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}`
+          ? `停滞 ${fmtElapsed(stallDurationMs(slot) ?? 0)}`
           : '';
         lines.push(`<code>#${htmlEscape(id)}</code> ${title} — ${rate}${since ? ` · ${since}` : ''}`);
       }

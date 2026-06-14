@@ -46,6 +46,8 @@ function ensureSlot(state, marketId, cur, now) {
     slot = {
       baseline: cur,
       lastChangeAt: now,
+      lastObservedAt: now,
+      stallMs: 0,
       lastSeenAt: now,
       alerted: false,
       lastMid: midOf({
@@ -444,6 +446,23 @@ export async function checkMarket(marketId, state, { isPaused }) {
   const lastSeenAt = slot.lastSeenAt ?? now;
   slot.lastSeenAt = now;
 
+  // Gap-aware stall accounting. `lastObservedAt` is the previous *successful*
+  // orderbook fetch (stub/error ticks don't bump it), so the delta below is
+  // real watched time. Cap it at 2× the poll interval so a monitoring gap
+  // (downtime, a run of fetch errors, a restart) doesn't get counted as the
+  // book sitting still. The accumulation/reset happens after change
+  // detection, below.
+  const prevObservedAt = slot.lastObservedAt;
+  slot.lastObservedAt = now;
+  // Seed slots persisted before stallMs existed so the leaderboard keeps its
+  // current value across a deploy instead of snapping back to 0.
+  if (!Number.isFinite(slot.stallMs)) {
+    slot.stallMs = Number.isFinite(slot.lastChangeAt) ? Math.max(0, now - slot.lastChangeAt) : 0;
+  }
+  const observedGapMs = Number.isFinite(prevObservedAt)
+    ? Math.min(Math.max(now - prevObservedAt, 0), 2 * config.pollIntervalMs)
+    : 0;
+
   // Per-tick rate logging — used by /digest to compute 24h PP totals.
   if (totalHourlyRate > 0) {
     const dtMs = Math.min(now - lastSeenAt, 2 * config.pollIntervalMs);
@@ -545,9 +564,14 @@ export async function checkMarket(marketId, state, { isPaused }) {
     }).catch(() => {});
     slot.baseline = cur;
     slot.lastChangeAt = now;
+    slot.stallMs = 0;
     slot.alerted = false;
     return;
   }
+
+  // Book held steady this tick — add the observed (capped) delta. Done even
+  // when paused/filtered: muting alerts doesn't mean the book moved.
+  slot.stallMs += observedGapMs;
 
   await detectStall(ctx);
 }

@@ -1,17 +1,17 @@
 import { config } from '../config.js';
 import { htmlEscape } from '../telegram.js';
 import { fmtElapsed, marketLink, formatOrderbookBlock, formatOpportunitySummary } from '../format.js';
-import { effectiveOverride } from '../state.js';
+import { effectiveOverride, stallDurationMs } from '../state.js';
 
 export async function detectStall(ctx) {
   const { state, slot, orderbook, marketId, totalHourlyRate, isPaused, filtered, now, alert, log, zone } = ctx;
+  const elapsedMs = stallDurationMs(slot, now) ?? 0;
   if (!config.alertStall || isPaused || filtered) {
     const why = !config.alertStall ? 'stall alerts off' : isPaused ? 'paused' : 'filtered';
-    log(`[${marketId}] unchanged ${fmtElapsed(now - slot.lastChangeAt)} (${why})`);
+    log(`[${marketId}] unchanged ${fmtElapsed(elapsedMs)} (${why})`);
     return;
   }
   const staleHours = effectiveOverride(state, marketId, 'staleHours', config.staleHours);
-  const elapsedMs = now - slot.lastChangeAt;
   const staleMs = staleHours * 3600 * 1000;
   if (elapsedMs < staleMs) {
     log(`[${marketId}] unchanged ${fmtElapsed(elapsedMs)} (alerted=${slot.alerted})`);
