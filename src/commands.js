@@ -17,6 +17,7 @@ import {
   removeAllowedChat,
   broadcastChats,
   effectiveOverride,
+  stallDurationMs,
 } from './state.js';
 import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
@@ -793,13 +794,29 @@ function extFilterActive(e) {
   return parseExtRaw(e).mode !== 'off';
 }
 
-function passesExtFilter(slot, ext) {
+// Freshest known top-of-book for a slot. The 极端价 filter must agree with
+// the orderbook the user opens (buildProbeMessage fetches live), so prefer
+// the wizard-refetched book (slot.recentBook, seconds old) over the monitor
+// baseline (up to a poll interval stale). lastObservedAt dates the baseline;
+// recentBook carries its own fetchedAt — newest wins.
+export function extTopOfBook(slot) {
+  if (!slot) return { bid: null, ask: null };
+  const rb = slot.recentBook;
+  const rbAt = Number.isFinite(rb?.fetchedAt) ? rb.fetchedAt : -Infinity;
+  const baseAt = Number.isFinite(slot.lastObservedAt) ? slot.lastObservedAt : -Infinity;
+  const finite = (v) => (Number.isFinite(v) ? v : null);
+  if (rb && rbAt >= baseAt) {
+    return { bid: finite(rb.bids?.[0]?.price), ask: finite(rb.asks?.[0]?.price) };
+  }
+  return { bid: finite(slot.baseline?.bidPrice), ask: finite(slot.baseline?.askPrice) };
+}
+
+export function passesExtFilter(slot, ext) {
   const p = parseExtRaw(ext);
   if (p.mode === 'off') return true;
   const hi = p.val / 100;
   const lo = (100 - p.val) / 100;
-  const bid = slot?.baseline?.bidPrice;
-  const ask = slot?.baseline?.askPrice;
+  const { bid, ask } = extTopOfBook(slot);
   const askExt = Number.isFinite(ask) && ask >= hi;
   const bidExt = Number.isFinite(bid) && bid <= lo;
   const isExtreme = askExt || bidExt;
@@ -1477,10 +1494,12 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
   }
 
   if (action === 'run') {
-    // No depth filter active → just re-render with the chosen sort + ext
-    // filter (cache-only knobs). Skips the orderbook refetch. This makes
-    // "switch sort" / "toggle 极端价" a 1-tap instant operation.
-    if (!staleFilterIsActive(safeBits, safeThresh)) {
+    // Refetch the orderbook when a filter that depends on live book data is
+    // active: the depth-sum filter (needs every level) OR the 极端价 filter
+    // (its bid/ask must match the orderbook the user opens, which is fetched
+    // live). Pure sort changes stay a 1-tap instant re-render off the cache.
+    const needsRefetch = staleFilterIsActive(safeBits, safeThresh) || extFilterActive(safeExt);
+    if (!needsRefetch) {
       const reply = renderListPage(kind, 0, state, filter);
       if (reply) {
         try {
@@ -2659,7 +2678,7 @@ function renderListPage(cmd, page, state, filter = null) {
       rows = allRows
         .filter(({ slot }) => isLive(slot) && Number.isFinite(slot.lastChangeAt))
         .map(({ id, slot }) => {
-          const sinceMs = Date.now() - slot.lastChangeAt;
+          const sinceMs = stallDurationMs(slot) ?? 0;
           const thresholdH = effectiveOverride(state, id, 'staleHours', config.staleHours);
           const sumUsd = sel ? sumLevels(slot.recentBook, sel) : null;
           return { id, slot, sinceMs, thresholdH, sumUsd };
@@ -2729,7 +2748,7 @@ function renderListPage(cmd, page, state, filter = null) {
       rows = allRows
         .map(({ id, slot }) => {
           const sinceMs = Number.isFinite(slot?.lastChangeAt)
-            ? Date.now() - slot.lastChangeAt
+            ? stallDurationMs(slot)
             : null;
           const sumUsd = sel ? sumLevels(slot?.recentBook, sel) : null;
           let status = 'alive';
@@ -2930,7 +2949,7 @@ async function buildStatusDashboard(state) {
   if (ppRows.length) {
     lines.push('🔥 <b>PP/h Top</b>');
     for (const { id, slot } of ppRows.slice(0, 10)) {
-      const since = slot.lastChangeAt ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}` : '';
+      const since = slot.lastChangeAt ? `停滞 ${fmtElapsed(stallDurationMs(slot) ?? 0)}` : '';
       lines.push(compactOpportunityRow(id, slot, since));
     }
   }
@@ -2964,7 +2983,7 @@ function statusLine(state, id) {
   if (slot.lastError) return `#${id}${tag} ${title} — ⚠ ${slot.lastError}`;
   if (slot.lastSkipReason) return `#${id}${tag} ${title} — ⏭ ${slot.lastSkipReason}`;
   if (slot.lastChangeAt == null) return `#${id}${tag} ${title} — 等待首次抓取`;
-  const since = Date.now() - slot.lastChangeAt;
+  const since = stallDurationMs(slot) ?? 0;
   const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
 
   // Remaining time + estimated total PP available for the rest of the market.
@@ -3718,7 +3737,7 @@ async function handle(text, state, ctx, chatId, fromId) {
           ? `${slot.lastHourlyRate.toFixed(0)}/h`
           : '?/h';
         const since = slot?.lastChangeAt
-          ? `停滞 ${fmtElapsed(Date.now() - slot.lastChangeAt)}`
+          ? `停滞 ${fmtElapsed(stallDurationMs(slot) ?? 0)}`
           : '';
         lines.push(`<code>#${htmlEscape(id)}</code> ${title} — ${rate}${since ? ` · ${since}` : ''}`);
       }

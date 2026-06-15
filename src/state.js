@@ -79,6 +79,27 @@ export function isSnoozed(state, marketId) {
   return true;
 }
 
+// Gap-aware orderbook stall duration. Raw `now - lastChangeAt` over-counts
+// because it folds in wall-clock time the monitor wasn't actually watching
+// the book — bot downtime, fetch errors, restarts — and reports it as
+// "stalled". The monitor instead accumulates `slot.stallMs` from the
+// per-tick observed delta (capped at 2× the poll interval, the same guard
+// the rate accounting uses), so only time we genuinely saw an unchanged
+// book counts. Here we add the (also capped) sliver since the last
+// successful observation so a between-ticks read stays live without
+// inflating during a gap. Falls back to the legacy timestamp for slots
+// persisted before stallMs existed.
+export function stallDurationMs(slot, now = Date.now()) {
+  if (!slot) return null;
+  if (Number.isFinite(slot.stallMs)) {
+    const since = Number.isFinite(slot.lastObservedAt)
+      ? Math.min(Math.max(now - slot.lastObservedAt, 0), 2 * config.pollIntervalMs)
+      : 0;
+    return slot.stallMs + since;
+  }
+  return Number.isFinite(slot.lastChangeAt) ? Math.max(0, now - slot.lastChangeAt) : null;
+}
+
 // Per-market threshold override. Returns the effective value for a knob,
 // preferring the per-market override if set, otherwise the global default.
 export function effectiveOverride(state, marketId, key, fallback) {
