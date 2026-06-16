@@ -5,7 +5,12 @@ process.env.TELEGRAM_BOT_TOKEN ??= 'x';
 process.env.TELEGRAM_CHAT_ID ??= '1';
 process.env.MARKET_IDS ??= 'A,B,C';
 
-const { passesExtFilter, extTopOfBook } = await import('../src/commands.js');
+const { passesExtFilter, extTopOfBook, rememberCustomExtPreset, listWizardKeyboard } = await import('../src/commands.js');
+
+// Flatten an inline_keyboard to the list of button texts for easy assertions.
+function buttonTexts(kb) {
+  return kb.inline_keyboard.flat().map((b) => b.text);
+}
 
 test('extTopOfBook: prefers the fresher of recentBook vs baseline', () => {
   // recentBook newer than the monitor baseline → use it.
@@ -53,4 +58,48 @@ test('passesExtFilter: bid side counts as extreme too', () => {
 test('passesExtFilter: off mode keeps everything', () => {
   const slot = { baseline: { bidPrice: 0.50, askPrice: 0.52 } };
   assert.equal(passesExtFilter(slot, 'off'), true);
+});
+
+test('rememberCustomExtPreset: stores genuinely-custom values, skips presets', () => {
+  const state = { customExtPresets: [] };
+  rememberCustomExtPreset(state, '80');   // custom exclude
+  rememberCustomExtPreset(state, 'i70');  // custom include
+  rememberCustomExtPreset(state, '85');   // preset → ignored
+  rememberCustomExtPreset(state, 'off');  // off → ignored
+  assert.deepEqual(state.customExtPresets, ['i70', '80']); // most-recent first
+});
+
+test('rememberCustomExtPreset: dedupes (move-to-front) and caps the list', () => {
+  const state = { customExtPresets: [] };
+  for (const v of ['81', '82', '83', '84', '85custom', '86']) {
+    // 85custom is invalid token → ignored; the rest are kept, capped at 4.
+    rememberCustomExtPreset(state, v);
+  }
+  assert.equal(state.customExtPresets.length, 4);
+  assert.equal(state.customExtPresets[0], '86'); // newest first
+  // Re-adding an existing value moves it to the front without growing the list.
+  rememberCustomExtPreset(state, '83');
+  assert.equal(state.customExtPresets[0], '83');
+  assert.equal(state.customExtPresets.length, 4);
+});
+
+test('listWizardKeyboard: renders retained custom presets + clear button', () => {
+  const kb = listWizardKeyboard('all', '100100', 'inf', 'p', 'le', 'off', ['80', 'i70']);
+  const texts = buttonTexts(kb);
+  assert.ok(texts.includes('排除≥80¢'), 'custom exclude button shown');
+  assert.ok(texts.includes('仅≥70¢'), 'custom include button shown');
+  assert.ok(texts.includes('🗑 清空'), 'clear button shown');
+});
+
+test('listWizardKeyboard: active custom value appears as a checkmarked button', () => {
+  // Active ext is a custom value not yet in the stored list → still rendered.
+  const kb = listWizardKeyboard('all', '100100', 'inf', 'p', 'le', '77', []);
+  const texts = buttonTexts(kb);
+  assert.ok(texts.includes('✅ 排除≥77¢'), 'active custom value checkmarked');
+});
+
+test('listWizardKeyboard: no custom row when there are none', () => {
+  const kb = listWizardKeyboard('all', '100100', 'inf', 'p', 'le', 'off', []);
+  const texts = buttonTexts(kb);
+  assert.ok(!texts.includes('🗑 清空'), 'no clear button without customs');
 });

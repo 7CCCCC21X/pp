@@ -794,6 +794,27 @@ function extFilterActive(e) {
   return parseExtRaw(e).mode !== 'off';
 }
 
+// Compact button label for an ext token (no space, matches the preset buttons).
+function extBtnLabel(e) {
+  const p = parseExtRaw(e);
+  if (p.mode === 'off') return '关';
+  return p.mode === 'in' ? `仅≥${p.val}¢` : `排除≥${p.val}¢`;
+}
+
+// Max custom 极端价 values kept as buttons (most-recent first).
+const CUSTOM_EXT_PRESET_CAP = 4;
+
+// Remember a user-entered custom 极端价 value so it stays available as a button
+// in the wizard. Only stores genuinely custom values (not the 94/90/85 presets);
+// dedupes (move-to-front) and caps the list so it can't grow unbounded.
+export function rememberCustomExtPreset(state, ext) {
+  const token = normalizeExt(ext);
+  if (token === 'off' || !isCustomExt(token)) return;
+  const prev = Array.isArray(state.customExtPresets) ? state.customExtPresets : [];
+  state.customExtPresets = [token, ...prev.filter((t) => normalizeExt(t) !== token)]
+    .slice(0, CUSTOM_EXT_PRESET_CAP);
+}
+
 // Freshest known top-of-book for a slot. The 极端价 filter must agree with
 // the orderbook the user opens (buildProbeMessage fetches live), so prefer
 // the wizard-refetched book (slot.recentBook, seconds old) over the monitor
@@ -1125,7 +1146,7 @@ function listWizardText(kind, bits, thresh, sort, dir, ext = 'off') {
   return lines.join('\n');
 }
 
-function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
+export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', customPresets = []) {
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const sel = parseStaleBits(bits);
   const sortKey = LIST_SORTS.includes(sort) ? sort : meta.defaultSort;
@@ -1168,10 +1189,32 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
       callback_data: cb('set', bits, thresh, sortKey, dirKey, `i${v}`),
     })),
     {
-      text: isCustomExt(extKey) ? `✅ ✏ (${extLabel(extKey)})` : '✏ 自定义…',
+      // The "✏ 自定义…" button always adds a NEW custom value; the active one
+      // (if custom) shows up as its own checkmarked button in the custom row.
+      text: '✏ 自定义…',
       callback_data: cb('custom-ext'),
     },
   ];
+  // Custom 极端价 values the user added stay as buttons (union with the active
+  // one so a just-applied value always has a visible, checkmarked button even
+  // before it's persisted). Trailing 🗑 clears the whole custom list.
+  const customTokens = [];
+  const seenCustom = new Set();
+  const pushCustom = (tok) => {
+    const n = normalizeExt(tok);
+    if (n === 'off' || !isCustomExt(n) || seenCustom.has(n)) return;
+    seenCustom.add(n);
+    customTokens.push(n);
+  };
+  if (isCustomExt(extKey)) pushCustom(extKey);
+  for (const t of (customPresets ?? [])) pushCustom(t);
+  const extCustomRow = customTokens.slice(0, CUSTOM_EXT_PRESET_CAP).map((tok) => ({
+    text: extMark(tok, extBtnLabel(tok)),
+    callback_data: cb('set', bits, thresh, sortKey, dirKey, tok),
+  }));
+  if (extCustomRow.length) {
+    extCustomRow.push({ text: '🗑 清空', callback_data: cb('ext-clear') });
+  }
   return {
     inline_keyboard: [
       [
@@ -1192,6 +1235,7 @@ function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off') {
       })),
       extExcludeRow,
       extIncludeRow,
+      ...(extCustomRow.length ? [extCustomRow] : []),
       LIST_SORTS.map((s) => ({
         text: sortMark(s),
         callback_data: cb('set', bits, thresh, s),
@@ -1424,11 +1468,34 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
         chatId,
         messageId,
         listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, safeExt),
-        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt),
+        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt, state.customExtPresets),
       );
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
         warn(`${kind} wizard edit failed:`, err.message);
+      }
+    }
+    return true;
+  }
+
+  if (action === 'ext-clear') {
+    // Drop all remembered custom 极端价 values and re-render the wizard.
+    if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
+      state.customExtPresets = [];
+      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('ext-clear persist failed:', err.message));
+    }
+    // If the active filter was one of the cleared customs, fall back to "off".
+    const nextExt = isCustomExt(safeExt) ? 'off' : safeExt;
+    try {
+      await editTelegramMessage(
+        chatId,
+        messageId,
+        listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, nextExt),
+        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, nextExt, state.customExtPresets),
+      );
+    } catch (err) {
+      if (!/message is not modified/i.test(err.message ?? '')) {
+        warn(`${kind} ext-clear edit failed:`, err.message);
       }
     }
     return true;
@@ -4043,6 +4110,8 @@ export function startCommandLoop({ getState, persist, ctx }) {
                   if (num != null && num >= 1 && num <= 99) {
                     const currentMode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
                     nextExt = formatExt(currentMode, num);
+                    // Keep a genuinely-custom value as a button for next time.
+                    rememberCustomExtPreset(state, nextExt);
                   } else {
                     nextExt = 'off';
                   }
@@ -4052,7 +4121,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
                     chatId,
                     pending.messageId,
                     listWizardText(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt),
-                    listWizardKeyboard(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt),
+                    listWizardKeyboard(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt, state.customExtPresets),
                   );
                 } catch (err) {
                   warn(`custom-thresh apply edit failed: ${err.message}`);
