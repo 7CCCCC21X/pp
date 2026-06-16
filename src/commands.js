@@ -2760,6 +2760,8 @@ function renderListPage(cmd, page, state, filter = null) {
           return { id, slot: slot ?? {}, sinceMs, sumUsd, status, statusTag };
         })
         .filter((r) => {
+          // 没有积分（PP/h = 0 / 已 resolve 或无奖励）的市场是噪音，直接去掉。
+          if (typeof r.slot.lastSkipReason === 'string' && r.slot.lastSkipReason.startsWith('PP/h = 0')) return false;
           if (extOn && !passesExtFilter(r.slot, filterExt)) return false;
           if (!filterOn) return true;
           if (!r.slot.recentBook) return false;
