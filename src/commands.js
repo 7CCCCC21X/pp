@@ -1168,7 +1168,7 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
   }));
   const customButton = {
     text: isCustomThresh(thresh) ? `✅ ✏自定义 ($${thresh})` : '✏ 自定义…',
-    callback_data: cb('custom'),
+    callback_data: cb('thresh-pick'),
   };
   // Split threshold buttons into two rows so they fit comfortably on mobile.
   const threshRow1 = threshButtons.slice(0, 4);
@@ -1189,10 +1189,10 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
       callback_data: cb('set', bits, thresh, sortKey, dirKey, `i${v}`),
     })),
     {
-      // The "✏ 自定义…" button always adds a NEW custom value; the active one
-      // (if custom) shows up as its own checkmarked button in the custom row.
+      // The "✏ 自定义…" button opens a value-picker card; the active custom
+      // value (if any) shows up as its own checkmarked button in the custom row.
       text: '✏ 自定义…',
-      callback_data: cb('custom-ext'),
+      callback_data: cb('ext-pick'),
     },
   ];
   // Custom 极端价 values the user added stay as buttons (union with the active
@@ -1246,6 +1246,68 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
       ],
     ],
   };
+}
+
+// Custom-value picker cards. Tapping "✏ 自定义" opens one of these instead of
+// only prompting for a typed number — on desktop the reply box doesn't reliably
+// pop, so a tap-to-choose card is the dependable path. Each value button reuses
+// action 'set' (selects + re-renders the full wizard); "✏ 手动输入" drops to the
+// reply-a-number flow for an arbitrary value; "⬅ 返回" goes back to the wizard.
+const EXT_PICK_EXCLUDE = ['98', '96', '92', '88', '80', '75']; // 排除 ≥N¢ presets
+const EXT_PICK_INCLUDE = ['98', '92', '80'];                   // 仅 ≥N¢ presets
+const THRESH_PICK_VALUES = ['150', '300', '750', '1500', '3000', '10000'];
+
+function chunk(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+export function extPickerKeyboard(kind, bits, thresh, sort, dir, ext) {
+  const extKey = normalizeExt(ext);
+  const cb = (action, e = extKey) => `${kind}:${action}:${bits}:${thresh}:${sort}:${dir}:${e}:0`;
+  const mark = (token, label) => token === extKey ? `✅ ${label}` : label;
+  const excludeRows = chunk(EXT_PICK_EXCLUDE, 3).map((row) =>
+    row.map((v) => ({ text: mark(v, `排除≥${v}¢`), callback_data: cb('set', v) })));
+  const includeRow = EXT_PICK_INCLUDE.map((v) => ({
+    text: mark(`i${v}`, `仅≥${v}¢`), callback_data: cb('set', `i${v}`),
+  }));
+  return {
+    inline_keyboard: [
+      ...excludeRows,
+      includeRow,
+      [
+        { text: '✏ 手动输入数字', callback_data: cb('custom-ext') },
+        { text: '⬅ 返回', callback_data: cb('wizard') },
+      ],
+    ],
+  };
+}
+
+export function threshPickerKeyboard(kind, bits, thresh, sort, dir, ext) {
+  const dirKey = LIST_DIRS.includes(dir) ? dir : 'le';
+  const cb = (action, t = thresh) => `${kind}:${action}:${bits}:${t}:${sort}:${dirKey}:${normalizeExt(ext)}:0`;
+  const mark = (t, label) => t === thresh ? `✅ ${label}` : label;
+  const valueRows = chunk(THRESH_PICK_VALUES, 3).map((row) =>
+    row.map((t) => ({ text: mark(t, staleThreshLabel(t, dirKey)), callback_data: cb('set', t) })));
+  return {
+    inline_keyboard: [
+      ...valueRows,
+      [
+        { text: '✏ 手动输入数字', callback_data: cb('custom') },
+        { text: '⬅ 返回', callback_data: cb('wizard') },
+      ],
+    ],
+  };
+}
+
+function pickerCardText(kind, field) {
+  const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
+  const title = field === 'ext' ? '极端价' : '盘口总额阈值';
+  const hint = field === 'ext'
+    ? '一边 ≥N¢ (或 ≤(100-N)¢) 的市场基本已决断。点下面任意值直接选,或「手动输入」填 1-99。'
+    : '盘口总额上/下限 (USD)。点下面任意值直接选,或「手动输入」填任意金额。';
+  return [`<b>${meta.title} · 自定义${title}</b>`, '', `<i>${hint}</i>`].join('\n');
 }
 
 // Parallel orderbook re-fetch with live progress bar. Edits the wizard
@@ -1463,6 +1525,12 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
   const filter = { bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir, ext: safeExt };
 
   if (action === 'wizard' || action === 'set') {
+    // Selecting a custom 极端价 value (from the picker card or its retained
+    // button) keeps it available as a button next time.
+    if (action === 'set' && isCustomExt(safeExt)) {
+      rememberCustomExtPreset(state, safeExt);
+      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('ext preset persist failed:', err.message));
+    }
     try {
       await editTelegramMessage(
         chatId,
@@ -1496,6 +1564,22 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) {
         warn(`${kind} ext-clear edit failed:`, err.message);
+      }
+    }
+    return true;
+  }
+
+  if (action === 'ext-pick' || action === 'thresh-pick') {
+    // Open a tap-to-choose value card instead of forcing a typed reply.
+    const field = action === 'ext-pick' ? 'ext' : 'thresh';
+    const kb = field === 'ext'
+      ? extPickerKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt)
+      : threshPickerKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt);
+    try {
+      await editTelegramMessage(chatId, messageId, pickerCardText(kind, field), kb);
+    } catch (err) {
+      if (!/message is not modified/i.test(err.message ?? '')) {
+        warn(`${kind} ${field}-pick edit failed:`, err.message);
       }
     }
     return true;

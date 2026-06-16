@@ -5,11 +5,22 @@ process.env.TELEGRAM_BOT_TOKEN ??= 'x';
 process.env.TELEGRAM_CHAT_ID ??= '1';
 process.env.MARKET_IDS ??= 'A,B,C';
 
-const { passesExtFilter, extTopOfBook, rememberCustomExtPreset, listWizardKeyboard } = await import('../src/commands.js');
+const {
+  passesExtFilter,
+  extTopOfBook,
+  rememberCustomExtPreset,
+  listWizardKeyboard,
+  extPickerKeyboard,
+  threshPickerKeyboard,
+} = await import('../src/commands.js');
 
 // Flatten an inline_keyboard to the list of button texts for easy assertions.
 function buttonTexts(kb) {
   return kb.inline_keyboard.flat().map((b) => b.text);
+}
+// All callback_data strings on a keyboard.
+function callbacks(kb) {
+  return kb.inline_keyboard.flat().map((b) => b.callback_data);
 }
 
 test('extTopOfBook: prefers the fresher of recentBook vs baseline', () => {
@@ -102,4 +113,38 @@ test('listWizardKeyboard: no custom row when there are none', () => {
   const kb = listWizardKeyboard('all', '100100', 'inf', 'p', 'le', 'off', []);
   const texts = buttonTexts(kb);
   assert.ok(!texts.includes('🗑 清空'), 'no clear button without customs');
+});
+
+test('listWizardKeyboard: ✏ buttons open picker cards (not direct reply prompt)', () => {
+  const cbs = callbacks(listWizardKeyboard('all', '100100', 'inf', 'p', 'le', 'off', []));
+  assert.ok(cbs.includes('all:ext-pick:100100:inf:p:le:off:0'), '极端价 ✏ opens ext picker');
+  assert.ok(cbs.includes('all:thresh-pick:100100:inf:p:le:off:0'), '阈值 ✏ opens thresh picker');
+});
+
+test('extPickerKeyboard: tap-to-choose values + manual input + back', () => {
+  const kb = extPickerKeyboard('all', '100100', 'inf', 'p', 'le', 'off');
+  const texts = buttonTexts(kb);
+  const cbs = callbacks(kb);
+  assert.ok(texts.includes('排除≥80¢'), 'exclude preset shown');
+  assert.ok(texts.includes('仅≥92¢'), 'include preset shown');
+  assert.ok(texts.includes('✏ 手动输入数字'), 'manual input fallback shown');
+  assert.ok(texts.includes('⬅ 返回'), 'back button shown');
+  // Value buttons select via 'set'; manual input drops to the reply flow.
+  assert.ok(cbs.includes('all:set:100100:inf:p:le:80:0'), 'tapping a value selects it');
+  assert.ok(cbs.includes('all:custom-ext:100100:inf:p:le:off:0'), 'manual input → reply flow');
+});
+
+test('extPickerKeyboard: marks the active value', () => {
+  const texts = buttonTexts(extPickerKeyboard('all', '100100', 'inf', 'p', 'le', '80'));
+  assert.ok(texts.includes('✅ 排除≥80¢'), 'active custom value checkmarked in picker');
+});
+
+test('threshPickerKeyboard: value buttons respect dir and offer manual input', () => {
+  const kb = threshPickerKeyboard('all', '100100', 'inf', 'p', 'ge', 'off');
+  const texts = buttonTexts(kb);
+  const cbs = callbacks(kb);
+  assert.ok(texts.includes('≥$1500'), 'value label respects ge direction');
+  assert.ok(texts.includes('✏ 手动输入数字'), 'manual input fallback shown');
+  assert.ok(cbs.includes('all:set:100100:1500:p:ge:off:0'), 'tapping a value selects it');
+  assert.ok(cbs.includes('all:custom:100100:inf:p:ge:off:0'), 'manual input → reply flow');
 });
