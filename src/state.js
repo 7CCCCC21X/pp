@@ -20,6 +20,7 @@ function emptyState() {
     marketFirstSeen: {},  // marketId -> { ms, title, rate, endMs } — first time we saw it as rewarded (powers /new)
     hourlyDigestOnly: false,   // true = suppress per-alert sends, keep only the hourly summary
     hourlyDigestExtExclude: 94, // exclude markets with a side ≥N¢ (or ≤(100-N)¢) from the hourly digest; 0 = off
+    customExtPresets: [],      // user-added 极端价 filter values (tokens like "80" / "i80") kept as wizard buttons
     lastDiscoveryAt: 0,
     lastDigestSentAt: 0,
     lastHourlyDigestAt: 0,
@@ -53,6 +54,7 @@ export async function loadState() {
       chatRouting: json.chatRouting ?? {},
       chatDigests: json.chatDigests ?? {},
       marketFirstSeen: json.marketFirstSeen ?? {},
+      customExtPresets: Array.isArray(json.customExtPresets) ? json.customExtPresets : [],
       filters: json.filters ?? {},
     };
   } catch (err) {
