@@ -3727,7 +3727,7 @@ async function handle(text, state, ctx, chatId, fromId) {
     //   /alerts on  <kind>         → re-enable
     //   /alerts reset              → clear all overrides (back to env)
     case '/alerts': {
-      const KINDS = ['stall', 'mid_jump', 'wide_spread', 'reward_zone', 'empty_book'];
+      const KINDS = ['stall', 'mid_jump', 'wide_spread', 'reward_zone', 'empty_book', 'price_sanity'];
       const [sub, kind] = arg.split(/\s+/);
       const action = (sub ?? '').toLowerCase();
       const cfgDefault = (k) => ({
@@ -3736,6 +3736,7 @@ async function handle(text, state, ctx, chatId, fromId) {
         wide_spread: config.alertWideSpread,
         reward_zone: config.alertRewardZone,
         empty_book: config.alertEmptyBook,
+        price_sanity: config.alertPriceSanity,
       })[k];
       if (!action || action === 'list' || action === 'ls') {
         const lines = ['🔔 <b>提醒类型开关</b>'];

@@ -14,6 +14,7 @@ function emptyState() {
     allowedChats: [],     // runtime-managed whitelist (private chats / groups)
     quietUntil: 0,        // global silence until this unix ms (0 = off)
     alertKinds: {},       // per-kind on/off override; missing = use config default
+    priceSanity: {},      // ladderKey -> { alertedAt } cooldown for cross-market定价异常 alerts
     snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
     chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
     chatDigests: {},      // chatId -> { intervalMs, queue, lastFlushAt } batched-alert mode
@@ -50,6 +51,7 @@ export async function loadState() {
       allowedChats: json.allowedChats ?? [],
       quietUntil: json.quietUntil ?? 0,
       alertKinds: json.alertKinds ?? {},
+      priceSanity: json.priceSanity ?? {},
       snapshots: json.snapshots ?? {},
       chatRouting: json.chatRouting ?? {},
       chatDigests: json.chatDigests ?? {},
