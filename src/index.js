@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
 import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats, recordMarketFirstSeen } from './state.js';
-import { checkMarket, flushChatDigests } from './monitor.js';
+import { checkMarket, flushChatDigests, checkPriceSanity } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
 import { sendDailyDigest, shouldSendDigest, sendHourlyDigest, shouldSendHourlyDigest } from './digest.js';
@@ -142,6 +142,8 @@ async function tick(state) {
   for (const id of Object.keys(state.markets)) {
     if (!ids.includes(id)) delete state.markets[id];
   }
+  // Cross-market ladder sanity check — needs every slot refreshed first.
+  await checkPriceSanity(state).catch((err) => warn('price sanity check failed:', err.message));
   await maybeDigest(state);
   await maybeHourlyDigest(state);
   await flushChatDigests(state).catch((err) => warn('digest flush failed:', err.message));

@@ -28,7 +28,8 @@ export async function sendDailyDigest(state) {
     sumKey(summary, 'jumpAlerts') +
     sumKey(summary, 'wideSpreadAlerts') +
     sumKey(summary, 'emptyBookAlerts') +
-    sumKey(summary, 'rewardZoneAlerts');
+    sumKey(summary, 'rewardZoneAlerts') +
+    sumKey(summary, 'priceSanityAlerts');
 
   const lines = [
     '📈 <b>过去 24 小时摘要</b>',
@@ -41,6 +42,7 @@ export async function sendDailyDigest(state) {
     sumKey(summary, 'wideSpreadAlerts') > 0 ? `阔差×${sumKey(summary, 'wideSpreadAlerts')}` : '',
     sumKey(summary, 'emptyBookAlerts') > 0 ? `空簿×${sumKey(summary, 'emptyBookAlerts')}` : '',
     sumKey(summary, 'rewardZoneAlerts') > 0 ? `区外×${sumKey(summary, 'rewardZoneAlerts')}` : '',
+    sumKey(summary, 'priceSanityAlerts') > 0 ? `定价异常×${sumKey(summary, 'priceSanityAlerts')}` : '',
   ].filter(Boolean);
   if (alertParts.length) {
     lines.push(`🔔 ${alertParts.join(' · ')}`);
@@ -60,6 +62,7 @@ export async function sendDailyDigest(state) {
       m.wideSpreadAlerts > 0 ? `阔差×${m.wideSpreadAlerts}` : '',
       m.emptyBookAlerts > 0 ? `空簿×${m.emptyBookAlerts}` : '',
       m.rewardZoneAlerts > 0 ? `区外×${m.rewardZoneAlerts}` : '',
+      m.priceSanityAlerts > 0 ? `定价异常×${m.priceSanityAlerts}` : '',
     ].filter(Boolean).join(' · ');
     const stall = m.maxStallMs > 0 ? `停滞 ${fmtElapsed(m.maxStallMs)}` : '';
     lines.push(`${medal} <code>#${htmlEscape(m.marketId)}</code> ${title}`);
@@ -180,6 +183,32 @@ function collectStallRows(records, state) {
   return rows;
 }
 
+// Roll up price_sanity (定价异常) alerts that fired in the window, one row
+// per ladder (most severe kept), sorted by locked-in arbitrage desc.
+function collectSanityRows(records) {
+  const byKey = new Map();
+  for (const r of records) {
+    if (r.event !== 'alert' || r.kind !== 'price_sanity') continue;
+    const key = r.ladderKey ?? String(r.marketId ?? '');
+    const prev = byKey.get(key);
+    const minGap = Number.isFinite(r.minGap) ? r.minGap : prev?.minGap ?? null;
+    if (!prev || (Number.isFinite(r.minGap) && r.minGap < (prev.minGap ?? Infinity))) {
+      byKey.set(key, {
+        key,
+        marketId: r.marketId,
+        title: r.title ?? prev?.title ?? null,
+        question: r.question ?? prev?.question ?? null,
+        slug: r.slug ?? prev?.slug ?? null,
+        minGap,
+        arbUsd: Number.isFinite(r.arbUsd) ? r.arbUsd : prev?.arbUsd ?? 0,
+      });
+    }
+  }
+  const rows = [...byKey.values()];
+  rows.sort((a, b) => (b.arbUsd ?? 0) - (a.arbUsd ?? 0));
+  return rows;
+}
+
 function collectNewlySeen(state, startMs, endMs) {
   const firstSeen = state.marketFirstSeen ?? {};
   const out = [];
@@ -208,6 +237,7 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
     (recs) => recs.filter((r) => r.ts < endMs),
   );
   let stallRows = collectStallRows(records, state);
+  const sanityRows = collectSanityRows(records);
   let newlySeen = collectNewlySeen(state, startMs, endMs);
   // PP/h movers this hour — same logic as /movers but scoped to the hour
   // window's records. Live rate override catches reward windows that ended.
@@ -224,8 +254,8 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
     newlySeen = newlySeen.filter((m) => keep(m.id));
   }
 
-  if (stallRows.length === 0 && newlySeen.length === 0 && moverRows.length === 0) {
-    return { text: null, replyMarkup: undefined, stallCount: 0, newCount: 0, moverCount: 0 };
+  if (stallRows.length === 0 && newlySeen.length === 0 && moverRows.length === 0 && sanityRows.length === 0) {
+    return { text: null, replyMarkup: undefined, stallCount: 0, newCount: 0, moverCount: 0, sanityCount: 0 };
   }
 
   const ids = activeMarketIds(state);
@@ -311,6 +341,21 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
     }
   }
 
+  // Price-sanity (定价异常) roll-up — page 1 only (short list).
+  if (sanityRows.length && safePage === 0) {
+    lines.push('');
+    lines.push(`⚠️ <b>定价异常阶梯 (本小时 ${sanityRows.length})</b>`);
+    for (const r of sanityRows.slice(0, 6)) {
+      const display = r.title || r.question || `Market ${r.marketId}`;
+      const safeTitle = htmlEscape(shortTitle(display, 36));
+      const url = marketUrl(r.marketId, r.title, r.question, r.slug);
+      const gapTag = Number.isFinite(r.minGap) ? `差 ${(r.minGap * 100).toFixed(1)}¢` : '';
+      const arbTag = r.arbUsd > 0 ? ` · 套利≈$${r.arbUsd.toFixed(0)}` : '';
+      lines.push(`• <a href="${url}">${safeTitle}</a> ${gapTag}${arbTag}`);
+    }
+    if (sanityRows.length > 6) lines.push('<i>……/sanity 查看全部</i>');
+  }
+
   // Pagination keyboard — only when there's more than one page.
   let replyMarkup;
   if (totalPages > 1) {
@@ -335,6 +380,7 @@ export async function buildHourlyDigest(state, startMs, endMs, page = 0) {
     stallCount: stallRows.length,
     newCount: newlySeen.length,
     moverCount: moverRows.length,
+    sanityCount: sanityRows.length,
     totalPages,
   };
 }
@@ -355,7 +401,7 @@ export async function sendHourlyDigest(state) {
     return;
   }
   await broadcastTelegramMessage(page.text, { chatIds, replyMarkup: page.replyMarkup });
-  log(`sent hourly digest (stalls=${page.stallCount} new=${page.newCount} movers=${page.moverCount} pages=${page.totalPages})`);
+  log(`sent hourly digest (stalls=${page.stallCount} new=${page.newCount} movers=${page.moverCount} sanity=${page.sanityCount} pages=${page.totalPages})`);
 }
 
 // Fire on each wall-clock-hour boundary. State.lastHourlyDigestAt tracks

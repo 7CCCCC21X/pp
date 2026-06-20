@@ -116,6 +116,15 @@ export const config = {
   alertEmptyBook: bool('ALERT_EMPTY_BOOK', true),
   emptyBookMinMinutes: num('EMPTY_BOOK_MIN_MINUTES', 30),
 
+  // Price-reasonableness (ladder sanity) alert. Cross-market check: within a
+  // ladder over one underlying number ("reach $3B" / "$4B" / "$5B" market
+  // cap), a higher threshold must price strictly lower. Flag when a lower
+  // rung's probability isn't at least PRICE_SANITY_MARGIN above the next
+  // rung — i.e. equal, inverted, or within the margin (default 3¢).
+  alertPriceSanity: bool('ALERT_PRICE_SANITY', true),
+  priceSanityMargin: num('PRICE_SANITY_MARGIN', 0.03),
+  priceSanityCooldownMs: num('PRICE_SANITY_COOLDOWN_MS', 60 * 60 * 1000),
+
   // Reward-zone alert: detect markets where the top of book sits outside
   // Predict.fun's reward zone (orders too far from mid OR too small) so PP
   // is up for grabs. Per-market spreadThreshold / shareThreshold from the
@@ -264,6 +273,10 @@ export function validateConfig() {
   if (config.rewardZoneMaxDistance <= 0 || config.rewardZoneMaxDistance >= 1) {
     errors.push('REWARD_ZONE_MAX_DISTANCE must be in (0, 1)');
   }
+  if (config.priceSanityMargin <= 0 || config.priceSanityMargin >= 1) {
+    errors.push('PRICE_SANITY_MARGIN must be in (0, 1)');
+  }
+  if (config.priceSanityCooldownMs < 0) errors.push('PRICE_SANITY_COOLDOWN_MS must be >= 0');
   if (config.rewardZoneMinSize < 0) errors.push('REWARD_ZONE_MIN_SIZE must be >= 0');
   if (config.discoveryMaxMarkets < 0) errors.push('DISCOVERY_MAX_MARKETS must be >= 0');
   if (config.discoveryIntervalMs < 60_000) errors.push('DISCOVERY_INTERVAL_MS must be >= 60000');

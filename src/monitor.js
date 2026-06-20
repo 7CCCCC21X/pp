@@ -2,9 +2,10 @@ import { config } from './config.js';
 import { getMarketRewardSummary, getOrderbook, marketEndMs, getSlugMapCached, getMarketRestById } from './predict.js';
 import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
-import { fmtElapsed, midOf, spreadOf, rewardZoneStatus, scoreSlot, priorityOf } from './format.js';
+import { fmtElapsed, midOf, spreadOf, rewardZoneStatus, scoreSlot, priorityOf, fmtCents, marketUrl } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
-import { effectiveOverride, broadcastChats } from './state.js';
+import { effectiveOverride, broadcastChats, isSnoozed } from './state.js';
+import { buildLadders, ladderViolations, ladderToken } from './priceSanity.js';
 import { alertKeyboard } from './commands.js';
 import { detectStall } from './alerts/stall.js';
 import { detectWatch } from './alerts/watch.js';
@@ -115,7 +116,7 @@ function chatsForKind(state, kind) {
   });
 }
 
-async function alert(state, kind, slot, marketId, message, extra = {}) {
+async function alert(state, kind, slot, marketId, message, extra = {}, opts = {}) {
   const isExempt = kind === 'watch' || kind === 'snapshot' || kind.endsWith('_recovered');
 
   // 1) Global temporary mute — /quiet sets state.quietUntil.
@@ -214,7 +215,8 @@ async function alert(state, kind, slot, marketId, message, extra = {}) {
         immediate.push(...chatIds);
       }
       if (immediate.length) {
-        await broadcastTelegramMessage(tagged, { chatIds: immediate, replyMarkup: alertKeyboard(marketId) });
+        const replyMarkup = opts.replyMarkup ?? alertKeyboard(marketId);
+        await broadcastTelegramMessage(tagged, { chatIds: immediate, replyMarkup });
       }
     }
   } catch (err) {
@@ -245,6 +247,7 @@ const KIND_LABELS = {
   wide_spread: '🔴 阔差',
   reward_zone: '🎯 奖励区',
   empty_book: '🌊 空簿',
+  price_sanity: '⚠️ 定价异常',
   stall_recovered: '✅ 停滞恢复',
   mid_jump_recovered: '✅ 跳变恢复',
   wide_spread_recovered: '✅ 阔差恢复',
@@ -574,4 +577,190 @@ export async function checkMarket(marketId, state, { isPaused }) {
   slot.stallMs += observedGapMs;
 
   await detectStall(ctx);
+}
+
+// Implied probability of a market from its slot — top-of-book mid, falling
+// back to the last computed mid for slots whose baseline isn't a full book.
+function slotMid(slot) {
+  const bid = slot?.baseline?.bidPrice;
+  const ask = slot?.baseline?.askPrice;
+  if (Number.isFinite(bid) && Number.isFinite(ask)) return (bid + ask) / 2;
+  if (Number.isFinite(slot?.lastMid)) return slot.lastMid;
+  return null;
+}
+
+// Locked-in edge from an inverted adjacent pair, using executable
+// top-of-book prices. For an 'up' ladder, reaching the higher cap implies
+// reaching the lower one, so YES(lo) ≥ YES(hi) at settlement: buy YES(lo)
+// at its ask, sell YES(hi) at its bid → credit (bid_hi − ask_lo) per share,
+// payoff ≥ 0. 'down' ladders flip which side is bought. Returns { edge, usd }
+// where edge is in probability units and usd ≈ edge × executable shares.
+// Null when either book side is missing.
+function pairArb(loRung, hiRung, direction) {
+  const lo = loRung?.slot?.baseline;
+  const hi = hiRung?.slot?.baseline;
+  if (!lo || !hi) return null;
+  let edge;
+  let size;
+  if (direction === 'down') {
+    if (!Number.isFinite(hi.askPrice) || !Number.isFinite(lo.bidPrice)) return null;
+    edge = lo.bidPrice - hi.askPrice;
+    size = Math.min(hi.askSize ?? 0, lo.bidSize ?? 0);
+  } else {
+    if (!Number.isFinite(lo.askPrice) || !Number.isFinite(hi.bidPrice)) return null;
+    edge = hi.bidPrice - lo.askPrice;
+    size = Math.min(lo.askSize ?? 0, hi.bidSize ?? 0);
+  }
+  const usd = edge > 0 && size > 0 ? edge * size : 0;
+  return { edge, usd };
+}
+
+// Render just the ladder body (context + rungs with violation flags), no
+// header. Shared by the push alert, /sanity, /ladders and /probe.
+export function formatPriceSanityLadder(issue, margin) {
+  const dirNote = issue.direction === 'down'
+    ? '门槛越高、概率应越高'
+    : '门槛越高、概率应越低';
+  const lines = [
+    `<i>${htmlEscape(issue.context.replace(/\s+/g, ' ').trim())}</i>`,
+    `<i>(${dirNote})</i>`,
+    '',
+  ];
+  let prev = null;
+  for (const rung of issue.rungs) {
+    const slot = rung.slot;
+    // Link text is the threshold token itself (e.g. "30亿" / "$4B").
+    const safeRaw = htmlEscape(rung.raw);
+    const label = slot
+      ? `<a href="${marketUrl(rung.id, slot.title, slot.question, slot.slug)}">${safeRaw}</a>`
+      : safeRaw;
+    let line = `· ${label} <code>${fmtCents(rung.mid)}</code>`;
+    if (prev) {
+      const gap = issue.direction === 'down' ? rung.mid - prev.mid : prev.mid - rung.mid;
+      if (gap <= margin) {
+        line += ` ❌ 差 ${(gap * 100).toFixed(1)}¢`;
+        const arb = pairArb(prev, rung, issue.direction);
+        if (arb && arb.usd > 0) line += ` · 套利≈$${arb.usd.toFixed(0)}`;
+      }
+    }
+    lines.push(line);
+    prev = rung;
+  }
+  return lines.join('\n');
+}
+
+function renderPriceSanity(issue, margin) {
+  const head = `⚠️ <b>定价不合理</b> · 相邻档位差 ≤ ${(margin * 100).toFixed(0)}¢`;
+  const arb = issue.arbUsd > 0 ? ` · 锁定套利≈<b>$${issue.arbUsd.toFixed(0)}</b>` : '';
+  return [head + arb, formatPriceSanityLadder(issue, margin)].join('\n');
+}
+
+// Gather every active, non-paused market that carries a parseable threshold
+// and a usable mid, keyed for ladder grouping.
+function gatherLadderEntries(state) {
+  const entries = [];
+  const slotById = new Map();
+  for (const [id, slot] of Object.entries(state.markets)) {
+    if (!slot) continue;
+    if (state.pausedIds?.includes(id) || isSnoozed(state, id)) continue;
+    const text = slot.question || slot.title;
+    if (!text) continue;
+    const mid = slotMid(slot);
+    if (mid == null) continue;
+    entries.push({ id, text, mid });
+    slotById.set(id, slot);
+  }
+  return { entries, slotById };
+}
+
+// All detected ladders (≥2 rungs), priced soundly or not. Each is enriched
+// with live slots, monotonicity violations, a stable token, and severity
+// metrics (minGap / arbUsd). Pure read — no alerting. Shared by /ladders,
+// /sanity, /probe and the per-tick checker.
+export function collectLadders(state) {
+  const { entries, slotById } = gatherLadderEntries(state);
+  if (entries.length < 2) return [];
+  const ladders = buildLadders(entries);
+  for (const l of ladders) {
+    for (const rung of l.rungs) rung.slot = slotById.get(rung.id) ?? null;
+    l.violations = ladderViolations(l, config.priceSanityMargin);
+    l.token = ladderToken(l.key);
+    l.minGap = l.violations.length
+      ? Math.min(...l.violations.map((v) => v.gap))
+      : null;
+    l.arbUsd = l.violations.reduce(
+      (acc, v) => acc + (pairArb(v.lo, v.hi, l.direction)?.usd ?? 0),
+      0,
+    );
+  }
+  return ladders;
+}
+
+// Just the violating ladders, most severe first: biggest locked-in arbitrage
+// on top, then most-inverted mid gap.
+export function collectPriceSanityIssues(state) {
+  return collectLadders(state)
+    .filter((l) => l.violations.length > 0)
+    .sort((a, b) => (b.arbUsd - a.arbUsd) || (a.minGap - b.minGap));
+}
+
+// Inline keyboard for a price_sanity alert: jump to the full list + mute
+// this specific ladder so a known-quirky market pair stops re-alerting.
+function priceSanityKeyboard(issue) {
+  const hiId = issue.violations[0]?.hi?.id;
+  const row2 = [{ text: '⚠️ 全部异常', callback_data: '/sanity' }];
+  if (hiId) row2.unshift({ text: '🔎 快照', callback_data: `/probe ${hiId}` });
+  return {
+    inline_keyboard: [
+      [{ text: '🔇 静音此阶梯', callback_data: `psmute:${issue.token}` }],
+      row2,
+    ],
+  };
+}
+
+// Cross-market ladder sanity check. Runs once per tick AFTER every market
+// has been refreshed, scanning the active slots for mispriced threshold
+// ladders (see ./priceSanity.js). Each violating ladder fires one alert,
+// rate-limited per-ladder via state.priceSanity[key].
+export async function checkPriceSanity(state) {
+  if (!config.alertPriceSanity) return;
+  const now = Date.now();
+
+  const issues = collectPriceSanityIssues(state);
+  if (!issues.length) return;
+
+  if (!state.priceSanity) state.priceSanity = {};
+  const muted = state.priceSanityMuted ?? {};
+  const seen = new Set();
+  for (const issue of issues) {
+    seen.add(issue.key);
+    // User muted this specific ladder via the alert button — never re-alert.
+    if (muted[issue.token]) continue;
+    const last = state.priceSanity[issue.key]?.alertedAt ?? 0;
+    if (now - last < config.priceSanityCooldownMs) continue;
+
+    // Fire on the most over-priced higher rung (first violation's hi side) —
+    // that's the slot whose probability looks too rich. collectLadders
+    // already attached each rung's live slot.
+    const hi = issue.violations[0].hi;
+    const slot = hi.slot;
+    if (!slot) continue;
+    const msg = renderPriceSanity(issue, config.priceSanityMargin);
+    const ok = await alert(state, 'price_sanity', slot, hi.id, msg, {
+      ladderKey: issue.key,
+      direction: issue.direction,
+      rungs: issue.rungs.map((r) => ({ id: r.id, value: r.value, mid: r.mid })),
+      minGap: issue.minGap,
+      arbUsd: issue.arbUsd,
+    }, { replyMarkup: priceSanityKeyboard(issue) });
+    if (ok) state.priceSanity[issue.key] = { alertedAt: now };
+  }
+
+  // Drop cooldown bookkeeping for ladders that no longer exist so the map
+  // doesn't grow without bound as markets churn.
+  for (const key of Object.keys(state.priceSanity)) {
+    if (!seen.has(key) && now - (state.priceSanity[key]?.alertedAt ?? 0) > config.priceSanityCooldownMs) {
+      delete state.priceSanity[key];
+    }
+  }
 }

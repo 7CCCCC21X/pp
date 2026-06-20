@@ -53,7 +53,9 @@ npm start
 | Command | Purpose |
 |---------|---------|
 | `/menu` | Inline-keyboard quick menu |
-| `/status` | Overview: each market's stall duration, PP/h, reward zone status, plus 24h PP total |
+| `/status` | Overview: market census, total/top PP/h, opportunity counts (gaps/thin/wide/empty/定价异常), 24h PP total |
+| `/sanity` | Mispriced threshold ladders, most arbitrage first (`套利≈$X`); `/sanity unmute all` clears ladder mutes |
+| `/ladders` | Every detected threshold ladder (sound or not) — verify the auto-grouping and eyeball the whole curve |
 | `/list` | Compact id-only listing |
 | `/probe <id>` | Single-market snapshot: top-3 bids/asks, mid/spread, reward zone activation |
 | `/watch <id>` | High-sensitivity tracking: alerts on every detected book move (1-min cooldown) |
@@ -82,10 +84,30 @@ Every alert message has inline buttons: `[静音此市场] [查看状态]`.
 | `wide_spread` | Spread > N for ≥ M minutes | 0.04 / 15min |
 | `empty_book` | Best bid OR ask missing for ≥ M minutes | 30min |
 | `reward_zone` | One side outside `±spreadThreshold` of mid OR size < `shareThreshold` for ≥ M min | 15min, ±6¢, size 100 |
+| `price_sanity` | Threshold-ladder mispricing: a higher cap target priced ≥ a lower one (or within `PRICE_SANITY_MARGIN`) | 3¢ gap |
 | `watch` | Watched market's top-of-book moved (cooldown 1min) | – |
 
 All gated by per-market `[paused]`, the global filter set, and reward presence
 (`SKIP_NO_REWARD=true` skips markets with `hourlyRate=0`).
+
+**`price_sanity`** is a *cross-market* check that runs once per tick after every
+market is refreshed. It groups markets that form a ladder over a single
+underlying number — e.g. "reach a **$3B** market cap", "… **$4B**", "… **$5B**"
+(also Chinese `30亿 / 40亿 / 50亿`, and `$3B ≡ 30亿`). Such a ladder is
+monotonic: a higher target is strictly harder, so its implied probability (mid)
+must be *lower*. The bot flags any adjacent pair whose lower rung isn't at least
+`PRICE_SANITY_MARGIN` (default **3¢**) more likely than the next rung — catching
+equal, inverted, or too-close pricing. "Below $X" ladders are detected and the
+expectation flipped automatically. One alert per ladder, rate-limited by
+`PRICE_SANITY_COOLDOWN_MS` (default 1h). Toggle with `/alerts off price_sanity`.
+View the current mispricings any time with **`/sanity`** (ignores the alert
+cooldown, sorted by locked-in arbitrage `套利≈$X` computed from executable
+top-of-book prices), or **`/ladders`** for every detected ladder including the
+soundly-priced ones. `/status` shows a `定价异常 N` count, and the 24h `/digest`
++ hourly pulse roll up how many fired. `/probe <id>` appends the market's full
+ladder when it belongs to one. Each `price_sanity` alert carries inline buttons:
+`[🔇 静音此阶梯] [🔎 快照] [⚠️ 全部异常]` — muting stops that one ladder from
+re-alerting (`/sanity unmute all` to undo).
 
 ---
 
