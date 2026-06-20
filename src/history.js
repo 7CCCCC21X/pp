@@ -84,6 +84,7 @@ export function summarize24h(records) {
       wideSpreadAlerts: 0,
       emptyBookAlerts: 0,
       rewardZoneAlerts: 0,
+      priceSanityAlerts: 0,
       lastHourlyRate: null,
       maxStallMs: 0,
       ppEarned: 0,
@@ -102,6 +103,7 @@ export function summarize24h(records) {
       if (r.kind === 'wide_spread') slot.wideSpreadAlerts += 1;
       if (r.kind === 'empty_book') slot.emptyBookAlerts += 1;
       if (r.kind === 'reward_zone') slot.rewardZoneAlerts += 1;
+      if (r.kind === 'price_sanity') slot.priceSanityAlerts += 1;
       if (r.kind === 'stall' && Number.isFinite(r.elapsedMs)) {
         slot.maxStallMs = Math.max(slot.maxStallMs, r.elapsedMs);
       }

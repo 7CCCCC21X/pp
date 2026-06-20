@@ -54,7 +54,8 @@ npm start
 |---------|---------|
 | `/menu` | Inline-keyboard quick menu |
 | `/status` | Overview: market census, total/top PP/h, opportunity counts (gaps/thin/wide/empty/定价异常), 24h PP total |
-| `/sanity` | On-demand list of mispriced threshold ladders (same signal as the `price_sanity` alert, ignores cooldown) |
+| `/sanity` | Mispriced threshold ladders, most arbitrage first (`套利≈$X`); `/sanity unmute all` clears ladder mutes |
+| `/ladders` | Every detected threshold ladder (sound or not) — verify the auto-grouping and eyeball the whole curve |
 | `/list` | Compact id-only listing |
 | `/probe <id>` | Single-market snapshot: top-3 bids/asks, mid/spread, reward zone activation |
 | `/watch <id>` | High-sensitivity tracking: alerts on every detected book move (1-min cooldown) |
@@ -100,7 +101,13 @@ equal, inverted, or too-close pricing. "Below $X" ladders are detected and the
 expectation flipped automatically. One alert per ladder, rate-limited by
 `PRICE_SANITY_COOLDOWN_MS` (default 1h). Toggle with `/alerts off price_sanity`.
 View the current mispricings any time with **`/sanity`** (ignores the alert
-cooldown); `/status` shows a `定价异常 N` count in its opportunity census.
+cooldown, sorted by locked-in arbitrage `套利≈$X` computed from executable
+top-of-book prices), or **`/ladders`** for every detected ladder including the
+soundly-priced ones. `/status` shows a `定价异常 N` count, and the 24h `/digest`
++ hourly pulse roll up how many fired. `/probe <id>` appends the market's full
+ladder when it belongs to one. Each `price_sanity` alert carries inline buttons:
+`[🔇 静音此阶梯] [🔎 快照] [⚠️ 全部异常]` — muting stops that one ladder from
+re-alerting (`/sanity unmute all` to undo).
 
 ---
 

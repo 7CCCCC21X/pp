@@ -84,6 +84,18 @@ export function ladderKey(context) {
   return context.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// Short, stable, ASCII handle for a ladder key — used in Telegram
+// callback_data (64-byte limit, no room for a long CJK key) so a "mute
+// this ladder" button can name the ladder. djb2 → base36.
+export function ladderToken(key) {
+  let h = 5381;
+  const s = String(key ?? '');
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(36);
+}
+
 // Which way does probability move with the threshold?
 //   'up'   — higher target is HARDER (reach/hit/above/exceed/达到/突破/以上).
 //            Probability should DECREASE as the number climbs. (default)

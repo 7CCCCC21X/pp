@@ -15,6 +15,7 @@ function emptyState() {
     quietUntil: 0,        // global silence until this unix ms (0 = off)
     alertKinds: {},       // per-kind on/off override; missing = use config default
     priceSanity: {},      // ladderKey -> { alertedAt } cooldown for cross-market定价异常 alerts
+    priceSanityMuted: {}, // ladderToken -> { key, context, mutedAt } muted ladders (via alert button)
     snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
     chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
     chatDigests: {},      // chatId -> { intervalMs, queue, lastFlushAt } batched-alert mode
@@ -52,6 +53,7 @@ export async function loadState() {
       quietUntil: json.quietUntil ?? 0,
       alertKinds: json.alertKinds ?? {},
       priceSanity: json.priceSanity ?? {},
+      priceSanityMuted: json.priceSanityMuted ?? {},
       snapshots: json.snapshots ?? {},
       chatRouting: json.chatRouting ?? {},
       chatDigests: json.chatDigests ?? {},

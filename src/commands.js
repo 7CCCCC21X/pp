@@ -47,7 +47,8 @@ const PRIVATE_MENU = [
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
   { command: 'new', description: '今日新上的有奖励市场（默认 24h；底部按钮可调窗口/PP/h/剩余/排序）' },
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
-  { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低）' },
+  { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
+  { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -1843,6 +1844,35 @@ async function renderMoversPage(state, windowMin, page = 0) {
   return { text: lines.join('\n'), replyMarkup: moversKeyboard(windowMin, safePage, totalPages, openUrls) };
 }
 
+// "🔇 静音此阶梯" button on a price_sanity alert. The button carries the
+// ladder's short token; we resolve its current context for a friendly
+// confirmation, then persist the mute so checkPriceSanity skips it.
+export async function handlePriceSanityMuteCallback(data, { chatId, state, fullCtx }) {
+  if (!data.startsWith('psmute:')) return false;
+  const token = data.slice('psmute:'.length).trim();
+  if (!token) return true;
+  state.priceSanityMuted = state.priceSanityMuted ?? {};
+  const entry = { mutedAt: Date.now(), context: null };
+  try {
+    const { collectLadders } = await import('./monitor.js');
+    const l = collectLadders(state).find((x) => x.token === token);
+    if (l) {
+      entry.key = l.key;
+      entry.context = l.context.replace(/\s+/g, ' ').trim();
+    }
+  } catch {}
+  state.priceSanityMuted[token] = entry;
+  await fullCtx.persist().catch(() => {});
+  const label = entry.context
+    ? `「${htmlEscape(shortTitle(entry.context, 40))}」`
+    : `token <code>${htmlEscape(token)}</code>`;
+  await sendTelegramMessage(
+    `🔇 已静音此阶梯 ${label}。\n不再推送其定价异常提醒；/sanity 仍可查看，<code>/sanity unmute ${htmlEscape(token)}</code> 恢复。`,
+    { chatId },
+  ).catch(() => {});
+  return true;
+}
+
 export async function handleMoversCallback(data, { chatId, messageId, state }) {
   if (!data.startsWith('mv:')) return false;
   const [, action, a, b] = data.split(':');
@@ -2178,7 +2208,8 @@ const HELP = [
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
   '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 可调窗口/最低 PP/h/最短剩余/盘口层级×总额/排序；开盘口过滤会重抓 orderbook；只显示当前有 PP 的）',
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
-  '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；门槛越高概率却没相应更低，相邻档差 ≤ PRICE_SANITY_MARGIN 即列出）',
+  '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序；/sanity unmute all 解除静音）',
+  '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -2366,6 +2397,20 @@ async function buildProbeMessage(marketId, state) {
   lines.push(`奖励区: ±${(zone.maxDistance * 100).toFixed(1)}¢ / size ≥ ${zone.minSize}  (距离: ${srcLabel(zone.maxSource)}, size: ${srcLabel(zone.sizeSource)})`);
   lines.push(`  买侧: ${zone.bidActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.bidReason ?? '未激活')}`}`);
   lines.push(`  卖侧: ${zone.askActivated ? '✓ 激活' : `✗ ${htmlEscape(zone.askReason ?? '未激活')}`}`);
+  // If this market is one rung of a detected threshold ladder, show the whole
+  // curve + any mispricing so the user sees it in the context of its siblings.
+  try {
+    const { collectLadders, formatPriceSanityLadder } = await import('./monitor.js');
+    const ladder = collectLadders(state ?? {})
+      .find((l) => l.rungs.some((r) => r.id === String(marketId)));
+    if (ladder) {
+      lines.push('');
+      lines.push(ladder.violations.length
+        ? `⚠️ <b>所在阶梯（定价异常，差 ${(ladder.minGap * 100).toFixed(1)}¢${ladder.arbUsd > 0 ? ` · 套利≈$${ladder.arbUsd.toFixed(0)}` : ''}）</b>`
+        : '🪜 <b>所在阶梯（定价正常）</b>');
+      lines.push(formatPriceSanityLadder(ladder, config.priceSanityMargin));
+    }
+  } catch {}
   // Same action menu shown after URL paste — one tap to /watch /
   // /snapshot / /add this market.
   return { text: lines.join('\n'), replyMarkup: actionKeyboard(marketId) };
@@ -3471,24 +3516,82 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/sanity':
     case '/arb': {
       // On-demand view of current threshold-ladder mispricings (the same
-      // signal price_sanity alerts push, but listed live and ignoring the
-      // per-ladder alert cooldown).
+      // signal price_sanity alerts push, but listed live, most-severe first,
+      // and ignoring the per-ladder alert cooldown). `/sanity unmute [all|token]`
+      // clears ladder mutes set via the alert button.
       const { collectPriceSanityIssues, formatPriceSanityLadder } = await import('./monitor.js');
+      const sub = arg.trim().toLowerCase();
+      if (sub.startsWith('unmute') || sub === 'reset') {
+        const rest = sub.replace(/^unmute|^reset/, '').trim();
+        state.priceSanityMuted = state.priceSanityMuted ?? {};
+        const muted = state.priceSanityMuted;
+        const n = Object.keys(muted).length;
+        if (!n) return '当前没有被静音的阶梯。';
+        if (!rest || rest === 'all') {
+          state.priceSanityMuted = {};
+          await ctx.persist();
+          return `✅ 已恢复 ${n} 个被静音的阶梯。`;
+        }
+        if (muted[rest]) {
+          delete muted[rest];
+          await ctx.persist();
+          return `✅ 已恢复阶梯 <code>${htmlEscape(rest)}</code>。`;
+        }
+        return `未找到 token <code>${htmlEscape(rest)}</code>。用 /sanity unmute all 全部恢复。`;
+      }
       const issues = collectPriceSanityIssues(state);
+      const muted = state.priceSanityMuted ?? {};
+      const mutedN = Object.keys(muted).length;
       if (!issues.length) {
-        return '✅ 暂无定价异常的阈值阶梯（相邻档位概率差都 &gt; 阈值）。';
+        return '✅ 暂无定价异常的阈值阶梯（相邻档位概率差都 &gt; 阈值）。'
+          + (mutedN ? `\n<i>（${mutedN} 个阶梯已静音，/sanity unmute all 恢复）</i>` : '');
       }
       const CAP = 12;
       const shown = issues.slice(0, CAP);
-      const lines = [
-        `⚠️ <b>定价异常阶梯 (${issues.length})</b> · 相邻档位差 ≤ ${(config.priceSanityMargin * 100).toFixed(0)}¢`,
-        '',
-      ];
+      const totalArb = issues.reduce((a, i) => a + (i.arbUsd ?? 0), 0);
+      const head = `⚠️ <b>定价异常阶梯 (${issues.length})</b> · 相邻档位差 ≤ ${(config.priceSanityMargin * 100).toFixed(0)}¢`
+        + (totalArb > 0 ? ` · 锁定套利≈<b>$${totalArb.toFixed(0)}</b>` : '');
+      const lines = [head, ''];
       for (const issue of shown) {
+        if (muted[issue.token]) lines.push(`🔇 <i>已静音（/sanity unmute ${issue.token} 恢复）</i>`);
         lines.push(formatPriceSanityLadder(issue, config.priceSanityMargin));
         lines.push('');
       }
       if (issues.length > CAP) lines.push(`……还有 ${issues.length - CAP} 个，未全部展开。`);
+      if (mutedN) lines.push(`<i>🔇 ${mutedN} 个阶梯已静音 · /sanity unmute all 恢复</i>`);
+      return lines.join('\n').trim();
+    }
+
+    case '/ladders':
+    case '/ladder': {
+      // Browse every detected threshold ladder, sound or not — useful to
+      // verify the auto-grouping and to eyeball the whole curve at once.
+      const { collectLadders } = await import('./monitor.js');
+      const ladders = collectLadders(state);
+      if (!ladders.length) {
+        return '未识别到任何阈值阶梯（需同一标的 ≥2 个不同门槛的市场，且都有盘口中价）。';
+      }
+      ladders.sort((a, b) =>
+        ((b.violations.length > 0) - (a.violations.length > 0))
+        || (b.arbUsd - a.arbUsd)
+        || (b.rungs.length - a.rungs.length));
+      const CAP = 20;
+      const shown = ladders.slice(0, CAP);
+      const badCount = ladders.filter((l) => l.violations.length).length;
+      const lines = [`🪜 <b>识别到的阈值阶梯 (${ladders.length})</b>${badCount ? ` · 异常 <b>${badCount}</b>` : ''}`, ''];
+      for (const l of shown) {
+        const bad = l.violations.length > 0;
+        const ctxText = htmlEscape(shortTitle(l.context.replace(/\s+/g, ' ').trim(), 50));
+        const rungStr = l.rungs
+          .map((r) => `${htmlEscape(r.raw)} ${(r.mid * 100).toFixed(0)}`)
+          .join(' · ');
+        const status = bad
+          ? `⚠️ 异常(差${(l.minGap * 100).toFixed(1)}¢${l.arbUsd > 0 ? ` 套利≈$${l.arbUsd.toFixed(0)}` : ''})`
+          : '✅ 正常';
+        lines.push(`${bad ? '⚠️' : '·'} <i>${ctxText}</i> — ${l.rungs.length}档 · ${status}`);
+        lines.push(`   ${rungStr}`);
+      }
+      if (ladders.length > CAP) lines.push(`……还有 ${ladders.length - CAP} 个。`);
       return lines.join('\n').trim();
     }
 
@@ -4305,6 +4408,10 @@ export function startCommandLoop({ getState, persist, ctx }) {
             } else if (data.startsWith('mv:')) {
               await handleMoversCallback(data, { chatId, messageId, state }).catch((err) => {
                 warn('movers callback error:', err.message);
+              });
+            } else if (data.startsWith('psmute:')) {
+              await handlePriceSanityMuteCallback(data, { chatId, state, fullCtx }).catch((err) => {
+                warn('price sanity mute error:', err.message);
               });
             } else if (data.startsWith('page:')) {
               await handlePageCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {

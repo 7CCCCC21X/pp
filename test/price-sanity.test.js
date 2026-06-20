@@ -5,6 +5,7 @@ import {
   parseCapThreshold,
   ladderContext,
   ladderKey,
+  ladderToken,
   classifyDirection,
   buildLadders,
   ladderViolations,
@@ -69,6 +70,16 @@ test('classifyDirection', () => {
   assert.equal(classifyDirection('市值达到30亿'), 'up');
   assert.equal(classifyDirection('Will price be below $3B?'), 'down');
   assert.equal(classifyDirection('低于30亿'), 'down');
+});
+
+test('ladderToken: stable, ASCII, short, distinct per key', () => {
+  const a = ladderToken('will coin reach ___ market cap');
+  const b = ladderToken('will coin reach ___ market cap');
+  const c = ladderToken('will eth reach ___ market cap');
+  assert.equal(a, b);                 // deterministic
+  assert.notEqual(a, c);              // distinct keys → distinct tokens
+  assert.match(a, /^[0-9a-z]+$/);     // ASCII base36, callback_data-safe
+  assert.ok(a.length <= 8);
 });
 
 const entry = (id, text, mid) => ({ id, text, mid });
