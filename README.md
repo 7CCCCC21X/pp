@@ -53,7 +53,8 @@ npm start
 | Command | Purpose |
 |---------|---------|
 | `/menu` | Inline-keyboard quick menu |
-| `/status` | Overview: each market's stall duration, PP/h, reward zone status, plus 24h PP total |
+| `/status` | Overview: market census, total/top PP/h, opportunity counts (gaps/thin/wide/empty/定价异常), 24h PP total |
+| `/sanity` | On-demand list of mispriced threshold ladders (same signal as the `price_sanity` alert, ignores cooldown) |
 | `/list` | Compact id-only listing |
 | `/probe <id>` | Single-market snapshot: top-3 bids/asks, mid/spread, reward zone activation |
 | `/watch <id>` | High-sensitivity tracking: alerts on every detected book move (1-min cooldown) |
@@ -98,6 +99,8 @@ must be *lower*. The bot flags any adjacent pair whose lower rung isn't at least
 equal, inverted, or too-close pricing. "Below $X" ladders are detected and the
 expectation flipped automatically. One alert per ladder, rate-limited by
 `PRICE_SANITY_COOLDOWN_MS` (default 1h). Toggle with `/alerts off price_sanity`.
+View the current mispricings any time with **`/sanity`** (ignores the alert
+cooldown); `/status` shows a `定价异常 N` count in its opportunity census.
 
 ---
 

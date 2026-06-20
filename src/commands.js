@@ -47,6 +47,7 @@ const PRIVATE_MENU = [
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
   { command: 'new', description: '今日新上的有奖励市场（默认 24h；底部按钮可调窗口/PP/h/剩余/排序）' },
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
+  { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -101,6 +102,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
         ],
         [
           { text: '📈 PP 变动', callback_data: '/movers' },
+          { text: '⚠️ 定价异常', callback_data: '/sanity' },
           { text: '⏱ 摘要设置', callback_data: '/hourly' },
         ],
         [
@@ -2176,6 +2178,7 @@ const HELP = [
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
   '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 可调窗口/最低 PP/h/最短剩余/盘口层级×总额/排序；开盘口过滤会重抓 orderbook；只显示当前有 PP 的）',
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
+  '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；门槛越高概率却没相应更低，相邻档差 ≤ PRICE_SANITY_MARGIN 即列出）',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -3048,6 +3051,13 @@ async function buildStatusDashboard(state) {
     && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)
   ).length;
 
+  // Cross-market ladder-mispricing count (same signal as /sanity).
+  let sanityCount = 0;
+  try {
+    const { collectPriceSanityIssues } = await import('./monitor.js');
+    sanityCount = collectPriceSanityIssues(state).length;
+  } catch {}
+
   let totalPP24h = null;
   try {
     const { readHistorySince, summarize24h } = await import('./history.js');
@@ -3073,6 +3083,7 @@ async function buildStatusDashboard(state) {
   if (thinCount > 0) oppParts.push(`薄盘 ${thinCount}`);
   if (wideCount > 0) oppParts.push(`宽差 ${wideCount}`);
   if (emptyCount > 0) oppParts.push(`空簿 ${emptyCount}`);
+  if (sanityCount > 0) oppParts.push(`⚠️ 定价异常 ${sanityCount}`);
   if (watched.length) oppParts.push(`👁 追踪 ${watched.length}`);
   lines.push(`🎯 ${oppParts.join(' · ')}`);
   lines.push('');
@@ -3114,7 +3125,7 @@ async function buildStatusDashboard(state) {
     for (const f of fresh) lines.push(f);
     lines.push('');
   }
-  lines.push('更多: /top /gaps /thin /wide /empty');
+  lines.push('更多: /top /gaps /thin /wide /empty' + (sanityCount > 0 ? ' /sanity' : ''));
 
   return lines.join('\n');
 }
@@ -3455,6 +3466,30 @@ async function handle(text, state, ctx, chatId, fromId) {
         }
       }
       return await renderMoversPage(state, windowMin, 0);
+    }
+
+    case '/sanity':
+    case '/arb': {
+      // On-demand view of current threshold-ladder mispricings (the same
+      // signal price_sanity alerts push, but listed live and ignoring the
+      // per-ladder alert cooldown).
+      const { collectPriceSanityIssues, formatPriceSanityLadder } = await import('./monitor.js');
+      const issues = collectPriceSanityIssues(state);
+      if (!issues.length) {
+        return '✅ 暂无定价异常的阈值阶梯（相邻档位概率差都 &gt; 阈值）。';
+      }
+      const CAP = 12;
+      const shown = issues.slice(0, CAP);
+      const lines = [
+        `⚠️ <b>定价异常阶梯 (${issues.length})</b> · 相邻档位差 ≤ ${(config.priceSanityMargin * 100).toFixed(0)}¢`,
+        '',
+      ];
+      for (const issue of shown) {
+        lines.push(formatPriceSanityLadder(issue, config.priceSanityMargin));
+        lines.push('');
+      }
+      if (issues.length > CAP) lines.push(`……还有 ${issues.length - CAP} 个，未全部展开。`);
+      return lines.join('\n').trim();
     }
 
     case '/top':

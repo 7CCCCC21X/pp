@@ -588,12 +588,13 @@ function slotMid(slot) {
   return null;
 }
 
-function renderPriceSanity(issue, margin) {
+// Render just the ladder body (context + rungs with violation flags), no
+// header. Shared by the push alert and the on-demand /sanity list view.
+export function formatPriceSanityLadder(issue, margin) {
   const dirNote = issue.direction === 'down'
     ? '门槛越高、概率应越高'
     : '门槛越高、概率应越低';
   const lines = [
-    `⚠️ <b>定价不合理</b> · 相邻档位差 ≤ ${(margin * 100).toFixed(0)}¢`,
     `<i>${htmlEscape(issue.context.replace(/\s+/g, ' ').trim())}</i>`,
     `<i>(${dirNote})</i>`,
     '',
@@ -617,14 +618,18 @@ function renderPriceSanity(issue, margin) {
   return lines.join('\n');
 }
 
-// Cross-market ladder sanity check. Runs once per tick AFTER every market
-// has been refreshed, scanning the active slots for mispriced threshold
-// ladders (see ./priceSanity.js). Each violating ladder fires one alert,
-// rate-limited per-ladder via state.priceSanity[key].
-export async function checkPriceSanity(state) {
-  if (!config.alertPriceSanity) return;
-  const now = Date.now();
+function renderPriceSanity(issue, margin) {
+  return [
+    `⚠️ <b>定价不合理</b> · 相邻档位差 ≤ ${(margin * 100).toFixed(0)}¢`,
+    formatPriceSanityLadder(issue, margin),
+  ].join('\n');
+}
 
+// Scan the active market slots for mispriced threshold ladders. Pure read —
+// no alerting, no cooldown — so both the per-tick checker and the on-demand
+// /sanity command can share it. Each returned issue has its rungs' live
+// slots attached for link rendering.
+export function collectPriceSanityIssues(state) {
   const entries = [];
   const slotById = new Map();
   for (const [id, slot] of Object.entries(state.markets)) {
@@ -637,9 +642,23 @@ export async function checkPriceSanity(state) {
     entries.push({ id, text, mid });
     slotById.set(id, slot);
   }
-  if (entries.length < 2) return;
-
+  if (entries.length < 2) return [];
   const issues = findPriceSanityIssues(entries, config.priceSanityMargin);
+  for (const issue of issues) {
+    for (const rung of issue.rungs) rung.slot = slotById.get(rung.id) ?? null;
+  }
+  return issues;
+}
+
+// Cross-market ladder sanity check. Runs once per tick AFTER every market
+// has been refreshed, scanning the active slots for mispriced threshold
+// ladders (see ./priceSanity.js). Each violating ladder fires one alert,
+// rate-limited per-ladder via state.priceSanity[key].
+export async function checkPriceSanity(state) {
+  if (!config.alertPriceSanity) return;
+  const now = Date.now();
+
+  const issues = collectPriceSanityIssues(state);
   if (!issues.length) return;
 
   if (!state.priceSanity) state.priceSanity = {};
@@ -649,13 +668,11 @@ export async function checkPriceSanity(state) {
     const last = state.priceSanity[issue.key]?.alertedAt ?? 0;
     if (now - last < config.priceSanityCooldownMs) continue;
 
-    // Attach the live slot to each rung so the render can link markets.
-    for (const rung of issue.rungs) rung.slot = slotById.get(rung.id) ?? null;
-
     // Fire on the most over-priced higher rung (first violation's hi side) —
-    // that's the slot whose probability looks too rich.
+    // that's the slot whose probability looks too rich. collectPriceSanityIssues
+    // already attached each rung's live slot.
     const hi = issue.violations[0].hi;
-    const slot = slotById.get(hi.id);
+    const slot = hi.slot;
     if (!slot) continue;
     const msg = renderPriceSanity(issue, config.priceSanityMargin);
     const ok = await alert(state, 'price_sanity', slot, hi.id, msg, {
