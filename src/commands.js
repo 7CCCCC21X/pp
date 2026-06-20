@@ -2212,7 +2212,7 @@ const HELP = [
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
   '/new — 今日新上的有奖励市场（默认 24h；底部 🎚 可调窗口/最低 PP/h/最短剩余/盘口层级×总额/排序；开盘口过滤会重抓 orderbook；只显示当前有 PP 的）',
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
-  '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序；/sanity unmute all 解除静音）',
+  '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
   '/opportunities — 机会评分（实验）',
   '',
@@ -3523,7 +3523,7 @@ async function handle(text, state, ctx, chatId, fromId) {
       // signal price_sanity alerts push, but listed live, most-severe first,
       // and ignoring the per-ladder alert cooldown). `/sanity unmute [all|token]`
       // clears ladder mutes set via the alert button.
-      const { collectPriceSanityIssues, formatPriceSanityLadder } = await import('./monitor.js');
+      const { collectPriceSanityIssues, formatPriceSanityLadder, priceSanityExtCents } = await import('./monitor.js');
       const sub = arg.trim().toLowerCase();
       if (sub.startsWith('unmute') || sub === 'reset') {
         const rest = sub.replace(/^unmute|^reset/, '').trim();
@@ -3543,25 +3543,45 @@ async function handle(text, state, ctx, chatId, fromId) {
         }
         return `未找到 token <code>${htmlEscape(rest)}</code>。用 /sanity unmute all 全部恢复。`;
       }
+      // /sanity ext <N|off> — exclude near-decided extreme-price rungs (one
+      // side ≥N¢ / ≤(100-N)¢) from the check. Mirrors the hourly digest's 94¢.
+      if (sub.startsWith('ext')) {
+        const val = sub.replace(/^ext/, '').trim();
+        if (!val) {
+          const cur = priceSanityExtCents(state);
+          return `当前极端价排除：${cur > 0 ? `≥${cur}¢ 或 ≤${100 - cur}¢ 的已决市场不参与检测` : '关闭（所有档位都参与）'}\n用法：/sanity ext 94 · /sanity ext 80 · /sanity ext off`;
+        }
+        if (val === 'off' || val === '0') {
+          state.priceSanityExtExclude = 0;
+          await ctx.persist();
+          return '✅ 已关闭极端价排除——所有档位都参与定价异常检测。';
+        }
+        const n = Number(val);
+        if (!Number.isFinite(n) || n <= 50 || n >= 100) {
+          return '阈值需在 (50, 100)，例如 94 = 排除 ≥94¢ 或 ≤6¢ 的已决市场。/sanity ext off 关闭。';
+        }
+        state.priceSanityExtExclude = n;
+        await ctx.persist();
+        return `✅ 已设置极端价排除 ≥${n}¢ / ≤${100 - n}¢（接近决出的市场不参与检测）。`;
+      }
       const issues = collectPriceSanityIssues(state);
       const muted = state.priceSanityMuted ?? {};
       const mutedN = Object.keys(muted).length;
+      const extCents = priceSanityExtCents(state);
+      const extTag = extCents > 0 ? ` · 排除 ≥${extCents}¢` : '';
       if (!issues.length) {
-        return '✅ 暂无定价异常的阈值阶梯（相邻档位概率差都 &gt; 阈值）。'
+        return `✅ 暂无定价异常的阈值阶梯（相邻档位概率差都 &gt; ${(config.priceSanityMargin * 100).toFixed(0)}¢${extTag}）。`
           + (mutedN ? `\n<i>（${mutedN} 个阶梯已静音，/sanity unmute all 恢复）</i>` : '');
       }
-      const CAP = 12;
-      const shown = issues.slice(0, CAP);
       const totalArb = issues.reduce((a, i) => a + (i.arbUsd ?? 0), 0);
-      const head = `⚠️ <b>定价异常阶梯 (${issues.length})</b> · 相邻档位差 ≤ ${(config.priceSanityMargin * 100).toFixed(0)}¢`
+      const head = `⚠️ <b>定价异常阶梯 (${issues.length})</b> · 相邻档位差 ≤ ${(config.priceSanityMargin * 100).toFixed(0)}¢${extTag}`
         + (totalArb > 0 ? ` · 锁定套利≈<b>$${totalArb.toFixed(0)}</b>` : '');
       const lines = [head, ''];
-      for (const issue of shown) {
+      for (const issue of issues) {
         if (muted[issue.token]) lines.push(`🔇 <i>已静音（/sanity unmute ${issue.token} 恢复）</i>`);
         lines.push(formatPriceSanityLadder(issue, config.priceSanityMargin));
         lines.push('');
       }
-      if (issues.length > CAP) lines.push(`……还有 ${issues.length - CAP} 个，未全部展开。`);
       if (mutedN) lines.push(`<i>🔇 ${mutedN} 个阶梯已静音 · /sanity unmute all 恢复</i>`);
       return lines.join('\n').trim();
     }
@@ -3570,7 +3590,7 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/ladder': {
       // Browse every detected threshold ladder, sound or not — useful to
       // verify the auto-grouping and to eyeball the whole curve at once.
-      const { collectLadders } = await import('./monitor.js');
+      const { collectLadders, priceSanityExtCents } = await import('./monitor.js');
       const ladders = collectLadders(state);
       if (!ladders.length) {
         return '未识别到任何阈值阶梯（需同一标的 ≥2 个不同门槛的市场，且都有盘口中价）。';
@@ -3579,11 +3599,11 @@ async function handle(text, state, ctx, chatId, fromId) {
         ((b.violations.length > 0) - (a.violations.length > 0))
         || (b.arbUsd - a.arbUsd)
         || (b.rungs.length - a.rungs.length));
-      const CAP = 20;
-      const shown = ladders.slice(0, CAP);
       const badCount = ladders.filter((l) => l.violations.length).length;
-      const lines = [`🪜 <b>识别到的阈值阶梯 (${ladders.length})</b>${badCount ? ` · 异常 <b>${badCount}</b>` : ''}`, ''];
-      for (const l of shown) {
+      const extCents = priceSanityExtCents(state);
+      const extTag = extCents > 0 ? ` · 排除 ≥${extCents}¢` : '';
+      const lines = [`🪜 <b>识别到的阈值阶梯 (${ladders.length})</b>${badCount ? ` · 异常 <b>${badCount}</b>` : ''}${extTag}`, ''];
+      for (const l of ladders) {
         const bad = l.violations.length > 0;
         const ctxText = htmlEscape(shortTitle(l.context.replace(/\s+/g, ' ').trim(), 50));
         const rungStr = l.rungs
@@ -3595,7 +3615,6 @@ async function handle(text, state, ctx, chatId, fromId) {
         lines.push(`${bad ? '⚠️' : '·'} <i>${ctxText}</i> — ${l.rungs.length}档 · ${status}`);
         lines.push(`   ${rungStr}`);
       }
-      if (ladders.length > CAP) lines.push(`……还有 ${ladders.length - CAP} 个。`);
       return lines.join('\n').trim();
     }
 

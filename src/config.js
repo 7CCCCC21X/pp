@@ -124,6 +124,10 @@ export const config = {
   alertPriceSanity: bool('ALERT_PRICE_SANITY', true),
   priceSanityMargin: num('PRICE_SANITY_MARGIN', 0.03),
   priceSanityCooldownMs: num('PRICE_SANITY_COOLDOWN_MS', 60 * 60 * 1000),
+  // Exclude near-decided markets from the ladder check: a rung whose best-ask
+  // ≥ N¢ OR best-bid ≤ (100-N)¢ is effectively resolved and only adds noise.
+  // Cents; 0 disables. Runtime override via /sanity ext <N|off>.
+  priceSanityExtExclude: num('PRICE_SANITY_EXT_EXCLUDE', 94),
 
   // Reward-zone alert: detect markets where the top of book sits outside
   // Predict.fun's reward zone (orders too far from mid OR too small) so PP
@@ -277,6 +281,9 @@ export function validateConfig() {
     errors.push('PRICE_SANITY_MARGIN must be in (0, 1)');
   }
   if (config.priceSanityCooldownMs < 0) errors.push('PRICE_SANITY_COOLDOWN_MS must be >= 0');
+  if (config.priceSanityExtExclude < 0 || config.priceSanityExtExclude > 100) {
+    errors.push('PRICE_SANITY_EXT_EXCLUDE must be 0..100');
+  }
   if (config.rewardZoneMinSize < 0) errors.push('REWARD_ZONE_MIN_SIZE must be >= 0');
   if (config.discoveryMaxMarkets < 0) errors.push('DISCOVERY_MAX_MARKETS must be >= 0');
   if (config.discoveryIntervalMs < 60_000) errors.push('DISCOVERY_INTERVAL_MS must be >= 60000');

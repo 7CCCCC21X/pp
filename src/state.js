@@ -16,6 +16,7 @@ function emptyState() {
     alertKinds: {},       // per-kind on/off override; missing = use config default
     priceSanity: {},      // ladderKey -> { alertedAt } cooldown for cross-market定价异常 alerts
     priceSanityMuted: {}, // ladderToken -> { key, context, mutedAt } muted ladders (via alert button)
+    priceSanityExtExclude: null, // cents; runtime override for extreme-price exclusion (null = use env default)
     snapshots: {},        // marketId -> { intervalMs, lastSentAt } (periodic orderbook snapshot)
     chatRouting: {},      // chatId -> { exclude: [kind, ...] } per-chat alert filter
     chatDigests: {},      // chatId -> { intervalMs, queue, lastFlushAt } batched-alert mode
@@ -54,6 +55,7 @@ export async function loadState() {
       alertKinds: json.alertKinds ?? {},
       priceSanity: json.priceSanity ?? {},
       priceSanityMuted: json.priceSanityMuted ?? {},
+      priceSanityExtExclude: Number.isFinite(json.priceSanityExtExclude) ? json.priceSanityExtExclude : null,
       snapshots: json.snapshots ?? {},
       chatRouting: json.chatRouting ?? {},
       chatDigests: json.chatDigests ?? {},
