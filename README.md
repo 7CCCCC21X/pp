@@ -54,7 +54,7 @@ npm start
 |---------|---------|
 | `/menu` | Inline-keyboard quick menu |
 | `/status` | Overview: market census, total/top PP/h, opportunity counts (gaps/thin/wide/empty/定价异常), 24h PP total |
-| `/sanity` | Mispriced threshold ladders, most arbitrage first (`套利≈$X`); `/sanity unmute all` clears ladder mutes |
+| `/sanity` | Mispriced threshold ladders (all shown, most arbitrage first, `套利≈$X`); `/sanity ext <N\|off>` excludes near-decided extreme prices; `/sanity unmute all` clears ladder mutes |
 | `/ladders` | Every detected threshold ladder (sound or not) — verify the auto-grouping and eyeball the whole curve |
 | `/list` | Compact id-only listing |
 | `/probe <id>` | Single-market snapshot: top-3 bids/asks, mid/spread, reward zone activation |
@@ -107,7 +107,9 @@ soundly-priced ones. `/status` shows a `定价异常 N` count, and the 24h `/dig
 + hourly pulse roll up how many fired. `/probe <id>` appends the market's full
 ladder when it belongs to one. Each `price_sanity` alert carries inline buttons:
 `[🔇 静音此阶梯] [🔎 快照] [⚠️ 全部异常]` — muting stops that one ladder from
-re-alerting (`/sanity unmute all` to undo).
+re-alerting (`/sanity unmute all` to undo). Near-decided markets (one side
+≥`PRICE_SANITY_EXT_EXCLUDE`¢, default 94, or ≤6¢) are skipped as noise; change
+it live with `/sanity ext 80` or disable via `/sanity ext off`.
 
 ---
 

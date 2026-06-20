@@ -655,14 +655,38 @@ function renderPriceSanity(issue, margin) {
   return [head + arb, formatPriceSanityLadder(issue, margin)].join('\n');
 }
 
+// Effective extreme-price exclusion threshold (cents): runtime override wins
+// over the env default. 0 = disabled.
+export function priceSanityExtCents(state) {
+  const v = state?.priceSanityExtExclude;
+  return Number.isFinite(v) ? v : config.priceSanityExtExclude;
+}
+
+// A rung is "extreme" (effectively decided) when one side is already pinned
+// near a boundary — best-ask ≥ N¢ or best-bid ≤ (100-N)¢. Such markets only
+// add noise to the monotonicity check, so they're excluded when cents > 0.
+function isExtremeSlot(slot, cents) {
+  if (!Number.isFinite(cents) || cents <= 0) return false;
+  const hi = cents / 100;
+  const lo = (100 - cents) / 100;
+  const bid = slot?.baseline?.bidPrice;
+  const ask = slot?.baseline?.askPrice;
+  if (Number.isFinite(ask) && ask >= hi) return true;
+  if (Number.isFinite(bid) && bid <= lo) return true;
+  return false;
+}
+
 // Gather every active, non-paused market that carries a parseable threshold
-// and a usable mid, keyed for ladder grouping.
+// and a usable mid, keyed for ladder grouping. Near-decided extreme-price
+// rungs are dropped per the effective exclusion threshold.
 function gatherLadderEntries(state) {
   const entries = [];
   const slotById = new Map();
+  const extCents = priceSanityExtCents(state);
   for (const [id, slot] of Object.entries(state.markets)) {
     if (!slot) continue;
     if (state.pausedIds?.includes(id) || isSnoozed(state, id)) continue;
+    if (isExtremeSlot(slot, extCents)) continue;
     const text = slot.question || slot.title;
     if (!text) continue;
     const mid = slotMid(slot);
