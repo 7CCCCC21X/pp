@@ -134,6 +134,10 @@ function menuKeyboard({ isPrivate = true } = {}) {
       ],
       [
         { text: '📈 PP 变动', callback_data: '/movers' },
+        { text: '⚠️ 定价异常', callback_data: '/sanity' },
+        { text: '🪜 阶梯', callback_data: '/ladders' },
+      ],
+      [
         { text: '⏱ 摘要设置', callback_data: '/hourly' },
       ],
       // 👁 监控管理
