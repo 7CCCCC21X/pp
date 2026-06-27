@@ -764,7 +764,10 @@ const TIGHT_WIZ_SORTS = [
   ['stale', '停滞时长'],
 ];
 const TIGHT_DEFAULT = {
-  levels: 3, gap: '0.1', minSh: 0, both: true, sort: 'shares',
+  // gap defaults to '整格(自适应)' so the wizard recognizes both 0.1¢-tick and
+  // 1¢-tick contiguous ladders out of the box (no skipped levels), instead of
+  // only matching a fixed 0.1¢ grid.
+  levels: 3, gap: 'auto', minSh: 0, both: true, sort: 'shares',
   spread: 'inf', ext: 'off',
 };
 
