@@ -56,6 +56,7 @@ npm start
 | `/status` | Overview: market census, total/top PP/h, opportunity counts (gaps/thin/wide/empty/定价异常), 24h PP total |
 | `/sanity` | Mispriced threshold ladders (all shown, most arbitrage first, `套利≈$X`); `/sanity ext <N\|off>` excludes near-decided extreme prices; `/sanity unmute all` clears ladder mutes |
 | `/ladders` | Every detected threshold ladder (sound or not) — verify the auto-grouping and eyeball the whole curve |
+| `/tight` | Tight-spread markets (best bid↔ask spread ≤ `TIGHT_SPREAD_MAX`, tightest first). The bottom `🎚` button opens a ladder wizard: keep markets whose first **N consecutive levels** are each within the chosen step of the previous — a fixed cents cap (default **0.1¢**) or **整格/auto**, which detects each market's own tick so a 1¢-step ladder (10/11/12¢) is recognized just like a 0.1¢-step one. Optional minimum total **share** depth, both-sides/either-side, ranked by share depth (refetches the multi-level book) |
 | `/list` | Compact id-only listing |
 | `/probe <id>` | Single-market snapshot: top-3 bids/asks, mid/spread, reward zone activation |
 | `/watch <id>` | High-sensitivity tracking: alerts on every detected book move (1-min cooldown) |
