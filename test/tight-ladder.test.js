@@ -67,6 +67,39 @@ test('evalTightMarket: no recentBook yields null', () => {
   assert.equal(evalTightMarket({}, { levels: 3, gap: '0.1', both: true }), null);
 });
 
+// --- 买1↔卖1 (top-of-book) spread cap ---
+
+test('evalTightMarket: spread reported and cap filters wide top-of-book', () => {
+  // Dense both sides; best bid 0.097, best ask 0.103 → 0.6¢ spread.
+  const slot = {
+    recentBook: {
+      bids: [lvl(0.097, 1000), lvl(0.096, 1000), lvl(0.095, 1000)],
+      asks: [lvl(0.103, 1000), lvl(0.104, 1000), lvl(0.105, 1000)],
+    },
+  };
+  const r = evalTightMarket(slot, { levels: 3, gap: '0.1', both: true });
+  assert.ok(Math.abs(r.spread - 0.006) < 1e-9, 'spread is best-ask − best-bid');
+
+  // 'inf' cap keeps it; a 0.5¢ cap drops it (0.6¢ > 0.5¢)…
+  assert.ok(evalTightMarket(slot, { levels: 3, gap: '0.1', both: true, spread: 'inf' }));
+  assert.equal(evalTightMarket(slot, { levels: 3, gap: '0.1', both: true, spread: '0.5' }), null);
+  // …while a 1¢ cap admits it again.
+  assert.ok(evalTightMarket(slot, { levels: 3, gap: '0.1', both: true, spread: '1' }));
+});
+
+test('evalTightMarket: spread cap drops single-sided book (can\'t confirm spread)', () => {
+  const slot = {
+    recentBook: {
+      bids: [lvl(0.097, 1000), lvl(0.096, 1000), lvl(0.095, 1000)],
+      asks: [], // no ask side → no top-of-book spread
+    },
+  };
+  // Either-side mode still finds the dense bid side without a spread cap…
+  assert.ok(evalTightMarket(slot, { levels: 3, gap: '0.1', both: false }));
+  // …but an active spread cap requires both tops, so it's dropped.
+  assert.equal(evalTightMarket(slot, { levels: 3, gap: '0.1', both: false, spread: '0.5' }), null);
+});
+
 // --- tick detection / 整格(auto) mode: recognize 1¢-tick markets too ---
 
 test('inferTickProb: whole-cent ladder is detected as a 1¢ tick', () => {
