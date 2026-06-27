@@ -5,7 +5,7 @@ process.env.TELEGRAM_BOT_TOKEN ??= 'x';
 process.env.TELEGRAM_CHAT_ID ??= '1';
 process.env.MARKET_IDS ??= 'A,B,C';
 
-const { analyzeLadderSide, evalTightMarket } = await import('../src/commands.js');
+const { analyzeLadderSide, evalTightMarket, inferTickProb, resolveGapProb } = await import('../src/commands.js');
 
 // Prices are probabilities in [0,1]; 0.1¢ = 0.001. The screenshot ladder
 // (9.6¢/9.7¢/9.8¢ one tick apart) → consecutive steps of 0.001.
@@ -65,4 +65,50 @@ test('evalTightMarket: both-sides mode requires both dense', () => {
 
 test('evalTightMarket: no recentBook yields null', () => {
   assert.equal(evalTightMarket({}, { levels: 3, gap: '0.1', both: true }), null);
+});
+
+// --- tick detection / 整格(auto) mode: recognize 1¢-tick markets too ---
+
+test('inferTickProb: whole-cent ladder is detected as a 1¢ tick', () => {
+  const rows = [lvl(0.10, 1), lvl(0.11, 1), lvl(0.12, 1)];
+  assert.equal(inferTickProb(rows, 3), 0.01);
+});
+
+test('inferTickProb: tenth-cent ladder is detected as a 0.1¢ tick', () => {
+  const rows = [lvl(0.098, 1), lvl(0.097, 1), lvl(0.096, 1)];
+  assert.equal(inferTickProb(rows, 3), 0.001);
+});
+
+test('resolveGapProb: auto follows the side tick, fixed value ignores it', () => {
+  const cents = [lvl(0.10, 1), lvl(0.11, 1), lvl(0.12, 1)];
+  assert.equal(resolveGapProb('auto', cents, 3), 0.01);
+  assert.equal(resolveGapProb('1', cents, 3), 0.01);
+  assert.equal(resolveGapProb('0.1', cents, 3), 0.001);
+});
+
+test('auto mode: a contiguous 1¢-tick market qualifies; a fixed 0.1¢ gap rejects it', () => {
+  const slot = {
+    recentBook: {
+      bids: [lvl(0.12, 1000), lvl(0.11, 1000), lvl(0.10, 1000)],
+      asks: [lvl(0.13, 800), lvl(0.14, 800), lvl(0.15, 800)],
+    },
+  };
+  // 整格/auto: both sides are one whole cent apart → dense.
+  const auto = evalTightMarket(slot, { levels: 3, gap: 'auto', both: true });
+  assert.ok(auto, 'auto mode should recognize the 1¢-tick ladder');
+  assert.equal(auto.shares, 5400);
+  // Fixed 0.1¢ threshold: 1¢ steps are 10× too wide → rejected.
+  assert.equal(evalTightMarket(slot, { levels: 3, gap: '0.1', both: true }), null);
+});
+
+test('auto mode: a 1¢-tick market with a skipped level is not dense', () => {
+  const slot = {
+    recentBook: {
+      bids: [lvl(0.12, 1), lvl(0.11, 1), lvl(0.10, 1)],
+      asks: [lvl(0.13, 1), lvl(0.15, 1), lvl(0.16, 1)], // 0.13→0.15 skips 0.14
+    },
+  };
+  assert.equal(evalTightMarket(slot, { levels: 3, gap: 'auto', both: true }), null);
+  // The bid side alone is still contiguous, so either-side mode passes.
+  assert.ok(evalTightMarket(slot, { levels: 3, gap: 'auto', both: false }));
 });

@@ -744,14 +744,21 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 //   tight:<action>:<levels>:<gap>:<minSh>:<both>:<sort>:<page>
 
 const TIGHT_LEVEL_PRESETS = [2, 3, 4, 5];
-const TIGHT_GAP_PRESETS = ['0.1', '0.2', '0.5', '1'];      // cents
+// 'auto' = 整格: per-market tick detection (no skipped levels), so a 1¢-tick
+// ladder (10/11/12¢) counts as dense just like a 0.1¢-tick one. The rest are
+// absolute caps in cents.
+const TIGHT_GAP_PRESETS = ['auto', '0.1', '0.2', '0.5', '1'];
 const TIGHT_MINSH_PRESETS = [0, 1000, 5000, 10000, 50000]; // shares
 const TIGHT_WIZ_SORTS = [
   ['shares', '份额深度'],
   ['usd', '金额深度'],
   ['rate', 'PP/h'],
 ];
-const TIGHT_DEFAULT = { levels: 3, gap: '0.2', minSh: 0, both: true, sort: 'shares' };
+const TIGHT_DEFAULT = { levels: 3, gap: '0.1', minSh: 0, both: true, sort: 'shares' };
+
+function tightGapLabel(g) {
+  return g === 'auto' ? '整格(自适应跳档)' : `${g}¢`;
+}
 
 function fmtSharesShort(n) {
   const v = Number(n);
@@ -786,22 +793,27 @@ function tightCb(action, f, page = 0) {
 }
 
 function tightLabel(f) {
-  return `连续 ${f.levels} 档 · 每档 ≤${f.gap}¢ · ${f.both ? '双边' : '单边'}`
+  const gap = f.gap === 'auto' ? '整格' : `每档 ≤${f.gap}¢`;
+  return `连续 ${f.levels} 档 · ${gap} · ${f.both ? '双边' : '单边'}`
     + (f.minSh > 0 ? ` · 份额 ≥${fmtSharesShort(f.minSh)}` : '')
     + ` · 排序 ${tightSortLabel(f.sort)}`;
 }
 
 function tightWizardText(f) {
+  const denseDesc = f.gap === 'auto'
+    ? `前 ${f.levels} 档<b>一格一档不跳档</b>（自动识别每个市场的最小跳档，0.1¢ 或 1¢ 的市场都能识别）`
+    : `前 ${f.levels} 档相邻价位每步都 ≤ ${f.gap}¢（像 9.6/9.7/9.8 一格一档）`;
   return [
     '🤏 <b>紧凑盘口 · 连续档位筛选</b>',
     '',
     `📐 连续档数 N: <b>${f.levels}</b>`,
-    `📏 每档最大价差: <b>${f.gap}¢</b>`,
+    `📏 每档跳档: <b>${tightGapLabel(f.gap)}</b>`,
     `🔢 最低份额(N档合计): <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>`,
     `↔️ 要求: <b>${f.both ? '买卖双边都密集' : '任一边密集即可'}</b>`,
     `📊 排序: <b>${tightSortLabel(f.sort)}</b>`,
     '',
-    `<i>找前 ${f.levels} 档相邻价位每步都 ≤ ${f.gap}¢ 的密集梯子（像 9.6/9.7/9.8 一格一档），按${tightSortLabel(f.sort)}排名。</i>`,
+    `<i>找${denseDesc}，按${tightSortLabel(f.sort)}排名。</i>`,
+    '<i>「整格」= 自适应：1为1档(1¢)的市场和 0.1为1档的市场都算密集，无跳档即可。固定 0.1¢ 则只认 0.1¢ 跳档的市场。</i>',
     '<i>点 🚀 会重抓所有监控市场的多档盘口，可能耗时几十秒。</i>',
   ].join('\n');
 }
@@ -809,7 +821,8 @@ function tightWizardText(f) {
 function tightWizardKeyboard(f) {
   const max = tightMaxLevels();
   const lvlMark = (n) => n === f.levels ? `✅ ${n}档` : `${n}档`;
-  const gapMark = (g) => g === f.gap ? `✅ ${g}¢` : `${g}¢`;
+  const gapBtn = (g) => g === 'auto' ? '整格' : `${g}¢`;
+  const gapMark = (g) => g === f.gap ? `✅ ${gapBtn(g)}` : gapBtn(g);
   const shLabel = (s) => s > 0 ? `≥${fmtSharesShort(s)}` : '不限';
   const shMark = (s) => s === f.minSh ? `✅ ${shLabel(s)}` : shLabel(s);
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
@@ -819,7 +832,7 @@ function tightWizardKeyboard(f) {
       TIGHT_LEVEL_PRESETS.filter((n) => n <= max).map((n) => ({
         text: lvlMark(n), callback_data: tightCb('set', { ...f, levels: n }),
       })),
-      [{ text: '— 📏 每档最大价差 —', callback_data: 'page:noop' }],
+      [{ text: '— 📏 每档跳档 (整格=自适应) —', callback_data: 'page:noop' }],
       TIGHT_GAP_PRESETS.map((g) => ({
         text: gapMark(g), callback_data: tightCb('set', { ...f, gap: g }),
       })),
@@ -841,6 +854,30 @@ function tightWizardKeyboard(f) {
       ],
     ],
   };
+}
+
+// Infer a side's tick size (smallest price increment) from its first N
+// levels. Predict.fun quotes on either a 1¢ grid (10/11/12¢) or a 0.1¢ grid
+// (9.8/9.9/10.0¢); a price sitting exactly on the 1¢ grid for every level
+// means the market trades in whole cents. Returns the tick in probability
+// units (0.01 or 0.001). Used by 整格/auto mode so a 1¢-tick dense ladder
+// is recognized just like a 0.1¢-tick one.
+export function inferTickProb(rows, levels) {
+  const onCentGrid = [];
+  for (let i = 0; i < levels && i < rows.length; i++) {
+    const p = rows[i]?.price;
+    if (!Number.isFinite(p)) return 0.001;
+    onCentGrid.push(Math.abs(p * 100 - Math.round(p * 100)) < 1e-6);
+  }
+  return onCentGrid.length && onCentGrid.every(Boolean) ? 0.01 : 0.001;
+}
+
+// Resolve the per-side max-step threshold (probability units) for a gap spec.
+// 'auto' → the side's own detected tick (整格 / no-skipped-levels); otherwise
+// the fixed cents value.
+export function resolveGapProb(gapSpec, rows, levels) {
+  if (gapSpec === 'auto') return inferTickProb(rows, levels);
+  return Number(gapSpec) / 100;
 }
 
 // Inspect one side's first N levels. Returns { dense, shares, usd, maxStep }
@@ -875,9 +912,10 @@ export function analyzeLadderSide(rows, levels, gapProb) {
 export function evalTightMarket(slot, f) {
   const book = slot?.recentBook;
   if (!book) return null;
-  const gapProb = Number(f.gap) / 100;
-  const bidSide = analyzeLadderSide(book.bids, f.levels, gapProb);
-  const askSide = analyzeLadderSide(book.asks, f.levels, gapProb);
+  // Resolve the step threshold per side so 整格/auto can detect each side's
+  // own tick (a market may even be asked-in-cents but bid-in-tenths).
+  const bidSide = analyzeLadderSide(book.bids, f.levels, resolveGapProb(f.gap, book.bids ?? [], f.levels));
+  const askSide = analyzeLadderSide(book.asks, f.levels, resolveGapProb(f.gap, book.asks ?? [], f.levels));
   const qualifies = f.both
     ? (bidSide.dense && askSide.dense)
     : (bidSide.dense || askSide.dense);
@@ -2495,7 +2533,7 @@ const HELP = [
   '/gaps — 奖励区可激活（PP 待捡）',
   '/thin — 薄盘市场（买1+卖1 总额 &lt; 阈值）',
   '/wide — 当前价差最大',
-  '/tight — 紧凑盘口。快查：价差 ≤ TIGHT_SPREAD_MAX，最紧在前。底部 🎚 进向导：连续 N 档每档价差 ≤ X¢ 的密集梯子（如 9.6/9.7/9.8 一格一档），可设最低份额、双边/单边，按份额深度排名（重抓多档盘口）',
+  '/tight — 紧凑盘口。快查：价差 ≤ TIGHT_SPREAD_MAX，最紧在前。底部 🎚 进向导：连续 N 档一格一档的密集梯子（默认每档 0.1¢；选「整格」则自适应每个市场的最小跳档，1为1档(1¢)的市场也能识别），可设最低份额、双边/单边，按份额深度排名（重抓多档盘口）',
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
