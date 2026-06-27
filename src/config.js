@@ -154,6 +154,12 @@ export const config = {
   // top of book, easy to dominate by placing your own orders. USD.
   lowDepthThreshold: num('LOW_DEPTH_THRESHOLD', 100),
 
+  // /tight command: list markets whose best bid↔ask spread is at or below
+  // this threshold (probability units, e.g. 0.02 = 2¢). "Tight" = bid and
+  // ask are packed close together (the dense low-spread book that's ideal
+  // for market-making to farm PP rewards). Counterpart to MAX_SPREAD/wide.
+  tightSpreadThreshold: num('TIGHT_SPREAD_MAX', 0.02),
+
   skipNoReward: bool('SKIP_NO_REWARD', true),
 
   // Filters: a market only emits alerts when its top-N book passes ALL set
@@ -283,6 +289,9 @@ export function validateConfig() {
   if (config.priceSanityCooldownMs < 0) errors.push('PRICE_SANITY_COOLDOWN_MS must be >= 0');
   if (config.priceSanityExtExclude < 0 || config.priceSanityExtExclude > 100) {
     errors.push('PRICE_SANITY_EXT_EXCLUDE must be 0..100');
+  }
+  if (config.tightSpreadThreshold <= 0 || config.tightSpreadThreshold >= 1) {
+    errors.push('TIGHT_SPREAD_MAX must be in (0, 1)');
   }
   if (config.rewardZoneMinSize < 0) errors.push('REWARD_ZONE_MIN_SIZE must be >= 0');
   if (config.discoveryMaxMarkets < 0) errors.push('DISCOVERY_MAX_MARKETS must be >= 0');

@@ -42,6 +42,7 @@ const PRIVATE_MENU = [
   { command: 'gaps', description: '奖励区可激活（PP 待捡）' },
   { command: 'thin', description: '薄盘市场（买1+卖1 总额 < 阈值）' },
   { command: 'wide', description: '当前价差最大的市场' },
+  { command: 'tight', description: '紧凑价差市场（价差 ≤ 阈值，最紧在前；适合做市刷 PP）' },
   { command: 'empty', description: '当前单边/空簿的市场' },
   { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
@@ -93,6 +94,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
         ],
         [
           { text: '📏 价差榜', callback_data: '/wide' },
+          { text: '🤏 紧差榜', callback_data: '/tight' },
           { text: '🌊 空簿榜', callback_data: '/empty' },
           { text: '⏱ 停滞榜', callback_data: '/stale' },
         ],
@@ -172,7 +174,7 @@ function menuText({ isPrivate = true } = {}) {
     return [
       '<b>快捷菜单</b>',
       '',
-      '🔍 <b>找机会</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 全部 / 自定义筛',
+      '🔍 <b>找机会</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 紧差 / 空簿 / 停滞 / 全部 / 自定义筛',
       '📡 <b>查看</b>: 状态 / 24h 摘要 / 当前配置',
       '<i>群里按钮只放只读浏览。改阈值/订阅请去私聊。</i>',
     ].join('\n');
@@ -180,7 +182,7 @@ function menuText({ isPrivate = true } = {}) {
   return [
     '<b>快捷菜单</b>',
     '',
-    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 空簿 / 停滞 / 全部 / 自定义筛',
+    '🔍 <b>机会找寻</b>: PP榜 / 空缺 / 薄盘 / 阔差 / 紧差 / 空簿 / 停滞 / 全部 / 自定义筛',
     '👁 <b>监控管理</b>: 状态 / 刷新 / 自动发现',
     '📸 <b>单市场</b>: 直接粘 URL 或 #id 进来 → 出操作菜单',
     '⚙️ <b>设置</b>: 提醒类型 / 过滤器 / 配置',
@@ -432,6 +434,7 @@ const WIZARD_TYPES = [
   ['gap',   '空缺'],
   ['thin',  '薄盘'],
   ['wide',  '宽差'],
+  ['tight', '紧差'],
   ['empty', '空簿'],
 ];
 const WIZARD_MIDS = [
@@ -543,11 +546,14 @@ function passesAdvanced(row, s) {
     const hasGap = z && (!z.bidActivated || !z.askActivated);
     const isThin = Number.isFinite(row.slot?.lastTopUsd) && row.slot.lastTopUsd < (config.lowDepthThreshold ?? 100);
     const isWide = Number.isFinite(row.slot?.lastSpread) && row.slot.lastSpread > config.maxSpread;
+    const isTight = Number.isFinite(row.slot?.lastSpread)
+      && row.slot.lastSpread >= 0 && row.slot.lastSpread <= config.tightSpreadThreshold;
     const isEmpty = row.slot?.baseline
       && (row.slot.baseline.bidPrice == null || row.slot.baseline.askPrice == null);
     if (s.type === 'gap'   && !hasGap)   return false;
     if (s.type === 'thin'  && !isThin)   return false;
     if (s.type === 'wide'  && !isWide)   return false;
+    if (s.type === 'tight' && !isTight)  return false;
     if (s.type === 'empty' && !isEmpty)  return false;
   }
   if (s.mid !== 'any') {
@@ -2207,6 +2213,7 @@ const HELP = [
   '/gaps — 奖励区可激活（PP 待捡）',
   '/thin — 薄盘市场（买1+卖1 总额 &lt; 阈值）',
   '/wide — 当前价差最大',
+  '/tight — 紧凑价差市场（价差 ≤ TIGHT_SPREAD_MAX，最紧在前；密集低价差盘口，适合做市刷 PP）',
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
@@ -2817,6 +2824,27 @@ function renderListPage(cmd, page, state, filter = null) {
       header = '<b>📏 价差最大</b>';
       extraFn = (_slot, row) => `spread ${(row.spread * 100).toFixed(2)}¢`;
       break;
+    case 'tight': {
+      // Markets whose best bid↔ask spread is ≤ tightSpreadThreshold, sorted
+      // tightest-first. These are the dense, low-spread books (like a 0.1¢
+      // spread around 10¢) that are friendliest for market-making to farm
+      // PP — the opposite end of the spectrum from /wide.
+      const threshold = config.tightSpreadThreshold;
+      rows = allRows
+        .filter(({ slot }) => isLive(slot))
+        .map(({ id, slot }) => {
+          const bid = slot.baseline?.bidPrice;
+          const ask = slot.baseline?.askPrice;
+          const spread = (Number.isFinite(bid) && Number.isFinite(ask)) ? ask - bid : null;
+          const mid = (Number.isFinite(bid) && Number.isFinite(ask)) ? (bid + ask) / 2 : null;
+          return { id, slot, spread, mid };
+        })
+        .filter((x) => Number.isFinite(x.spread) && x.spread >= 0 && x.spread <= threshold)
+        .sort((a, b) => a.spread - b.spread);
+      header = `<b>🤏 紧凑价差 (spread ≤ ${(threshold * 100).toFixed(1)}¢, 最紧在前)</b>`;
+      extraFn = (_slot, row) => row.mid != null ? `mid ${fmtCents(row.mid)}` : '';
+      break;
+    }
     case 'empty':
       rows = allRows.filter(({ slot }) => isLive(slot) && slot.baseline
         && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null));
@@ -3095,6 +3123,11 @@ async function buildStatusDashboard(state) {
     slot && !slot.lastError && !slot.lastSkipReason
     && Number.isFinite(slot.lastSpread) && slot.lastSpread > config.maxSpread
   ).length;
+  const tightCount = rows.filter(({ slot }) =>
+    slot && !slot.lastError && !slot.lastSkipReason
+    && Number.isFinite(slot.lastSpread)
+    && slot.lastSpread >= 0 && slot.lastSpread <= config.tightSpreadThreshold
+  ).length;
   const emptyCount = rows.filter(({ slot }) =>
     slot && !slot.lastError && !slot.lastSkipReason && slot.baseline
     && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)
@@ -3131,6 +3164,7 @@ async function buildStatusDashboard(state) {
   const oppParts = [`奖励区空缺 <b>${gaps.length}</b>`];
   if (thinCount > 0) oppParts.push(`薄盘 ${thinCount}`);
   if (wideCount > 0) oppParts.push(`宽差 ${wideCount}`);
+  if (tightCount > 0) oppParts.push(`紧差 ${tightCount}`);
   if (emptyCount > 0) oppParts.push(`空簿 ${emptyCount}`);
   if (sanityCount > 0) oppParts.push(`⚠️ 定价异常 ${sanityCount}`);
   if (watched.length) oppParts.push(`👁 追踪 ${watched.length}`);
@@ -3622,6 +3656,7 @@ async function handle(text, state, ctx, chatId, fromId) {
     case '/gaps':
     case '/thin':
     case '/wide':
+    case '/tight':
     case '/empty':
     case '/stale':
     case '/all':
