@@ -750,15 +750,29 @@ const TIGHT_LEVEL_PRESETS = [2, 3, 4, 5];
 // absolute caps in cents.
 const TIGHT_GAP_PRESETS = ['auto', '0.1', '0.2', '0.5', '1'];
 const TIGHT_MINSH_PRESETS = [0, 1000, 5000, 10000, 50000]; // shares
+// 买1↔卖1 (top-of-book) spread cap, in cents. 'inf' = 不限. Distinct from the
+// per-level gap knob above (which measures 买1→买2 steps on one side); this is
+// the distance across the book between best bid and best ask.
+const TIGHT_SPREAD_PRESETS = ['inf', '0.1', '0.2', '0.5', '1', '2'];
+// 极端价 (排除已决市场) presets — same semantics as /stale's ext filter. 'off'
+// = 不过滤; a numeric N excludes markets with best-ask ≥N¢ or best-bid ≤(100-N)¢.
+const TIGHT_EXT_PRESETS = ['off', '94', '90', '85'];
 const TIGHT_WIZ_SORTS = [
   ['shares', '份额深度'],
   ['usd', '金额深度'],
   ['rate', 'PP/h'],
 ];
-const TIGHT_DEFAULT = { levels: 3, gap: '0.1', minSh: 0, both: true, sort: 'shares' };
+const TIGHT_DEFAULT = {
+  levels: 3, gap: '0.1', minSh: 0, both: true, sort: 'shares',
+  spread: 'inf', ext: 'off',
+};
 
 function tightGapLabel(g) {
   return g === 'auto' ? '整格(自适应跳档)' : `${g}¢`;
+}
+
+function tightSpreadLabel(s) {
+  return s === 'inf' ? '不限' : `≤${s}¢`;
 }
 
 function fmtSharesShort(n) {
@@ -777,7 +791,10 @@ function tightSortLabel(sort) {
 }
 
 function parseTightFilter(parts) {
-  // parts after split(':'): [ 'tight', action, levels, gap, minSh, both, sort, page ]
+  // New 10-part shape:
+  //   [ 'tight', action, levels, gap, minSh, both, sort, spread, ext, page ]
+  // Legacy 8-part shape (pre-spread/ext) put page at index 7; still parses so
+  // buttons on already-sent messages keep working after a deploy.
   const max = tightMaxLevels();
   const levels = Math.max(2, Math.min(max, Number(parts[2]) || TIGHT_DEFAULT.levels));
   const gap = TIGHT_GAP_PRESETS.includes(parts[3]) ? parts[3] : TIGHT_DEFAULT.gap;
@@ -785,18 +802,30 @@ function parseTightFilter(parts) {
     ? Number(parts[4]) : TIGHT_DEFAULT.minSh;
   const both = parts[5] == null ? TIGHT_DEFAULT.both : parts[5] === '1';
   const sort = TIGHT_WIZ_SORTS.some(([k]) => k === parts[6]) ? parts[6] : TIGHT_DEFAULT.sort;
-  const page = Math.max(0, Number(parts[7]) || 0);
-  return { levels, gap, minSh, both, sort, page };
+  let spread = TIGHT_DEFAULT.spread;
+  let ext = TIGHT_DEFAULT.ext;
+  let page;
+  if (parts.length >= 10) {
+    spread = TIGHT_SPREAD_PRESETS.includes(parts[7]) ? parts[7] : TIGHT_DEFAULT.spread;
+    ext = normalizeExt(parts[8]);
+    page = Math.max(0, Number(parts[9]) || 0);
+  } else {
+    page = Math.max(0, Number(parts[7]) || 0);
+  }
+  return { levels, gap, minSh, both, sort, spread, ext, page };
 }
 
 function tightCb(action, f, page = 0) {
-  return `tight:${action}:${f.levels}:${f.gap}:${f.minSh}:${f.both ? 1 : 0}:${f.sort}:${page}`;
+  return `tight:${action}:${f.levels}:${f.gap}:${f.minSh}:${f.both ? 1 : 0}:${f.sort}`
+    + `:${f.spread ?? 'inf'}:${normalizeExt(f.ext)}:${page}`;
 }
 
 function tightLabel(f) {
   const gap = f.gap === 'auto' ? '整格' : `每档 ≤${f.gap}¢`;
   return `连续 ${f.levels} 档 · ${gap} · ${f.both ? '双边' : '单边'}`
     + (f.minSh > 0 ? ` · 份额 ≥${fmtSharesShort(f.minSh)}` : '')
+    + (f.spread && f.spread !== 'inf' ? ` · 价差 ≤${f.spread}¢` : '')
+    + (extFilterActive(f.ext) ? ` · ${extLabel(f.ext)}` : '')
     + ` · 排序 ${tightSortLabel(f.sort)}`;
 }
 
@@ -811,10 +840,13 @@ function tightWizardText(f) {
     `📏 每档跳档: <b>${tightGapLabel(f.gap)}</b>`,
     `🔢 最低份额(N档合计): <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>`,
     `↔️ 要求: <b>${f.both ? '买卖双边都密集' : '任一边密集即可'}</b>`,
+    `↕️ 买1卖1价差: <b>${tightSpreadLabel(f.spread)}</b>`,
+    `📈 极端价: <b>${extLabel(f.ext)}</b>`,
     `📊 排序: <b>${tightSortLabel(f.sort)}</b>`,
     '',
     `<i>找${denseDesc}，按${tightSortLabel(f.sort)}排名。</i>`,
     '<i>「整格」= 自适应：1为1档(1¢)的市场和 0.1为1档的市场都算密集，无跳档即可。固定 0.1¢ 则只认 0.1¢ 跳档的市场。</i>',
+    '<i>买1卖1价差 = 最优买价↔最优卖价的距离上限（顶档松紧）；极端价 = 排除一边 ≥N¢ 基本已决的市场。</i>',
     '<i>点 🚀 会重抓所有监控市场的多档盘口，可能耗时几十秒。</i>',
   ].join('\n');
 }
@@ -827,6 +859,12 @@ function tightWizardKeyboard(f) {
   const shLabel = (s) => s > 0 ? `≥${fmtSharesShort(s)}` : '不限';
   const shMark = (s) => s === f.minSh ? `✅ ${shLabel(s)}` : shLabel(s);
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
+  const spreadMark = (s) => s === f.spread ? `✅ ${tightSpreadLabel(s)}` : tightSpreadLabel(s);
+  const extKey = normalizeExt(f.ext);
+  const extMark = (e) => {
+    const label = e === 'off' ? '关' : `排除≥${e}¢`;
+    return normalizeExt(e) === extKey ? `✅ ${label}` : label;
+  };
   return {
     inline_keyboard: [
       [{ text: '— 📐 连续档数 —', callback_data: 'page:noop' }],
@@ -845,6 +883,14 @@ function tightWizardKeyboard(f) {
         text: f.both ? '✅ 双边都密集' : '⬜ 双边都密集（点=任一边即可）',
         callback_data: tightCb('set', { ...f, both: !f.both }),
       }],
+      [{ text: '— ↕️ 买1卖1价差上限 —', callback_data: 'page:noop' }],
+      TIGHT_SPREAD_PRESETS.map((s) => ({
+        text: spreadMark(s), callback_data: tightCb('set', { ...f, spread: s }),
+      })),
+      [{ text: '— 📈 极端价 (排除已决市场) —', callback_data: 'page:noop' }],
+      TIGHT_EXT_PRESETS.map((e) => ({
+        text: extMark(e), callback_data: tightCb('set', { ...f, ext: e }),
+      })),
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
       TIGHT_WIZ_SORTS.map((pair) => ({
         text: sortMark(pair), callback_data: tightCb('set', { ...f, sort: pair[0] }),
@@ -929,8 +975,17 @@ export function evalTightMarket(slot, f) {
   const maxStep = Math.max(...sides.map((s) => s.maxStep));
   const bid = book.bids?.[0]?.price;
   const ask = book.asks?.[0]?.price;
-  const mid = (Number.isFinite(bid) && Number.isFinite(ask)) ? (bid + ask) / 2 : null;
-  return { shares, usd, maxStep, mid };
+  const haveTop = Number.isFinite(bid) && Number.isFinite(ask);
+  const mid = haveTop ? (bid + ask) / 2 : null;
+  const spread = haveTop ? (ask - bid) : null;
+  // 买1↔卖1 spread cap. When active, a market needs a complete top-of-book
+  // whose best-bid→best-ask distance is within the cap; missing a side means
+  // we can't confirm the spread, so it's dropped.
+  if (f.spread && f.spread !== 'inf') {
+    const cap = Number(f.spread) / 100;
+    if (!haveTop || spread > cap + 1e-9) return null;
+  }
+  return { shares, usd, maxStep, mid, spread };
 }
 
 function renderTightResult(f, page, state) {
@@ -939,6 +994,7 @@ function renderTightResult(f, page, state) {
   for (const id of activeMarketIds(state)) {
     const slot = state.markets[id];
     if (!isLive(slot)) continue;
+    if (!passesExtFilter(slot, f.ext)) continue;
     const m = evalTightMarket(slot, f);
     if (!m) continue;
     if (f.minSh > 0 && m.shares < f.minSh) continue;
@@ -957,7 +1013,7 @@ function renderTightResult(f, page, state) {
   if (!rows.length) {
     const anyBook = activeMarketIds(state).some((id) => state.markets[id]?.recentBook);
     const hint = anyBook
-      ? '\n\n没有符合条件的市场。放宽档数 / 每档价差，或降低最低份额再试。'
+      ? '\n\n没有符合条件的市场。放宽档数 / 每档价差 / 买1卖1价差，降低最低份额，或关掉极端价过滤再试。'
       : '\n\n还没有多档盘口数据 — 点 🎚 进向导后按 🚀 重抓。';
     return { text: `${header}${hint}`, replyMarkup: { inline_keyboard: [wizardRow] } };
   }
@@ -967,6 +1023,7 @@ function renderTightResult(f, page, state) {
   for (const row of items) {
     const extraBits = [`份额 ${fmtSharesShort(row.shares)}`, `$${row.usd.toFixed(0)}`];
     if (row.mid != null) extraBits.push(`mid ${fmtCents(row.mid)}`);
+    if (row.spread != null) extraBits.push(`价差 ${(row.spread * 100).toFixed(2)}¢`);
     extraBits.push(`档距 ≤${(row.maxStep * 100).toFixed(2)}¢`);
     lines.push(compactOpportunityRow(row.id, row.slot, extraBits.join(' · ')));
   }
