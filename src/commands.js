@@ -761,6 +761,7 @@ const TIGHT_WIZ_SORTS = [
   ['shares', '份额深度'],
   ['usd', '金额深度'],
   ['rate', 'PP/h'],
+  ['stale', '停滞时长'],
 ];
 const TIGHT_DEFAULT = {
   levels: 3, gap: '0.1', minSh: 0, both: true, sort: 'shares',
@@ -1003,6 +1004,7 @@ function renderTightResult(f, page, state) {
   const sortVal = (r) => {
     if (f.sort === 'usd') return r.usd;
     if (f.sort === 'rate') return Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
+    if (f.sort === 'stale') return stallDurationMs(r.slot) ?? 0;
     return r.shares;
   };
   rows.sort((a, b) => sortVal(b) - sortVal(a));
@@ -1025,6 +1027,9 @@ function renderTightResult(f, page, state) {
     if (row.mid != null) extraBits.push(`mid ${fmtCents(row.mid)}`);
     if (row.spread != null) extraBits.push(`价差 ${(row.spread * 100).toFixed(2)}¢`);
     extraBits.push(`档距 ≤${(row.maxStep * 100).toFixed(2)}¢`);
+    if (f.sort === 'stale' && Number.isFinite(row.slot?.lastChangeAt)) {
+      extraBits.push(`停滞 ${fmtElapsed(stallDurationMs(row.slot) ?? 0)}`);
+    }
     lines.push(compactOpportunityRow(row.id, row.slot, extraBits.join(' · ')));
   }
   const fresh = freshnessLines(state, { compact: true });
