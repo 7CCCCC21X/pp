@@ -42,7 +42,7 @@ const PRIVATE_MENU = [
   { command: 'gaps', description: '奖励区可激活（PP 待捡）' },
   { command: 'thin', description: '薄盘市场（买1+卖1 总额 < 阈值）' },
   { command: 'wide', description: '当前价差最大的市场' },
-  { command: 'tight', description: '紧凑价差市场（价差 ≤ 阈值，最紧在前；适合做市刷 PP）' },
+  { command: 'tight', description: '紧凑盘口（价差小→最紧在前；底部 🎚 进连续N档/每档价差/份额排名向导）' },
   { command: 'empty', description: '当前单边/空簿的市场' },
   { command: 'stale', description: '停滞时长排名（含未到阈值的）' },
   { command: 'all', description: '全部监控市场（含暂停/跳过/错误,可筛+排序）' },
@@ -718,6 +718,287 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
   return true; // unknown find:* — swallow
 }
 
+// ===================== /tight ladder wizard =====================
+//
+// Finds "dense ladder" markets like the screenshot this feature was built
+// from: a tight stack of price levels (9.6¢ / 9.7¢ / 9.8¢ … one tick apart)
+// with real share depth behind each rung — the books friendliest for
+// market-making to farm PP.
+//
+// Unlike the quick /tight view (top-of-book spread only, off the per-tick
+// baseline), this wizard inspects MULTIPLE consecutive levels, so it needs
+// the full per-level book. On 🚀 it refetches every monitored market's
+// orderbook (populating slot.recentBook), then keeps markets whose first N
+// levels on the required side(s) are each within `gap`¢ of the previous,
+// ranked by SHARE depth (份额) — the truer "how much size is stacked"
+// metric than a $-total, which conflates price and size.
+//
+// Customizable knobs (all via buttons):
+//   levels N — how many consecutive levels must be dense (2..ORDERBOOK_DEPTH)
+//   gap    ¢ — max price step between adjacent levels (0.1/0.2/0.5/1)
+//   minSh    — minimum total shares across the N levels (0 = 不限)
+//   both     — require BOTH sides dense, or EITHER side
+//   sort     — shares (份额深度) | usd (金额深度) | rate (PP/h)
+//
+// Callback shape (well within Telegram's 64-byte limit):
+//   tight:<action>:<levels>:<gap>:<minSh>:<both>:<sort>:<page>
+
+const TIGHT_LEVEL_PRESETS = [2, 3, 4, 5];
+const TIGHT_GAP_PRESETS = ['0.1', '0.2', '0.5', '1'];      // cents
+const TIGHT_MINSH_PRESETS = [0, 1000, 5000, 10000, 50000]; // shares
+const TIGHT_WIZ_SORTS = [
+  ['shares', '份额深度'],
+  ['usd', '金额深度'],
+  ['rate', 'PP/h'],
+];
+const TIGHT_DEFAULT = { levels: 3, gap: '0.2', minSh: 0, both: true, sort: 'shares' };
+
+function fmtSharesShort(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '-';
+  if (v >= 1000) return `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k`;
+  return String(Math.round(v));
+}
+
+function tightMaxLevels() {
+  return Math.max(2, Math.min(5, Math.floor(config.orderbookDepth ?? 5)));
+}
+
+function tightSortLabel(sort) {
+  return (TIGHT_WIZ_SORTS.find(([k]) => k === sort) ?? ['', sort])[1];
+}
+
+function parseTightFilter(parts) {
+  // parts after split(':'): [ 'tight', action, levels, gap, minSh, both, sort, page ]
+  const max = tightMaxLevels();
+  const levels = Math.max(2, Math.min(max, Number(parts[2]) || TIGHT_DEFAULT.levels));
+  const gap = TIGHT_GAP_PRESETS.includes(parts[3]) ? parts[3] : TIGHT_DEFAULT.gap;
+  const minSh = (Number.isFinite(Number(parts[4])) && Number(parts[4]) >= 0)
+    ? Number(parts[4]) : TIGHT_DEFAULT.minSh;
+  const both = parts[5] == null ? TIGHT_DEFAULT.both : parts[5] === '1';
+  const sort = TIGHT_WIZ_SORTS.some(([k]) => k === parts[6]) ? parts[6] : TIGHT_DEFAULT.sort;
+  const page = Math.max(0, Number(parts[7]) || 0);
+  return { levels, gap, minSh, both, sort, page };
+}
+
+function tightCb(action, f, page = 0) {
+  return `tight:${action}:${f.levels}:${f.gap}:${f.minSh}:${f.both ? 1 : 0}:${f.sort}:${page}`;
+}
+
+function tightLabel(f) {
+  return `连续 ${f.levels} 档 · 每档 ≤${f.gap}¢ · ${f.both ? '双边' : '单边'}`
+    + (f.minSh > 0 ? ` · 份额 ≥${fmtSharesShort(f.minSh)}` : '')
+    + ` · 排序 ${tightSortLabel(f.sort)}`;
+}
+
+function tightWizardText(f) {
+  return [
+    '🤏 <b>紧凑盘口 · 连续档位筛选</b>',
+    '',
+    `📐 连续档数 N: <b>${f.levels}</b>`,
+    `📏 每档最大价差: <b>${f.gap}¢</b>`,
+    `🔢 最低份额(N档合计): <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>`,
+    `↔️ 要求: <b>${f.both ? '买卖双边都密集' : '任一边密集即可'}</b>`,
+    `📊 排序: <b>${tightSortLabel(f.sort)}</b>`,
+    '',
+    `<i>找前 ${f.levels} 档相邻价位每步都 ≤ ${f.gap}¢ 的密集梯子（像 9.6/9.7/9.8 一格一档），按${tightSortLabel(f.sort)}排名。</i>`,
+    '<i>点 🚀 会重抓所有监控市场的多档盘口，可能耗时几十秒。</i>',
+  ].join('\n');
+}
+
+function tightWizardKeyboard(f) {
+  const max = tightMaxLevels();
+  const lvlMark = (n) => n === f.levels ? `✅ ${n}档` : `${n}档`;
+  const gapMark = (g) => g === f.gap ? `✅ ${g}¢` : `${g}¢`;
+  const shLabel = (s) => s > 0 ? `≥${fmtSharesShort(s)}` : '不限';
+  const shMark = (s) => s === f.minSh ? `✅ ${shLabel(s)}` : shLabel(s);
+  const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
+  return {
+    inline_keyboard: [
+      [{ text: '— 📐 连续档数 —', callback_data: 'page:noop' }],
+      TIGHT_LEVEL_PRESETS.filter((n) => n <= max).map((n) => ({
+        text: lvlMark(n), callback_data: tightCb('set', { ...f, levels: n }),
+      })),
+      [{ text: '— 📏 每档最大价差 —', callback_data: 'page:noop' }],
+      TIGHT_GAP_PRESETS.map((g) => ({
+        text: gapMark(g), callback_data: tightCb('set', { ...f, gap: g }),
+      })),
+      [{ text: '— 🔢 最低份额(合计) —', callback_data: 'page:noop' }],
+      TIGHT_MINSH_PRESETS.map((s) => ({
+        text: shMark(s), callback_data: tightCb('set', { ...f, minSh: s }),
+      })),
+      [{
+        text: f.both ? '✅ 双边都密集' : '⬜ 双边都密集（点=任一边即可）',
+        callback_data: tightCb('set', { ...f, both: !f.both }),
+      }],
+      [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
+      TIGHT_WIZ_SORTS.map((pair) => ({
+        text: sortMark(pair), callback_data: tightCb('set', { ...f, sort: pair[0] }),
+      })),
+      [
+        { text: '🚀 应用(重抓盘口)', callback_data: tightCb('run', f) },
+        { text: '✖ 取消', callback_data: tightCb('cancel', f) },
+      ],
+    ],
+  };
+}
+
+// Inspect one side's first N levels. Returns { dense, shares, usd, maxStep }
+// where dense = N levels present AND every adjacent step ≤ gapProb.
+export function analyzeLadderSide(rows, levels, gapProb) {
+  if (!Array.isArray(rows) || rows.length < levels) {
+    return { dense: false, shares: 0, usd: 0, maxStep: Infinity };
+  }
+  let shares = 0;
+  let usd = 0;
+  let maxStep = 0;
+  for (let i = 0; i < levels; i++) {
+    const r = rows[i];
+    if (!Number.isFinite(r?.price) || !Number.isFinite(r?.size)) {
+      return { dense: false, shares: 0, usd: 0, maxStep: Infinity };
+    }
+    shares += r.size;
+    usd += r.price * r.size;
+    if (i > 0) {
+      const step = Math.abs(rows[i - 1].price - r.price);
+      if (step > maxStep) maxStep = step;
+    }
+  }
+  // Float guard: 0.1¢ = 0.001 in prob units; allow a tiny epsilon so exact
+  // one-tick ladders aren't rejected by representation error.
+  const dense = maxStep <= gapProb + 1e-9;
+  return { dense, shares, usd, maxStep };
+}
+
+// Evaluate a market against the tight filter. Returns null if it doesn't
+// qualify, else { shares, usd, maxStep, mid }.
+export function evalTightMarket(slot, f) {
+  const book = slot?.recentBook;
+  if (!book) return null;
+  const gapProb = Number(f.gap) / 100;
+  const bidSide = analyzeLadderSide(book.bids, f.levels, gapProb);
+  const askSide = analyzeLadderSide(book.asks, f.levels, gapProb);
+  const qualifies = f.both
+    ? (bidSide.dense && askSide.dense)
+    : (bidSide.dense || askSide.dense);
+  if (!qualifies) return null;
+  // Depth metric sums the N levels on the qualifying side(s): both sides for
+  // "双边", only the dense side(s) for "任一边".
+  const sides = f.both ? [bidSide, askSide] : [bidSide, askSide].filter((s) => s.dense);
+  const shares = sides.reduce((a, s) => a + s.shares, 0);
+  const usd = sides.reduce((a, s) => a + s.usd, 0);
+  const maxStep = Math.max(...sides.map((s) => s.maxStep));
+  const bid = book.bids?.[0]?.price;
+  const ask = book.asks?.[0]?.price;
+  const mid = (Number.isFinite(bid) && Number.isFinite(ask)) ? (bid + ask) / 2 : null;
+  return { shares, usd, maxStep, mid };
+}
+
+function renderTightResult(f, page, state) {
+  const isLive = (slot) => slot && !slot.lastError && !slot.lastSkipReason;
+  const rows = [];
+  for (const id of activeMarketIds(state)) {
+    const slot = state.markets[id];
+    if (!isLive(slot)) continue;
+    const m = evalTightMarket(slot, f);
+    if (!m) continue;
+    if (f.minSh > 0 && m.shares < f.minSh) continue;
+    rows.push({ id, slot, ...m });
+  }
+  const sortVal = (r) => {
+    if (f.sort === 'usd') return r.usd;
+    if (f.sort === 'rate') return Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
+    return r.shares;
+  };
+  rows.sort((a, b) => sortVal(b) - sortVal(a));
+
+  const header = `<b>🤏 紧凑盘口</b> <i>· ${htmlEscape(tightLabel(f))}</i>`;
+  const wizardRow = [{ text: `🎚 调整设置`, callback_data: tightCb('wizard', f) }];
+
+  if (!rows.length) {
+    const anyBook = activeMarketIds(state).some((id) => state.markets[id]?.recentBook);
+    const hint = anyBook
+      ? '\n\n没有符合条件的市场。放宽档数 / 每档价差，或降低最低份额再试。'
+      : '\n\n还没有多档盘口数据 — 点 🎚 进向导后按 🚀 重抓。';
+    return { text: `${header}${hint}`, replyMarkup: { inline_keyboard: [wizardRow] } };
+  }
+
+  const { items, page: safePage, totalPages } = paginate(rows, page);
+  const lines = [`${header} <i>(${items.length} / ${rows.length})</i>`, ''];
+  for (const row of items) {
+    const extraBits = [`份额 ${fmtSharesShort(row.shares)}`, `$${row.usd.toFixed(0)}`];
+    if (row.mid != null) extraBits.push(`mid ${fmtCents(row.mid)}`);
+    extraBits.push(`档距 ≤${(row.maxStep * 100).toFixed(2)}¢`);
+    lines.push(compactOpportunityRow(row.id, row.slot, extraBits.join(' · ')));
+  }
+  const fresh = freshnessLines(state, { compact: true });
+  if (fresh.length) {
+    lines.push('');
+    lines.push(`<i>📅 ${fresh.join(' · ')}</i>`);
+  }
+  const navRows = [];
+  if (totalPages > 1) {
+    const nav = [];
+    if (safePage > 0) nav.push({ text: '⬅️ 上一页', callback_data: tightCb('page', f, safePage - 1) });
+    nav.push({ text: `${safePage + 1} / ${totalPages}`, callback_data: 'page:noop' });
+    if (safePage < totalPages - 1) nav.push({ text: '➡️ 下一页', callback_data: tightCb('page', f, safePage + 1) });
+    navRows.push(nav);
+  }
+  navRows.push(wizardRow);
+  const openUrls = items.map((row) => marketUrl(row.id, row.slot?.title, row.slot?.question, row.slot?.slug));
+  const CHUNK = 5;
+  for (let i = 0; i < openUrls.length; i += CHUNK) {
+    navRows.push(openUrls.slice(i, i + CHUNK).map((u, j) => ({ text: `🌐 ${i + j + 1}`, url: u })));
+  }
+  return { text: lines.join('\n'), replyMarkup: { inline_keyboard: navRows } };
+}
+
+export async function handleTightWizardCallback(data, { chatId, messageId, state, fullCtx }) {
+  const parts = data.split(':');
+  if (parts[0] !== 'tight') return false;
+  const action = parts[1];
+  const f = parseTightFilter(parts);
+
+  if (action === 'wizard' || action === 'set') {
+    try {
+      await editTelegramMessage(chatId, messageId, tightWizardText(f), tightWizardKeyboard(f));
+    } catch (err) {
+      if (!/message is not modified/i.test(err.message ?? '')) warn('tight wizard edit failed:', err.message);
+    }
+    return true;
+  }
+  if (action === 'cancel') {
+    const reply = renderListPage('tight', 0, state);
+    if (reply) {
+      try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); } catch {}
+    }
+    return true;
+  }
+  if (action === 'page') {
+    const reply = renderTightResult(f, f.page, state);
+    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
+    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('tight page edit failed:', err.message); }
+    return true;
+  }
+  if (action === 'run') {
+    const ids = activeMarketIds(state);
+    if (!ids.length) {
+      try { await editTelegramMessage(chatId, messageId, '当前没有监控的市场。', undefined); } catch {}
+      return true;
+    }
+    // bits/thresh only label the progress bar; '111111' = all 6 levels.
+    await refetchOrderbooksWithProgress({
+      ids, state, chatId, messageId, kind: 'tight', bits: '111111', thresh: 'inf',
+    });
+    if (fullCtx?.persist) await fullCtx.persist().catch((err) => warn('tight persist failed:', err.message));
+    const reply = renderTightResult(f, 0, state);
+    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
+    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('tight result edit failed:', err.message); }
+    return true;
+  }
+  return true;
+}
+
 // ---------- /stale filter wizard ----------
 //
 // ---------- shared filter wizard (used by /stale and /all) ----------
@@ -862,6 +1143,7 @@ const LIST_KINDS = {
   stale: { title: '⏱ 停滞排名', defaultSort: 't' },
   all:   { title: '📋 全部市场', defaultSort: 'p' },
   new:   { title: '🆕 新上市场', defaultSort: 't' },
+  tight: { title: '🤏 紧凑盘口', defaultSort: 'p' },
 };
 
 // /new wizard knobs (shares LIST_LEVELS / LIST_THRESHOLDS / LIST_DIRS with
@@ -2213,7 +2495,7 @@ const HELP = [
   '/gaps — 奖励区可激活（PP 待捡）',
   '/thin — 薄盘市场（买1+卖1 总额 &lt; 阈值）',
   '/wide — 当前价差最大',
-  '/tight — 紧凑价差市场（价差 ≤ TIGHT_SPREAD_MAX，最紧在前；密集低价差盘口，适合做市刷 PP）',
+  '/tight — 紧凑盘口。快查：价差 ≤ TIGHT_SPREAD_MAX，最紧在前。底部 🎚 进向导：连续 N 档每档价差 ≤ X¢ 的密集梯子（如 9.6/9.7/9.8 一格一档），可设最低份额、双边/单边，按份额深度排名（重抓多档盘口）',
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
@@ -2640,6 +2922,14 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
       callback_data: `new:wizard:${newFilterToCbParts(newF).join(':')}:0`,
     }]);
   }
+  // /tight's quick view (top-of-book spread sort) gets a button into the
+  // deeper ladder wizard (连续 N 档 / 每档价差 / 份额排名).
+  if (cmd === 'tight') {
+    rows.push([{
+      text: '🎚 连续档位筛选 (份额排名)',
+      callback_data: tightCb('wizard', TIGHT_DEFAULT),
+    }]);
+  }
   // "🌐 N" url buttons — one per market on the current page. Each is a
   // direct-URL button so a single tap opens that market in the browser
   // without going through the inline title link in the text (much easier
@@ -2841,7 +3131,7 @@ function renderListPage(cmd, page, state, filter = null) {
         })
         .filter((x) => Number.isFinite(x.spread) && x.spread >= 0 && x.spread <= threshold)
         .sort((a, b) => a.spread - b.spread);
-      header = `<b>🤏 紧凑价差 (spread ≤ ${(threshold * 100).toFixed(1)}¢, 最紧在前)</b>`;
+      header = `<b>🤏 紧凑价差 (spread ≤ ${(threshold * 100).toFixed(1)}¢, 最紧在前)</b>\n<i>底部 🎚 = 连续 N 档 / 每档价差 / 份额排名</i>`;
       extraFn = (_slot, row) => row.mid != null ? `mid ${fmtCents(row.mid)}` : '';
       break;
     }
@@ -4458,6 +4748,10 @@ export function startCommandLoop({ getState, persist, ctx }) {
             } else if (data.startsWith('new:')) {
               await handleNewWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }).catch((err) => {
                 warn('new wizard error:', err.message);
+              });
+            } else if (data.startsWith('tight:')) {
+              await handleTightWizardCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+                warn('tight wizard error:', err.message);
               });
             } else if (data.startsWith('hd:')) {
               await handleHourlyDigestCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {

@@ -739,7 +739,9 @@ export async function getMarketRewardSummary(marketId) {
 // then falls back through alternate templates and id-like fields drawn
 // from the market object. Caches the working combination per market id
 // in state so future ticks go straight to the right URL.
-const ORDERBOOK_DEPTH = 3;
+// Number of levels per side to retain. Configurable so the /tight ladder
+// wizard (which inspects consecutive levels) has enough depth to work with.
+const ORDERBOOK_DEPTH = Math.max(3, Math.floor(config.orderbookDepth ?? 5));
 
 function topNOfBook(rows, n = ORDERBOOK_DEPTH) {
   const out = [];

@@ -159,6 +159,10 @@ export const config = {
   // ask are packed close together (the dense low-spread book that's ideal
   // for market-making to farm PP rewards). Counterpart to MAX_SPREAD/wide.
   tightSpreadThreshold: num('TIGHT_SPREAD_MAX', 0.02),
+  // How many price levels per side to fetch + retain in the orderbook. The
+  // /tight ladder wizard inspects consecutive levels (买1→买2→买3…), so it
+  // needs enough depth. Default 5 covers the wizard's max level count.
+  orderbookDepth: num('ORDERBOOK_DEPTH', 5),
 
   skipNoReward: bool('SKIP_NO_REWARD', true),
 
@@ -292,6 +296,9 @@ export function validateConfig() {
   }
   if (config.tightSpreadThreshold <= 0 || config.tightSpreadThreshold >= 1) {
     errors.push('TIGHT_SPREAD_MAX must be in (0, 1)');
+  }
+  if (!Number.isInteger(config.orderbookDepth) || config.orderbookDepth < 3 || config.orderbookDepth > 50) {
+    errors.push('ORDERBOOK_DEPTH must be an integer in [3, 50]');
   }
   if (config.rewardZoneMinSize < 0) errors.push('REWARD_ZONE_MIN_SIZE must be >= 0');
   if (config.discoveryMaxMarkets < 0) errors.push('DISCOVERY_MAX_MARKETS must be >= 0');
