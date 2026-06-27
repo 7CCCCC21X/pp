@@ -126,6 +126,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
       ],
       [
         { text: '📏 价差榜', callback_data: '/wide' },
+        { text: '🤏 紧差榜', callback_data: '/tight' },
         { text: '🌊 空簿榜', callback_data: '/empty' },
         { text: '⏱ 停滞榜', callback_data: '/stale' },
       ],
