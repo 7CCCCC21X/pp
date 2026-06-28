@@ -742,7 +742,11 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 //   sort     — shares (份额深度) | usd (金额深度) | rate (PP/h)
 //
 // Callback shape (well within Telegram's 64-byte limit):
-//   tight:<action>:<levels>:<gap>:<minSh>:<both>:<sort>:<page>
+//   tight:<action>:<levels>:<gap>:<minSh>:<both>:<sort>:<spread>:<ext>:<page>
+// gap/spread/minSh/ext each accept a typed custom value (not just presets):
+// the row's "✏" button emits action=cust-<field>, which stashes a pending
+// input so the next number the user sends is applied to that knob. ext-clear
+// drops remembered custom 极端价 buttons.
 
 const TIGHT_LEVEL_PRESETS = [2, 3, 4, 5];
 // 'auto' = 整格: per-market tick detection (no skipped levels), so a 1¢-tick
@@ -771,6 +775,48 @@ const TIGHT_DEFAULT = {
   spread: 'inf', ext: 'off',
 };
 
+// Every knob on the wizard accepts a typed custom value via its "✏" button,
+// not just the presets above. Bounds for the cents knobs (gap / 买1卖1价差):
+// a market trading in whole-cent ticks never needs a cap above a few cents,
+// but allow up to 50¢ so a deliberate wide setting isn't silently clamped.
+const TIGHT_CUSTOM_GAP_MAX = 50;     // ¢
+const TIGHT_CUSTOM_SPREAD_MAX = 50;  // ¢
+
+// Canonical string for a typed cents value (gap / spread). Trims trailing
+// zeros so "0.30" and "0.3" collapse to one token/button, keeps 0.01¢
+// resolution, and rejects junk / out-of-range to null.
+function normalizeCustomCents(raw, maxCents) {
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0 || v > maxCents) return null;
+  return String(Number(v.toFixed(2)));
+}
+
+// gap: 'auto'(整格) | preset | custom cents string. Junk falls back to default.
+function normalizeTightGap(raw) {
+  if (TIGHT_GAP_PRESETS.includes(raw)) return raw;
+  return normalizeCustomCents(raw, TIGHT_CUSTOM_GAP_MAX) ?? TIGHT_DEFAULT.gap;
+}
+function isCustomTightGap(g) {
+  return g !== 'auto' && !TIGHT_GAP_PRESETS.includes(g)
+    && normalizeCustomCents(g, TIGHT_CUSTOM_GAP_MAX) != null;
+}
+
+// spread: 'inf'(不限) | preset | custom cents string.
+function normalizeTightSpread(raw) {
+  if (TIGHT_SPREAD_PRESETS.includes(raw)) return raw;
+  return normalizeCustomCents(raw, TIGHT_CUSTOM_SPREAD_MAX) ?? TIGHT_DEFAULT.spread;
+}
+function isCustomTightSpread(s) {
+  return s !== 'inf' && !TIGHT_SPREAD_PRESETS.includes(s)
+    && normalizeCustomCents(s, TIGHT_CUSTOM_SPREAD_MAX) != null;
+}
+
+// minSh: any non-negative integer; "custom" = a positive value not on the
+// preset list (so the wizard shows it as a checkmarked ✏ button).
+function isCustomTightMinSh(s) {
+  return s > 0 && !TIGHT_MINSH_PRESETS.includes(s);
+}
+
 function tightGapLabel(g) {
   return g === 'auto' ? '整格(自适应跳档)' : `${g}¢`;
 }
@@ -794,14 +840,15 @@ function tightSortLabel(sort) {
   return (TIGHT_WIZ_SORTS.find(([k]) => k === sort) ?? ['', sort])[1];
 }
 
-function parseTightFilter(parts) {
+export function parseTightFilter(parts) {
   // New 10-part shape:
   //   [ 'tight', action, levels, gap, minSh, both, sort, spread, ext, page ]
   // Legacy 8-part shape (pre-spread/ext) put page at index 7; still parses so
   // buttons on already-sent messages keep working after a deploy.
   const max = tightMaxLevels();
   const levels = Math.max(2, Math.min(max, Number(parts[2]) || TIGHT_DEFAULT.levels));
-  const gap = TIGHT_GAP_PRESETS.includes(parts[3]) ? parts[3] : TIGHT_DEFAULT.gap;
+  // gap / spread accept presets OR a typed custom cents value (e.g. 0.3).
+  const gap = normalizeTightGap(parts[3]);
   const minSh = (Number.isFinite(Number(parts[4])) && Number(parts[4]) >= 0)
     ? Number(parts[4]) : TIGHT_DEFAULT.minSh;
   const both = parts[5] == null ? TIGHT_DEFAULT.both : parts[5] === '1';
@@ -810,7 +857,7 @@ function parseTightFilter(parts) {
   let ext = TIGHT_DEFAULT.ext;
   let page;
   if (parts.length >= 10) {
-    spread = TIGHT_SPREAD_PRESETS.includes(parts[7]) ? parts[7] : TIGHT_DEFAULT.spread;
+    spread = normalizeTightSpread(parts[7]);
     ext = normalizeExt(parts[8]);
     page = Math.max(0, Number(parts[9]) || 0);
   } else {
@@ -837,25 +884,27 @@ function tightWizardText(f) {
   const denseDesc = f.gap === 'auto'
     ? `前 ${f.levels} 档<b>一格一档不跳档</b>（自动识别每个市场的最小跳档，0.1¢ 或 1¢ 的市场都能识别）`
     : `前 ${f.levels} 档相邻价位每步都 ≤ ${f.gap}¢（像 9.6/9.7/9.8 一格一档）`;
+  const tag = (on) => on ? ' <i>(自定义)</i>' : '';
   return [
     '🤏 <b>紧凑盘口 · 连续档位筛选</b>',
     '',
     `📐 连续档数 N: <b>${f.levels}</b>`,
-    `📏 每档跳档: <b>${tightGapLabel(f.gap)}</b>`,
-    `🔢 最低份额(N档合计): <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>`,
+    `📏 每档跳档: <b>${tightGapLabel(f.gap)}</b>${tag(isCustomTightGap(f.gap))}`,
+    `🔢 最低份额(N档合计): <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>${tag(isCustomTightMinSh(f.minSh))}`,
     `↔️ 要求: <b>${f.both ? '买卖双边都密集' : '任一边密集即可'}</b>`,
-    `↕️ 买1卖1价差: <b>${tightSpreadLabel(f.spread)}</b>`,
-    `📈 极端价: <b>${extLabel(f.ext)}</b>`,
+    `↕️ 买1卖1价差: <b>${tightSpreadLabel(f.spread)}</b>${tag(isCustomTightSpread(f.spread))}`,
+    `📈 极端价: <b>${extLabel(f.ext)}</b>${tag(isCustomExt(f.ext))}`,
     `📊 排序: <b>${tightSortLabel(f.sort)}</b>`,
     '',
     `<i>找${denseDesc}，按${tightSortLabel(f.sort)}排名。</i>`,
     '<i>「整格」= 自适应：1为1档(1¢)的市场和 0.1为1档的市场都算密集，无跳档即可。固定 0.1¢ 则只认 0.1¢ 跳档的市场。</i>',
-    '<i>买1卖1价差 = 最优买价↔最优卖价的距离上限（顶档松紧）；极端价 = 排除一边 ≥N¢ 基本已决的市场。</i>',
+    '<i>买1卖1价差 = 最优买价↔最优卖价的距离上限（顶档松紧）；极端价 = 排除/仅 一边 ≥N¢ 基本已决的市场。</i>',
+    '<i>每项都能自定义：点该行末尾的 ✏ 后，在本 chat 回复一个数字（跳档/价差填 ¢ 可带小数，份额填整数，极端价填 1-99）。</i>',
     '<i>点 🚀 会重抓所有监控市场的多档盘口，可能耗时几十秒。</i>',
   ].join('\n');
 }
 
-function tightWizardKeyboard(f) {
+export function tightWizardKeyboard(f, customExtPresets = []) {
   const max = tightMaxLevels();
   const lvlMark = (n) => n === f.levels ? `✅ ${n}档` : `${n}档`;
   const gapBtn = (g) => g === 'auto' ? '整格' : `${g}¢`;
@@ -865,10 +914,44 @@ function tightWizardKeyboard(f) {
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
   const spreadMark = (s) => s === f.spread ? `✅ ${tightSpreadLabel(s)}` : tightSpreadLabel(s);
   const extKey = normalizeExt(f.ext);
-  const extMark = (e) => {
-    const label = e === 'off' ? '关' : `排除≥${e}¢`;
-    return normalizeExt(e) === extKey ? `✅ ${label}` : label;
+  const extMark = (e, label) => normalizeExt(e) === extKey ? `✅ ${label}` : label;
+  // "✏" custom button for a knob. When the active value is a custom (non-preset)
+  // one it shows checkmarked with the value so the user can see what's set.
+  const custBtn = (active, label, action) => ({
+    text: active ? `✅ ✏${label}` : '✏', callback_data: tightCb(action, f),
+  });
+
+  // 极端价 section mirrors /stale: an "排除" row, a "仅" row, then any
+  // remembered custom values as their own checkmarked buttons (+ 🗑 清空).
+  const extExcludeRow = [
+    { text: extMark('off', '关'), callback_data: tightCb('set', { ...f, ext: 'off' }) },
+    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
+      text: extMark(e, `排除≥${e}¢`), callback_data: tightCb('set', { ...f, ext: e }),
+    })),
+  ];
+  const extIncludeRow = [
+    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
+      text: extMark(`i${e}`, `仅≥${e}¢`), callback_data: tightCb('set', { ...f, ext: `i${e}` }),
+    })),
+    { text: '✏ 自定义…', callback_data: tightCb('cust-ext', f) },
+  ];
+  // Remembered custom 极端价 values stay available as buttons (union with the
+  // active one so a just-applied value always has a visible checkmarked button).
+  const seenCustom = new Set();
+  const customTokens = [];
+  const pushCustom = (tok) => {
+    const n = normalizeExt(tok);
+    if (n === 'off' || !isCustomExt(n) || seenCustom.has(n)) return;
+    seenCustom.add(n);
+    customTokens.push(n);
   };
+  if (isCustomExt(extKey)) pushCustom(extKey);
+  for (const t of (customExtPresets ?? [])) pushCustom(t);
+  const extCustomRow = customTokens.slice(0, CUSTOM_EXT_PRESET_CAP).map((tok) => ({
+    text: extMark(tok, extBtnLabel(tok)), callback_data: tightCb('set', { ...f, ext: tok }),
+  }));
+  if (extCustomRow.length) extCustomRow.push({ text: '🗑 清空', callback_data: tightCb('ext-clear', f) });
+
   return {
     inline_keyboard: [
       [{ text: '— 📐 连续档数 —', callback_data: 'page:noop' }],
@@ -876,25 +959,34 @@ function tightWizardKeyboard(f) {
         text: lvlMark(n), callback_data: tightCb('set', { ...f, levels: n }),
       })),
       [{ text: '— 📏 每档跳档 (整格=自适应) —', callback_data: 'page:noop' }],
-      TIGHT_GAP_PRESETS.map((g) => ({
-        text: gapMark(g), callback_data: tightCb('set', { ...f, gap: g }),
-      })),
+      [
+        ...TIGHT_GAP_PRESETS.map((g) => ({
+          text: gapMark(g), callback_data: tightCb('set', { ...f, gap: g }),
+        })),
+        custBtn(isCustomTightGap(f.gap), gapBtn(f.gap), 'cust-gap'),
+      ],
       [{ text: '— 🔢 最低份额(合计) —', callback_data: 'page:noop' }],
-      TIGHT_MINSH_PRESETS.map((s) => ({
-        text: shMark(s), callback_data: tightCb('set', { ...f, minSh: s }),
-      })),
+      [
+        ...TIGHT_MINSH_PRESETS.map((s) => ({
+          text: shMark(s), callback_data: tightCb('set', { ...f, minSh: s }),
+        })),
+        custBtn(isCustomTightMinSh(f.minSh), shLabel(f.minSh), 'cust-minsh'),
+      ],
       [{
         text: f.both ? '✅ 双边都密集' : '⬜ 双边都密集（点=任一边即可）',
         callback_data: tightCb('set', { ...f, both: !f.both }),
       }],
       [{ text: '— ↕️ 买1卖1价差上限 —', callback_data: 'page:noop' }],
-      TIGHT_SPREAD_PRESETS.map((s) => ({
-        text: spreadMark(s), callback_data: tightCb('set', { ...f, spread: s }),
-      })),
-      [{ text: '— 📈 极端价 (排除已决市场) —', callback_data: 'page:noop' }],
-      TIGHT_EXT_PRESETS.map((e) => ({
-        text: extMark(e), callback_data: tightCb('set', { ...f, ext: e }),
-      })),
+      [
+        ...TIGHT_SPREAD_PRESETS.map((s) => ({
+          text: spreadMark(s), callback_data: tightCb('set', { ...f, spread: s }),
+        })),
+        custBtn(isCustomTightSpread(f.spread), tightSpreadLabel(f.spread), 'cust-spread'),
+      ],
+      [{ text: '— 📈 极端价 (排除/仅 已决市场) —', callback_data: 'page:noop' }],
+      extExcludeRow,
+      extIncludeRow,
+      ...(extCustomRow.length ? [extCustomRow] : []),
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
       TIGHT_WIZ_SORTS.map((pair) => ({
         text: sortMark(pair), callback_data: tightCb('set', { ...f, sort: pair[0] }),
@@ -1057,18 +1149,61 @@ function renderTightResult(f, page, state) {
   return { text: lines.join('\n'), replyMarkup: { inline_keyboard: navRows } };
 }
 
-export async function handleTightWizardCallback(data, { chatId, messageId, state, fullCtx }) {
+export async function handleTightWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
   const parts = data.split(':');
   if (parts[0] !== 'tight') return false;
   const action = parts[1];
   const f = parseTightFilter(parts);
 
   if (action === 'wizard' || action === 'set') {
+    // Selecting a custom 极端价 value (from a retained button) keeps it around.
+    if (action === 'set' && isCustomExt(f.ext)) {
+      rememberCustomExtPreset(state, f.ext);
+      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight ext preset persist failed:', err.message));
+    }
     try {
-      await editTelegramMessage(chatId, messageId, tightWizardText(f), tightWizardKeyboard(f));
+      await editTelegramMessage(chatId, messageId, tightWizardText(f), tightWizardKeyboard(f, state.customExtPresets));
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) warn('tight wizard edit failed:', err.message);
     }
+    return true;
+  }
+  // ✏ on any knob: stash a pending-input entry; the next plain number the
+  // user sends in this chat is applied to that field (see the message loop).
+  if (action.startsWith('cust-')) {
+    const field = action.slice('cust-'.length); // gap | minsh | spread | ext
+    setPendingFilterInput(chatId, fromId, {
+      kind: 'tight', field,
+      levels: f.levels, gap: f.gap, minSh: f.minSh, both: f.both,
+      sort: f.sort, spread: f.spread, ext: f.ext, messageId,
+    });
+    const prompts = {
+      gap: '每档跳档 ¢，可带小数（例 0.3 = 相邻档 ≤0.3¢）',
+      minsh: 'N 档合计最低份额，整数（例 2500）',
+      spread: '买1卖1价差上限 ¢，可带小数（例 0.3）',
+      ext: `极端价百分位 1-99（例 88 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'} ≥88¢ / ≤12¢；想换模式先点对应的 排除/仅 按钮）`,
+    };
+    const hint = [
+      '🤏 <b>紧凑盘口 · 等待自定义…</b>',
+      '',
+      `请直接在本 chat <b>回复一个数字</b>（${prompts[field] ?? ''}）。`,
+      '',
+      `当前: <i>${htmlEscape(tightLabel(f))}</i>`,
+      '',
+      '<i>5 分钟内有效。回复非数字 / 0 即清除该项。</i>',
+    ].join('\n');
+    const cancelKb = { inline_keyboard: [[{ text: '✖ 取消(回到向导)', callback_data: tightCb('wizard', f) }]] };
+    try { await editTelegramMessage(chatId, messageId, hint, cancelKb); } catch {}
+    return true;
+  }
+  if (action === 'ext-clear') {
+    if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
+      state.customExtPresets = [];
+      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight ext-clear persist failed:', err.message));
+    }
+    const f2 = { ...f, ext: isCustomExt(f.ext) ? 'off' : f.ext };
+    try { await editTelegramMessage(chatId, messageId, tightWizardText(f2), tightWizardKeyboard(f2, state.customExtPresets)); }
+    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('tight ext-clear edit failed:', err.message); }
     return true;
   }
   if (action === 'cancel') {
@@ -2599,7 +2734,7 @@ const HELP = [
   '/gaps — 奖励区可激活（PP 待捡）',
   '/thin — 薄盘市场（买1+卖1 总额 &lt; 阈值）',
   '/wide — 当前价差最大',
-  '/tight — 紧凑盘口。快查：价差 ≤ TIGHT_SPREAD_MAX，最紧在前。底部 🎚 进向导：连续 N 档一格一档的密集梯子（默认每档 0.1¢；选「整格」则自适应每个市场的最小跳档，1为1档(1¢)的市场也能识别），可设最低份额、双边/单边，按份额深度排名（重抓多档盘口）',
+  '/tight — 紧凑盘口。快查：价差 ≤ TIGHT_SPREAD_MAX，最紧在前。底部 🎚 进向导：连续 N 档一格一档的密集梯子（选「整格」则自适应每个市场的最小跳档，1为1档(1¢)的市场也能识别），可设最低份额、买1卖1价差、极端价(排除/仅)、双边/单边，按份额/金额深度·PP/h·停滞时长排名（重抓多档盘口）。每项都可自定义：点该行的 ✏ 回复数字（跳档/价差填¢可带小数，份额填整数，极端价填1-99）',
   '/empty — 单边/空簿',
   '/stale — 停滞时长排名（含未到 staleHours 阈值的；底部 🎚 过滤 = 重抓 orderbook + 按 sum 阈值筛）',
   '/all — 全部监控市场（包括暂停/跳过/错误的；同款过滤+排序向导）',
@@ -4769,6 +4904,41 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 } catch (err) {
                   warn(`new custom-input apply edit failed: ${err.message}`);
                 }
+              } else if (pending.kind === 'tight') {
+                // /tight wizard. pending.field = gap | minsh | spread | ext.
+                // gap/spread accept decimals (e.g. 0.3¢), so parse the raw
+                // string here rather than the integer-only `num` above.
+                const f = {
+                  levels: pending.levels, gap: pending.gap, minSh: pending.minSh,
+                  both: pending.both, sort: pending.sort, spread: pending.spread, ext: pending.ext,
+                };
+                const decOk = /^\d+(\.\d+)?$/.test(trimmed);
+                const dec = decOk ? Number(trimmed) : null;
+                if (pending.field === 'gap') {
+                  // junk / out-of-range → reset to 整格(自适应).
+                  f.gap = (dec != null ? normalizeCustomCents(trimmed, TIGHT_CUSTOM_GAP_MAX) : null) ?? TIGHT_DEFAULT.gap;
+                } else if (pending.field === 'spread') {
+                  f.spread = (dec != null ? normalizeCustomCents(trimmed, TIGHT_CUSTOM_SPREAD_MAX) : null) ?? 'inf';
+                } else if (pending.field === 'minsh') {
+                  f.minSh = (num != null && num > 0) ? num : 0; // shares: integer; 0/junk → 不限
+                } else if (pending.field === 'ext') {
+                  if (num != null && num >= 1 && num <= 99) {
+                    const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+                    f.ext = formatExt(mode, num);
+                    rememberCustomExtPreset(state, f.ext);
+                  } else {
+                    f.ext = 'off';
+                  }
+                }
+                try {
+                  await editTelegramMessage(
+                    chatId, pending.messageId,
+                    tightWizardText(f), tightWizardKeyboard(f, state.customExtPresets),
+                  );
+                  if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight custom persist failed:', err.message));
+                } catch (err) {
+                  warn(`tight custom-input apply edit failed: ${err.message}`);
+                }
               } else {
                 // /stale or /all wizard. pending.field tells us which knob —
                 // 'thresh' for sum threshold ($), 'ext' for 极端价 (1-99).
@@ -4854,7 +5024,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 warn('new wizard error:', err.message);
               });
             } else if (data.startsWith('tight:')) {
-              await handleTightWizardCallback(data, { chatId, messageId, state, fullCtx }).catch((err) => {
+              await handleTightWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }).catch((err) => {
                 warn('tight wizard error:', err.message);
               });
             } else if (data.startsWith('hd:')) {
