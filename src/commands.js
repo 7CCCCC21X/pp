@@ -51,7 +51,7 @@ const PRIVATE_MENU = [
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
   { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
   { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
-  { command: 'combo', description: '相邻档组合价筛选（FDV: 低档是+高档否 / 发币日期: 早档否+晚档是 <110¢；实时重抓订单簿；底部 🎚 自定义向导）' },
+  { command: 'combo', description: '相邻档组合价筛选（FDV: 低档是+高档否 / 发币日期: 早档否+晚档是 <110¢；实时重抓订单簿；底部 🎚 向导可调上限/类型/股数/极端价）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -2736,7 +2736,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。每次运行都实时重抓相关订单簿。/combo 105 单次改上限 · /combo set 108 保存默认。结果底部 🎚 进自定义向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 排序(组合价/股数/区间盈利额)，上限和股数都可点 ✏ 回复数字自定义',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。每次运行都实时重抓相关订单簿。/combo 105 单次改上限 · /combo set 108 保存默认。结果底部 🎚 进自定义向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按重抓后的实时盘口判断) × 排序(组合价/股数/区间盈利额)，上限/股数/极端价都可点 ✏ 回复数字自定义',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -3947,12 +3947,18 @@ function formatComboPair(pair, state) {
 // tick cache).
 //
 // Callback shape (well within Telegram's 64-byte limit):
-//   combo:<action>:<cap>:<kind>:<minSh>:<sort>
+//   combo:<action>:<cap>:<kind>:<minSh>:<sort>:<ext>
 //   cap   = combined-cost ceiling in cents (decimals OK, e.g. 107.5)
 //   kind  = all | money | date (ladder type filter)
 //   minSh = minimum top-of-book executable shares across both legs (0 = 不限)
 //   sort  = cost (组合价 asc) | size (可成交股数 desc) | usd (区间盈利额 desc)
-//   actions = wizard | set | run | cancel | cust-cap | cust-minsh
+//   ext   = 极端价 filter, same token scheme as /tight & /stale ('off' | '85'
+//           = 排除 either-leg ≥85¢/≤15¢ | 'i85' = 仅 pairs with an extreme leg).
+//           Judged on the freshly fetched books, per PAIR: 'ex' drops a pair
+//           when EITHER leg is extreme, 'in' keeps only those pairs.
+//   actions = wizard | set | run | cancel | cust-cap | cust-minsh | cust-ext
+//             | ext-clear
+// Legacy 6-part callbacks (pre-ext) still parse — ext defaults to 'off'.
 
 const COMBO_CAP_PRESETS = ['100', '105', '108', '110', '115'];
 const COMBO_KIND_OPTS = [
@@ -3984,22 +3990,23 @@ function isCustomComboMinSh(s) {
 
 function comboDefaultFilter(state) {
   const cap = normalizeComboCap(state?.comboMaxCents) ?? '110';
-  return { cap, kind: 'all', minSh: 0, sort: 'cost' };
+  return { cap, kind: 'all', minSh: 0, sort: 'cost', ext: 'off' };
 }
 
 export function parseComboFilter(parts, state) {
-  // [ 'combo', action, cap, kind, minSh, sort ]
+  // [ 'combo', action, cap, kind, minSh, sort, ext ]
   const d = comboDefaultFilter(state);
   const cap = normalizeComboCap(parts[2]) ?? d.cap;
   const kind = COMBO_KIND_OPTS.some(([k]) => k === parts[3]) ? parts[3] : d.kind;
   const minSh = (Number.isFinite(Number(parts[4])) && Number(parts[4]) >= 0)
     ? Math.floor(Number(parts[4])) : d.minSh;
   const sort = COMBO_SORTS.some(([k]) => k === parts[5]) ? parts[5] : d.sort;
-  return { cap, kind, minSh, sort };
+  const ext = normalizeExt(parts[6]);
+  return { cap, kind, minSh, sort, ext };
 }
 
 function comboCb(action, f) {
-  return `combo:${action}:${f.cap}:${f.kind}:${f.minSh}:${f.sort}`;
+  return `combo:${action}:${f.cap}:${f.kind}:${f.minSh}:${f.sort}:${normalizeExt(f.ext)}`;
 }
 
 function comboKindLabel(kind) {
@@ -4012,6 +4019,7 @@ function comboSortLabel(sort) {
 function comboLabel(f) {
   return `上限 <${f.cap}¢ · ${comboKindLabel(f.kind)}`
     + (f.minSh > 0 ? ` · 可成交 ≥${fmtSharesShort(f.minSh)}股` : '')
+    + (extFilterActive(f.ext) ? ` · ${extLabel(f.ext)}` : '')
     + ` · 排序 ${comboSortLabel(f.sort)}`;
 }
 
@@ -4023,24 +4031,58 @@ function comboWizardText(f) {
     `💵 组合价上限: <b>&lt;${f.cap}¢</b>${tag(isCustomComboCap(f.cap))}`,
     `🪜 阶梯类型: <b>${comboKindLabel(f.kind)}</b>`,
     `🔢 最低可成交股数: <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>${tag(isCustomComboMinSh(f.minSh))}`,
+    `📈 极端价: <b>${extLabel(f.ext)}</b>${tag(isCustomExt(f.ext))}`,
     `📊 排序: <b>${comboSortLabel(f.sort)}</b>`,
     '',
     '<i>组合 = 金额阶梯买「低档 是 + 高档 否」，日期阶梯买「早档 否 + 晚档 是」。两腿合计 &lt;100¢ 为纯套利；100~上限 之间是低风险中间区间打法（命中赚 200−成本，落空亏 成本−100）。</i>',
     '<i>可成交股数 = 两腿顶档挂单量的较小值，衡量这个价位实际吃得到多少。</i>',
-    '<i>💵/🔢 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数）。</i>',
+    '<i>极端价 = 按刚重抓的盘口判断：排除 ≥85¢ 会剔除任一腿基本已决（一边 ≥85¢ 或 ≤15¢）的组合；仅 ≥85¢ 则只看这类组合。</i>',
+    '<i>💵/🔢/📈 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99）。</i>',
     '<i>点 🚀 会实时重抓所有阶梯市场的订单簿再筛选，可能耗时几十秒。</i>',
   ].join('\n');
 }
 
-export function comboWizardKeyboard(f) {
+export function comboWizardKeyboard(f, customExtPresets = []) {
   const capMark = (c) => c === f.cap ? `✅ <${c}¢` : `<${c}¢`;
   const kindMark = ([k, label]) => k === f.kind ? `✅ ${label}` : label;
   const shLabel = (s) => s > 0 ? `≥${fmtSharesShort(s)}` : '不限';
   const shMark = (s) => s === f.minSh ? `✅ ${shLabel(s)}` : shLabel(s);
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
+  const extKey = normalizeExt(f.ext);
+  const extMark = (e, label) => normalizeExt(e) === extKey ? `✅ ${label}` : label;
   const custBtn = (active, label, action) => ({
     text: active ? `✅ ✏${label}` : '✏', callback_data: comboCb(action, f),
   });
+
+  // 极端价 section mirrors /tight: an "排除" row, a "仅" row, then any
+  // remembered custom values as their own checkmarked buttons (+ 🗑 清空).
+  const extExcludeRow = [
+    { text: extMark('off', '关'), callback_data: comboCb('set', { ...f, ext: 'off' }) },
+    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
+      text: extMark(e, `排除≥${e}¢`), callback_data: comboCb('set', { ...f, ext: e }),
+    })),
+  ];
+  const extIncludeRow = [
+    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
+      text: extMark(`i${e}`, `仅≥${e}¢`), callback_data: comboCb('set', { ...f, ext: `i${e}` }),
+    })),
+    { text: '✏ 自定义…', callback_data: comboCb('cust-ext', f) },
+  ];
+  const seenCustom = new Set();
+  const customTokens = [];
+  const pushCustom = (tok) => {
+    const n = normalizeExt(tok);
+    if (n === 'off' || !isCustomExt(n) || seenCustom.has(n)) return;
+    seenCustom.add(n);
+    customTokens.push(n);
+  };
+  if (isCustomExt(extKey)) pushCustom(extKey);
+  for (const t of (customExtPresets ?? [])) pushCustom(t);
+  const extCustomRow = customTokens.slice(0, CUSTOM_EXT_PRESET_CAP).map((tok) => ({
+    text: extMark(tok, extBtnLabel(tok)), callback_data: comboCb('set', { ...f, ext: tok }),
+  }));
+  if (extCustomRow.length) extCustomRow.push({ text: '🗑 清空', callback_data: comboCb('ext-clear', f) });
+
   return {
     inline_keyboard: [
       [{ text: '— 💵 组合价上限 (¢) —', callback_data: 'page:noop' }],
@@ -4061,6 +4103,10 @@ export function comboWizardKeyboard(f) {
         })),
         custBtn(isCustomComboMinSh(f.minSh), shLabel(f.minSh), 'cust-minsh'),
       ],
+      [{ text: '— 📈 极端价 (排除/仅 已决档位) —', callback_data: 'page:noop' }],
+      extExcludeRow,
+      extIncludeRow,
+      ...(extCustomRow.length ? [extCustomRow] : []),
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
       COMBO_SORTS.map((pair) => ({
         text: sortMark(pair), callback_data: comboCb('set', { ...f, sort: pair[0] }),
@@ -4071,6 +4117,28 @@ export function comboWizardKeyboard(f) {
       ],
     ],
   };
+}
+
+// 极端价 check on a freshly fetched book (not the slot cache — the combo
+// screen's whole premise is live prices). A leg is "extreme" (effectively
+// decided) when best-ask ≥N¢ or best-bid ≤(100−N)¢. Missing sides count as
+// not-extreme, matching passesExtFilter's pass-through for one-sided books.
+function comboBookIsExtreme(book, extParsed) {
+  const hi = extParsed.val / 100;
+  const lo = (100 - extParsed.val) / 100;
+  const ask = book?.bestAsk?.price;
+  const bid = book?.bestBid?.price;
+  return (Number.isFinite(ask) && ask >= hi) || (Number.isFinite(bid) && bid <= lo);
+}
+
+// Pair-level 极端价 filter: 'ex' drops a pair when EITHER leg is extreme,
+// 'in' keeps only pairs with at least one extreme leg.
+function comboPairPassesExt(pair, books, ext) {
+  const p = parseExtRaw(ext);
+  if (p.mode === 'off') return true;
+  const anyExtreme = comboBookIsExtreme(books.get(String(pair.easy.id)), p)
+    || comboBookIsExtreme(books.get(String(pair.hard.id)), p);
+  return p.mode === 'in' ? anyExtreme : !anyExtreme;
 }
 
 // Full combo scan: gather ladder entries from live slots, refetch every rung's
@@ -4097,6 +4165,7 @@ async function runComboScan(f, state) {
   const { books, failed } = await fetchFreshBooks(ids, state);
   let pairs = ladders.flatMap((l) => comboPairs(l, books));
   if (f.minSh > 0) pairs = pairs.filter((p) => p.size >= f.minSh);
+  if (extFilterActive(f.ext)) pairs = pairs.filter((p) => comboPairPassesExt(p, books, f.ext));
   pairs.sort((a, b) => a.costCents - b.costCents);
   const cap = Number(f.cap);
   const hits = pairs.filter((p) => p.costCents < cap);
@@ -4152,24 +4221,40 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
   const f = parseComboFilter(parts, state);
 
   if (action === 'wizard' || action === 'set') {
+    // Selecting a custom 极端价 value (from a retained button) keeps it around.
+    if (action === 'set' && isCustomExt(f.ext)) {
+      rememberCustomExtPreset(state, f.ext);
+      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo ext preset persist failed:', err.message));
+    }
     try {
-      await editTelegramMessage(chatId, messageId, comboWizardText(f), comboWizardKeyboard(f));
+      await editTelegramMessage(chatId, messageId, comboWizardText(f), comboWizardKeyboard(f, state.customExtPresets));
     } catch (err) {
       if (!/message is not modified/i.test(err.message ?? '')) warn('combo wizard edit failed:', err.message);
     }
     return true;
   }
+  if (action === 'ext-clear') {
+    if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
+      state.customExtPresets = [];
+      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo ext-clear persist failed:', err.message));
+    }
+    const f2 = { ...f, ext: isCustomExt(f.ext) ? 'off' : f.ext };
+    try { await editTelegramMessage(chatId, messageId, comboWizardText(f2), comboWizardKeyboard(f2, state.customExtPresets)); }
+    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo ext-clear edit failed:', err.message); }
+    return true;
+  }
   // ✏ on a knob: stash pending input; the next plain number the user sends
   // in this chat is applied to that field (see the message loop).
   if (action.startsWith('cust-')) {
-    const field = action.slice('cust-'.length); // cap | minsh
+    const field = action.slice('cust-'.length); // cap | minsh | ext
     setPendingFilterInput(chatId, fromId, {
       kind: 'combo', field,
-      cap: f.cap, comboKind: f.kind, minSh: f.minSh, sort: f.sort, messageId,
+      cap: f.cap, comboKind: f.kind, minSh: f.minSh, sort: f.sort, ext: f.ext, messageId,
     });
     const prompts = {
       cap: '组合价上限 ¢，可带小数（例 107.5 = 两腿合计 <107.5¢ 才列出；范围 50-199.9）',
       minsh: '最低可成交股数，整数（例 200；0 = 不限）',
+      ext: `极端价百分位 1-99（例 85 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'}任一腿 ≥85¢ / ≤15¢ 的组合；想换模式先点对应的 排除/仅 按钮）`,
     };
     const hint = [
       '💡 <b>组合价筛选 · 等待自定义…</b>',
@@ -5348,23 +5433,33 @@ export function startCommandLoop({ getState, persist, ctx }) {
                   warn(`tight custom-input apply edit failed: ${err.message}`);
                 }
               } else if (pending.kind === 'combo') {
-                // /combo wizard. pending.field = cap | minsh. cap accepts
+                // /combo wizard. pending.field = cap | minsh | ext. cap accepts
                 // decimals (e.g. 107.5¢); junk falls back to the default.
                 const f = {
                   cap: pending.cap, kind: pending.comboKind,
-                  minSh: pending.minSh, sort: pending.sort,
+                  minSh: pending.minSh, sort: pending.sort, ext: pending.ext,
                 };
                 const decOk = /^\d+(\.\d+)?$/.test(trimmed);
                 if (pending.field === 'cap') {
                   f.cap = (decOk ? normalizeComboCap(trimmed) : null) ?? comboDefaultFilter(state).cap;
                 } else if (pending.field === 'minsh') {
                   f.minSh = (num != null && num > 0) ? num : 0; // 0/junk → 不限
+                } else if (pending.field === 'ext') {
+                  // Clamp 1-99, preserve the current mode (排除/仅); junk → off.
+                  if (num != null && num >= 1 && num <= 99) {
+                    const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+                    f.ext = formatExt(mode, num);
+                    rememberCustomExtPreset(state, f.ext);
+                  } else {
+                    f.ext = 'off';
+                  }
                 }
                 try {
                   await editTelegramMessage(
                     chatId, pending.messageId,
-                    comboWizardText(f), comboWizardKeyboard(f),
+                    comboWizardText(f), comboWizardKeyboard(f, state.customExtPresets),
                   );
+                  if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo custom persist failed:', err.message));
                 } catch (err) {
                   warn(`combo custom-input apply edit failed: ${err.message}`);
                 }
