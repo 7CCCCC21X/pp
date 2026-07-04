@@ -2736,7 +2736,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。每次运行都实时重抓相关订单簿。/combo 105 单次改上限 · /combo set 108 保存默认。结果底部 🎚 进自定义向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按重抓后的实时盘口判断) × 排序(组合价/股数/区间盈利额)，上限/股数/极端价都可点 ✏ 回复数字自定义',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。每次运行都实时重抓相关订单簿。/combo 105 单次改上限 · /combo set 108 保存默认。结果底部 🎚 进自定义向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按重抓后的实时盘口判断) × 排序(组合价/股数/区间盈利额/停滞时长)，上限/股数/极端价都可点 ✏ 回复数字自定义。结果全部列出，超长自动分条发送',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -3916,7 +3916,7 @@ async function fetchFreshBooks(ids, state) {
 
 // One rendered line-pair per combo hit. `state` supplies slot titles/slugs
 // for the market links.
-function formatComboPair(pair, state) {
+function formatComboPair(pair, state, { showStall = false } = {}) {
   const easySlot = state.markets[pair.easy.id];
   const hardSlot = state.markets[pair.hard.id];
   const linkOf = (rung, slot) => {
@@ -3932,9 +3932,11 @@ function formatComboPair(pair, state) {
   const legs = `买 ${linkOf(pair.easy, easySlot)} 是 @${pair.yesAskCents.toFixed(1)}¢ ＋ `
     + `买 ${linkOf(pair.hard, hardSlot)} 否 @${pair.noAskCents.toFixed(1)}¢ ＝ <b>${pair.costCents.toFixed(1)}¢</b>`;
   const size = pair.size > 0 ? ` · 顶档约可成交 ${Math.floor(pair.size)} 股` : '';
+  const stall = showStall && Number.isFinite(pair.stallMs)
+    ? ` · 停滞 ${fmtElapsed(pair.stallMs)}` : '';
   const outcome = pure
-    ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}`
-    : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}`;
+    ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}${stall}`
+    : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}${stall}`;
   return `${head}\n   ${legs}\n   ${outcome}`;
 }
 
@@ -3952,6 +3954,7 @@ function formatComboPair(pair, state) {
 //   kind  = all | money | date (ladder type filter)
 //   minSh = minimum top-of-book executable shares across both legs (0 = 不限)
 //   sort  = cost (组合价 asc) | size (可成交股数 desc) | usd (区间盈利额 desc)
+//           | stale (停滞时长 desc — 两腿盘口都未动的时长，取较短一腿)
 //   ext   = 极端价 filter, same token scheme as /tight & /stale ('off' | '85'
 //           = 排除 either-leg ≥85¢/≤15¢ | 'i85' = 仅 pairs with an extreme leg).
 //           Judged on the freshly fetched books, per PAIR: 'ex' drops a pair
@@ -3971,6 +3974,7 @@ const COMBO_SORTS = [
   ['cost', '组合价(低→高)'],
   ['size', '可成交股数'],
   ['usd', '区间盈利额'],
+  ['stale', '停滞时长'],
 ];
 const COMBO_CAP_MIN = 50;
 const COMBO_CAP_MAX = 199.9;
@@ -4166,19 +4170,24 @@ async function runComboScan(f, state) {
   let pairs = ladders.flatMap((l) => comboPairs(l, books));
   if (f.minSh > 0) pairs = pairs.filter((p) => p.size >= f.minSh);
   if (extFilterActive(f.ext)) pairs = pairs.filter((p) => comboPairPassesExt(p, books, f.ext));
+  // Pair stall = the shorter of the two legs' stall durations — how long
+  // BOTH books have sat unmoved. Powers the 停滞时长 sort + row tag.
+  for (const p of pairs) {
+    const stallOf = (id) => stallDurationMs(state.markets[id]) ?? 0;
+    p.stallMs = Math.min(stallOf(p.easy.id), stallOf(p.hard.id));
+  }
   pairs.sort((a, b) => a.costCents - b.costCents);
   const cap = Number(f.cap);
   const hits = pairs.filter((p) => p.costCents < cap);
   const sortVal = (p) => {
     if (f.sort === 'size') return p.size;
     if (f.sort === 'usd') return p.size * p.bandWinCents;
+    if (f.sort === 'stale') return p.stallMs;
     return -p.costCents;
   };
   if (f.sort !== 'cost') hits.sort((a, b) => sortVal(b) - sortVal(a));
   return { ladders: ladders.length, ids, booksCount: books.size, failed, pairs, hits };
 }
-
-const COMBO_MAX_SHOWN = 25;
 
 function renderComboResult(f, state, scan) {
   const wizardRow = [{ text: '🎚 调整设置', callback_data: comboCb('wizard', f) }];
@@ -4207,10 +4216,10 @@ function renderComboResult(f, state, scan) {
     `${freshTag} · 💰=金额（低档是+高档否） · 📅=日期（早档否+晚档是） · 🔥=合计&lt;100¢ 纯套利`,
     '',
   ];
-  for (const p of scan.hits.slice(0, COMBO_MAX_SHOWN)) lines.push(formatComboPair(p, state), '');
-  if (scan.hits.length > COMBO_MAX_SHOWN) {
-    lines.push(`<i>… 还有 ${scan.hits.length - COMBO_MAX_SHOWN} 个，收紧上限可减少结果</i>`);
-  }
+  // All hits, no cap — the send path chunks long messages, and the wizard's
+  // run handler falls back to sendLongTelegramMessage when an edit can't fit.
+  const showStall = f.sort === 'stale';
+  for (const p of scan.hits) lines.push(formatComboPair(p, state, { showStall }), '');
   return { text: lines.join('\n').trim(), replyMarkup: { inline_keyboard: [wizardRow] } };
 }
 
@@ -4309,8 +4318,25 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
       return true;
     }
     const reply = renderComboResult(f, state, scan);
-    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo result edit failed:', err.message); }
+    // A single Telegram message caps at 4096 chars and edits can't chunk —
+    // when the full result doesn't fit, turn the wizard message into a short
+    // pointer and send the complete list as chunked follow-ups (keyboard
+    // rides the last chunk).
+    const COMBO_EDIT_MAX = 3900;
+    if (reply.text.length <= COMBO_EDIT_MAX) {
+      try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
+      catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo result edit failed:', err.message); }
+    } else {
+      try {
+        await editTelegramMessage(
+          chatId, messageId,
+          `💡 组合价筛选完成：${scan.hits.length} 个结果，内容较长，已分条发送 ↓`,
+          undefined,
+        );
+      } catch {}
+      await sendLongTelegramMessage(reply.text, { chatId, replyMarkup: reply.replyMarkup })
+        .catch((err) => warn('combo long result send failed:', err.message));
+    }
     return true;
   }
   return true;
