@@ -89,6 +89,18 @@ test('comboWizardKeyboard: custom ext value gets a retained checkmarked button',
   assert.ok(texts.includes('🗑 清空'));
 });
 
+test('parseComboFilter: stale sort accepted', () => {
+  assert.equal(parseComboFilter(parts('set', { sort: 'stale' }), {}).sort, 'stale');
+});
+
+test('comboWizardKeyboard: 停滞时长 sort button present and round-trips', () => {
+  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'stale', ext: 'off' };
+  const kb = comboWizardKeyboard(f);
+  assert.ok(buttonTexts(kb).includes('✅ 停滞时长'));
+  const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
+  assert.deepEqual(parseComboFilter(run.split(':'), {}), f);
+});
+
 test('comboWizardKeyboard: round-trips through parseComboFilter', () => {
   const f = { cap: '105', kind: 'money', minSh: 100, sort: 'size', ext: '85' };
   const kb = comboWizardKeyboard(f);
