@@ -18,6 +18,7 @@ import {
   broadcastChats,
   effectiveOverride,
   stallDurationMs,
+  isSnoozed,
 } from './state.js';
 import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
@@ -50,6 +51,7 @@ const PRIVATE_MENU = [
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
   { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
   { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
+  { command: 'combo', description: '相邻档组合价筛选（FDV: 低档是+高档否 / 发币日期: 早档否+晚档是 <110¢；实时重抓订单簿）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -106,6 +108,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
         [
           { text: '📈 PP 变动', callback_data: '/movers' },
           { text: '⚠️ 定价异常', callback_data: '/sanity' },
+          { text: '💡 组合价', callback_data: '/combo' },
           { text: '⏱ 摘要设置', callback_data: '/hourly' },
         ],
         [
@@ -139,6 +142,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
         { text: '📈 PP 变动', callback_data: '/movers' },
         { text: '⚠️ 定价异常', callback_data: '/sanity' },
         { text: '🪜 阶梯', callback_data: '/ladders' },
+        { text: '💡 组合价', callback_data: '/combo' },
       ],
       [
         { text: '⏱ 摘要设置', callback_data: '/hourly' },
@@ -2742,6 +2746,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。每次运行都实时重抓相关订单簿。/combo 105 单次改上限 · /combo set 108 保存默认',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -3861,6 +3866,88 @@ async function buildConfigDump(state) {
   return { text: lines.join('\n') };
 }
 
+// Fresh orderbook sweep for /combo. The whole point of the combo screen is
+// executable prices, so it NEVER reads slot.baseline (last tick's cache) —
+// every run re-fetches the book of every ladder rung, with a small worker
+// pool and a per-market timeout so one dead market can't stall the scan.
+const COMBO_FETCH_CONCURRENCY = 6;
+const COMBO_PER_MARKET_TIMEOUT_MS = 12_000;
+
+async function fetchFreshBooks(ids, state) {
+  const books = new Map();
+  let failed = 0;
+  let next = 0;
+  const fetchOne = async (id) => {
+    const slot = state.markets[id];
+    let timer;
+    const timeout = new Promise((_, rej) => {
+      timer = setTimeout(
+        () => rej(new Error(`timeout ${COMBO_PER_MARKET_TIMEOUT_MS / 1000}s`)),
+        COMBO_PER_MARKET_TIMEOUT_MS,
+      );
+    });
+    try {
+      return await Promise.race([
+        getOrderbook(slot?.orderbookCache?.key ?? id, {
+          contextMarketId: id,
+          cache: slot?.orderbookCache ?? null,
+        }),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const worker = async () => {
+    while (next < ids.length) {
+      const id = ids[next++];
+      try {
+        const book = await fetchOne(id);
+        books.set(String(id), book);
+        const slot = state.markets[id];
+        if (slot) {
+          slot.recentBook = {
+            bids: book.bids ?? [],
+            asks: book.asks ?? [],
+            fetchedAt: Date.now(),
+          };
+        }
+      } catch (err) {
+        failed += 1;
+        log(`[combo] book refetch failed for ${id}: ${err.message}`);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(COMBO_FETCH_CONCURRENCY, ids.length) }, worker),
+  );
+  return { books, failed };
+}
+
+// One rendered line-pair per combo hit. `state` supplies slot titles/slugs
+// for the market links.
+function formatComboPair(pair, state) {
+  const easySlot = state.markets[pair.easy.id];
+  const hardSlot = state.markets[pair.hard.id];
+  const linkOf = (rung, slot) => {
+    const safeRaw = htmlEscape(rung.raw);
+    return slot
+      ? `<a href="${marketUrl(rung.id, slot.title, slot.question, slot.slug)}">${safeRaw}</a>`
+      : safeRaw;
+  };
+  const kindTag = pair.kind === 'date' ? '📅' : '💰';
+  const pure = pair.costCents < 100;
+  const ctxText = htmlEscape(shortTitle(pair.context.replace(/\s+/g, ' ').trim(), 60));
+  const head = `${pure ? '🔥' : kindTag} <i>${ctxText}</i>`;
+  const legs = `买 ${linkOf(pair.easy, easySlot)} 是 @${pair.yesAskCents.toFixed(1)}¢ ＋ `
+    + `买 ${linkOf(pair.hard, hardSlot)} 否 @${pair.noAskCents.toFixed(1)}¢ ＝ <b>${pair.costCents.toFixed(1)}¢</b>`;
+  const size = pair.size > 0 ? ` · 顶档约可成交 ${Math.floor(pair.size)} 股` : '';
+  const outcome = pure
+    ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}`
+    : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}`;
+  return `${head}\n   ${legs}\n   ${outcome}`;
+}
+
 async function handle(text, state, ctx, chatId, fromId) {
   const [raw, ...rest] = text.trim().split(/\s+/);
   if (!raw) return null;
@@ -4177,6 +4264,89 @@ async function handle(text, state, ctx, chatId, fromId) {
           : '✅ 正常';
         lines.push(`${bad ? '⚠️' : '·'} <i>${ctxText}</i> — ${l.rungs.length}档 · ${status}`);
         lines.push(`   ${rungStr}`);
+      }
+      return lines.join('\n').trim();
+    }
+
+    case '/combo': {
+      // Adjacent-rung combo screen: for FDV/market-cap ladders buy the
+      // lower rung's YES + the next rung's NO; for launch-date ladders buy
+      // the earlier date's NO + the next date's YES. Both legs together pay
+      // at least $1, and $2 when the outcome lands between the thresholds —
+      // so a combined cost under the cap (default 110¢) is a cheap bet on
+      // the middle band (or a pure arb below 100¢). Prices come from a
+      // fresh orderbook fetch on EVERY run, never the tick cache.
+      const { buildComboLadders, comboPairs } = await import('./combo.js');
+      const sub = arg.trim().toLowerCase();
+      let maxCents = Number.isFinite(state.comboMaxCents) ? state.comboMaxCents : 110;
+      if (sub.startsWith('set')) {
+        const val = sub.replace(/^set/, '').trim();
+        const n = Number(val);
+        if (!Number.isFinite(n) || n < 50 || n >= 200) {
+          return `组合价上限需在 [50, 200)¢，例如 /combo set 108。当前默认 ${maxCents}¢。`;
+        }
+        state.comboMaxCents = n;
+        await ctx.persist();
+        return `✅ 组合价上限已保存为 ${n}¢（两腿合计低于此值才列出）。/combo 立即扫描。`;
+      }
+      if (sub) {
+        const n = Number(sub);
+        if (!Number.isFinite(n) || n < 50 || n >= 200) {
+          return `用法：/combo（默认上限 ${maxCents}¢） · /combo 105 单次改上限 · /combo set 108 保存默认`;
+        }
+        maxCents = n;
+      }
+
+      const entries = [];
+      for (const [id, slot] of Object.entries(state.markets)) {
+        if (!slot) continue;
+        if (state.pausedIds?.includes(id) || isSnoozed(state, id)) continue;
+        // Stub slots (resolved / fetch-error markets) have no working book —
+        // don't waste a refetch on them.
+        if (slot.lastError) continue;
+        if (!slot.title && !slot.question) continue;
+        entries.push({ id, title: slot.title, question: slot.question });
+      }
+      const ladders = buildComboLadders(entries);
+      if (!ladders.length) {
+        return '未识别到任何金额/日期阶梯（需同一事件 ≥2 个不同门槛或日期的市场在监控中）。';
+      }
+      const ids = [...new Set(ladders.flatMap((l) => l.rungs.map((r) => String(r.id))))];
+      if (chatId) {
+        // Fire-and-forget progress note — the fresh sweep can take a while.
+        sendTelegramMessage(
+          `⏳ 组合价筛选：识别到 ${ladders.length} 个阶梯，正在实时重抓 ${ids.length} 个市场的订单簿…`,
+          { chatId },
+        ).catch(() => {});
+      }
+      const { books, failed } = await fetchFreshBooks(ids, state);
+
+      const pairs = ladders.flatMap((l) => comboPairs(l, books));
+      pairs.sort((a, b) => a.costCents - b.costCents);
+      const hits = pairs.filter((p) => p.costCents < maxCents);
+      const freshTag = `已实时重抓 ${books.size} 个盘口${failed ? `（失败 ${failed}）` : ''}`;
+      if (!hits.length) {
+        const lines = [
+          `💡 <b>组合价筛选</b> · 上限 &lt;${maxCents}¢ · ${freshTag}`,
+          '',
+          `没有低于 ${maxCents}¢ 的相邻档组合。`,
+        ];
+        const nearest = pairs.slice(0, 3);
+        if (nearest.length) {
+          lines.push('', `<b>最接近的组合（参考）</b>`);
+          for (const p of nearest) lines.push(formatComboPair(p, state), '');
+        }
+        return lines.join('\n').trim();
+      }
+      const lines = [
+        `💡 <b>组合价筛选 (${hits.length})</b> · 上限 &lt;${maxCents}¢ · ${freshTag}`,
+        '💰=金额阶梯（低档是+高档否） · 📅=日期阶梯（早档否+晚档是） · 🔥=合计&lt;100¢ 纯套利',
+        '',
+      ];
+      const MAX_SHOWN = 25;
+      for (const p of hits.slice(0, MAX_SHOWN)) lines.push(formatComboPair(p, state), '');
+      if (hits.length > MAX_SHOWN) {
+        lines.push(`<i>… 还有 ${hits.length - MAX_SHOWN} 个，收紧上限（/combo ${Math.floor(hits[MAX_SHOWN].costCents)}）可减少结果</i>`);
       }
       return lines.join('\n').trim();
     }
