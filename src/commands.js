@@ -51,7 +51,7 @@ const PRIVATE_MENU = [
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
   { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
   { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
-  { command: 'combo', description: '相邻档组合价筛选（FDV: 低档是+高档否 / 发币日期: 早档否+晚档是 <110¢；实时重抓订单簿；底部 🎚 向导可调上限/类型/股数/极端价）' },
+  { command: 'combo', description: '相邻档组合价筛选（FDV: 低档是+高档否 / 发币日期: 早档否+晚档是 <110¢；先开筛选向导，🚀 实时重抓订单簿查询，结果分页）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -2736,7 +2736,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。每次运行都实时重抓相关订单簿。/combo 105 单次改上限 · /combo set 108 保存默认。结果底部 🎚 进自定义向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按重抓后的实时盘口判断) × 排序(组合价/股数/区间盈利额/停滞时长)，上限/股数/极端价都可点 ✏ 回复数字自定义。结果全部列出，超长自动分条发送',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 排序(组合价/股数/区间盈利额/停滞时长)，上限/股数/极端价都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -3948,8 +3948,12 @@ function formatComboPair(pair, state, { showStall = false } = {}) {
 // the scan with a FRESH orderbook sweep (the combo screen never trusts the
 // tick cache).
 //
+// Flow: /combo opens the FILTER CARD first (no fetching); 🚀 runs the fresh
+// orderbook sweep and renders page 1 of the results; ⬅️/➡️ page through the
+// cached scan without refetching (re-run 🚀 for fresh prices).
+//
 // Callback shape (well within Telegram's 64-byte limit):
-//   combo:<action>:<cap>:<kind>:<minSh>:<sort>:<ext>
+//   combo:<action>:<cap>:<kind>:<minSh>:<sort>:<ext>:<page>
 //   cap   = combined-cost ceiling in cents (decimals OK, e.g. 107.5)
 //   kind  = all | money | date (ladder type filter)
 //   minSh = minimum top-of-book executable shares across both legs (0 = 不限)
@@ -3959,9 +3963,11 @@ function formatComboPair(pair, state, { showStall = false } = {}) {
 //           = 排除 either-leg ≥85¢/≤15¢ | 'i85' = 仅 pairs with an extreme leg).
 //           Judged on the freshly fetched books, per PAIR: 'ex' drops a pair
 //           when EITHER leg is extreme, 'in' keeps only those pairs.
-//   actions = wizard | set | run | cancel | cust-cap | cust-minsh | cust-ext
-//             | ext-clear
-// Legacy 6-part callbacks (pre-ext) still parse — ext defaults to 'off'.
+//   page  = results page index (only used by action=page)
+//   actions = wizard | set | run | page | cancel | cust-cap | cust-minsh
+//             | cust-ext | ext-clear
+// Legacy shorter callbacks (pre-ext / pre-page) still parse — missing
+// fields fall back to their defaults.
 
 const COMBO_CAP_PRESETS = ['100', '105', '108', '110', '115'];
 const COMBO_KIND_OPTS = [
@@ -3998,7 +4004,7 @@ function comboDefaultFilter(state) {
 }
 
 export function parseComboFilter(parts, state) {
-  // [ 'combo', action, cap, kind, minSh, sort, ext ]
+  // [ 'combo', action, cap, kind, minSh, sort, ext, page ]
   const d = comboDefaultFilter(state);
   const cap = normalizeComboCap(parts[2]) ?? d.cap;
   const kind = COMBO_KIND_OPTS.some(([k]) => k === parts[3]) ? parts[3] : d.kind;
@@ -4006,11 +4012,12 @@ export function parseComboFilter(parts, state) {
     ? Math.floor(Number(parts[4])) : d.minSh;
   const sort = COMBO_SORTS.some(([k]) => k === parts[5]) ? parts[5] : d.sort;
   const ext = normalizeExt(parts[6]);
-  return { cap, kind, minSh, sort, ext };
+  const page = Math.max(0, Number(parts[7]) || 0);
+  return { cap, kind, minSh, sort, ext, page };
 }
 
-function comboCb(action, f) {
-  return `combo:${action}:${f.cap}:${f.kind}:${f.minSh}:${f.sort}:${normalizeExt(f.ext)}`;
+function comboCb(action, f, page = 0) {
+  return `combo:${action}:${f.cap}:${f.kind}:${f.minSh}:${f.sort}:${normalizeExt(f.ext)}:${page}`;
 }
 
 function comboKindLabel(kind) {
@@ -4189,7 +4196,38 @@ async function runComboScan(f, state) {
   return { ladders: ladders.length, ids, booksCount: books.size, failed, pairs, hits };
 }
 
-function renderComboResult(f, state, scan) {
+// Completed scans, kept so ⬅️/➡️ can page through results without refetching
+// every orderbook. Keyed per result message; pruned by TTL and size cap.
+const COMBO_SCAN_TTL_MS = 30 * 60 * 1000;
+const COMBO_SCAN_CACHE_MAX = 20;
+const _comboScans = new Map(); // `${chatId}:${messageId}` -> { scan, at }
+
+function rememberComboScan(chatId, messageId, scan) {
+  const now = Date.now();
+  for (const [k, v] of _comboScans) {
+    if (now - v.at > COMBO_SCAN_TTL_MS) _comboScans.delete(k);
+  }
+  while (_comboScans.size >= COMBO_SCAN_CACHE_MAX) {
+    _comboScans.delete(_comboScans.keys().next().value); // oldest insert
+  }
+  _comboScans.set(`${chatId}:${messageId}`, { scan, at: now });
+}
+
+function getComboScan(chatId, messageId) {
+  const v = _comboScans.get(`${chatId}:${messageId}`);
+  if (!v) return null;
+  if (Date.now() - v.at > COMBO_SCAN_TTL_MS) {
+    _comboScans.delete(`${chatId}:${messageId}`);
+    return null;
+  }
+  return v.scan;
+}
+
+// Pairs per result page — each hit renders as a 3-line block, so 8 per page
+// stays comfortably inside one Telegram message.
+const COMBO_PAGE_SIZE = 8;
+
+function renderComboResult(f, state, scan, page = 0) {
   const wizardRow = [{ text: '🎚 调整设置', callback_data: comboCb('wizard', f) }];
   if (!scan.ladders) {
     const kindNote = f.kind !== 'all' ? `${comboKindLabel(f.kind)}的` : '';
@@ -4199,8 +4237,8 @@ function renderComboResult(f, state, scan) {
     };
   }
   const freshTag = `已实时重抓 ${scan.booksCount} 个盘口${scan.failed ? `（失败 ${scan.failed}）` : ''}`;
-  const header = `💡 <b>组合价筛选${scan.hits.length ? ` (${scan.hits.length})` : ''}</b> <i>· ${htmlEscape(comboLabel(f))}</i>`;
   if (!scan.hits.length) {
+    const header = `💡 <b>组合价筛选</b> <i>· ${htmlEscape(comboLabel(f))}</i>`;
     const lines = [header, `${freshTag}`, '', `没有符合条件的相邻档组合。`];
     const nearest = scan.pairs.slice(0, 3);
     if (nearest.length) {
@@ -4211,16 +4249,27 @@ function renderComboResult(f, state, scan) {
     }
     return { text: lines.join('\n').trim(), replyMarkup: { inline_keyboard: [wizardRow] } };
   }
+  const totalPages = Math.max(1, Math.ceil(scan.hits.length / COMBO_PAGE_SIZE));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const items = scan.hits.slice(safePage * COMBO_PAGE_SIZE, (safePage + 1) * COMBO_PAGE_SIZE);
   const lines = [
-    header,
+    `💡 <b>组合价筛选 (${scan.hits.length})</b> <i>· ${htmlEscape(comboLabel(f))}</i>`,
     `${freshTag} · 💰=金额（低档是+高档否） · 📅=日期（早档否+晚档是） · 🔥=合计&lt;100¢ 纯套利`,
     '',
   ];
-  // All hits, no cap — the send path chunks long messages, and the wizard's
-  // run handler falls back to sendLongTelegramMessage when an edit can't fit.
   const showStall = f.sort === 'stale';
-  for (const p of scan.hits) lines.push(formatComboPair(p, state, { showStall }), '');
-  return { text: lines.join('\n').trim(), replyMarkup: { inline_keyboard: [wizardRow] } };
+  for (const p of items) lines.push(formatComboPair(p, state, { showStall }), '');
+  if (totalPages > 1) lines.push(`<i>第 ${safePage + 1} / ${totalPages} 页 · 翻页用刚重抓的缓存，重新报价请再点 🚀</i>`);
+  const navRows = [];
+  if (totalPages > 1) {
+    const nav = [];
+    if (safePage > 0) nav.push({ text: '⬅️ 上一页', callback_data: comboCb('page', f, safePage - 1) });
+    nav.push({ text: `${safePage + 1} / ${totalPages}`, callback_data: 'page:noop' });
+    if (safePage < totalPages - 1) nav.push({ text: '➡️ 下一页', callback_data: comboCb('page', f, safePage + 1) });
+    navRows.push(nav);
+  }
+  navRows.push(wizardRow);
+  return { text: lines.join('\n').trim(), replyMarkup: { inline_keyboard: navRows } };
 }
 
 export async function handleComboWizardCallback(data, { chatId, messageId, fromId, state, fullCtx }) {
@@ -4317,26 +4366,35 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
       } catch {}
       return true;
     }
-    const reply = renderComboResult(f, state, scan);
-    // A single Telegram message caps at 4096 chars and edits can't chunk —
-    // when the full result doesn't fit, turn the wizard message into a short
-    // pointer and send the complete list as chunked follow-ups (keyboard
-    // rides the last chunk).
-    const COMBO_EDIT_MAX = 3900;
-    if (reply.text.length <= COMBO_EDIT_MAX) {
-      try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
-      catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo result edit failed:', err.message); }
-    } else {
+    rememberComboScan(chatId, messageId, scan);
+    const reply = renderComboResult(f, state, scan, 0);
+    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
+    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo result edit failed:', err.message); }
+    return true;
+  }
+  if (action === 'page') {
+    // Page through the scan cached at 🚀 time — no refetch. After a restart
+    // (or TTL expiry) the cache is gone; point the user back at 🚀.
+    const scan = getComboScan(chatId, messageId);
+    if (!scan) {
+      const kb = {
+        inline_keyboard: [[
+          { text: '🚀 重新扫描', callback_data: comboCb('run', f) },
+          { text: '🎚 调整设置', callback_data: comboCb('wizard', f) },
+        ]],
+      };
       try {
         await editTelegramMessage(
           chatId, messageId,
-          `💡 组合价筛选完成：${scan.hits.length} 个结果，内容较长，已分条发送 ↓`,
-          undefined,
+          `💡 <b>组合价筛选</b>\n\n这页结果已过期（缓存 ${COMBO_SCAN_TTL_MS / 60000} 分钟）。点 🚀 重新实时扫描。\n\n当前设置: <i>${htmlEscape(comboLabel(f))}</i>`,
+          kb,
         );
       } catch {}
-      await sendLongTelegramMessage(reply.text, { chatId, replyMarkup: reply.replyMarkup })
-        .catch((err) => warn('combo long result send failed:', err.message));
+      return true;
     }
+    const reply = renderComboResult(f, state, scan, f.page);
+    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
+    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo page edit failed:', err.message); }
     return true;
   }
   return true;
@@ -4685,19 +4743,16 @@ async function handle(text, state, ctx, chatId, fromId) {
       if (sub) {
         const n = normalizeComboCap(sub);
         if (n == null) {
-          return `用法：/combo（默认上限 ${f.cap}¢） · /combo 105 单次改上限 · /combo set 108 保存默认。结果底部 🎚 可进自定义向导（类型/最低股数/排序）。`;
+          return `用法：/combo 打开筛选向导（默认上限 ${f.cap}¢） · /combo 105 预设上限 · /combo set 108 保存默认。向导里点 🚀 才实时重抓订单簿查询。`;
         }
         f.cap = n;
       }
-      if (chatId) {
-        // Fire-and-forget progress note — the fresh sweep can take a while.
-        sendTelegramMessage(
-          '⏳ 组合价筛选：正在实时重抓阶梯市场的订单簿…',
-          { chatId },
-        ).catch(() => {});
-      }
-      const scan = await runComboScan(f, state);
-      return renderComboResult(f, state, scan);
+      // Filter first, query second: /combo opens the wizard card without
+      // touching the network; the scan runs when the user hits 🚀.
+      return {
+        text: comboWizardText(f),
+        replyMarkup: comboWizardKeyboard(f, state.customExtPresets),
+      };
     }
 
     case '/top':

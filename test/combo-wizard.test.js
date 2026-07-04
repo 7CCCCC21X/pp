@@ -16,14 +16,14 @@ function callbacks(kb) {
 function buttonTexts(kb) {
   return kb.inline_keyboard.flat().map((b) => b.text);
 }
-// Build the 7-part callback parts array a button would carry.
-function parts(action, { cap = '110', kind = 'all', minSh = 0, sort = 'cost', ext = 'off' } = {}) {
-  return ['combo', action, String(cap), kind, String(minSh), sort, ext];
+// Build the 8-part callback parts array a button would carry.
+function parts(action, { cap = '110', kind = 'all', minSh = 0, sort = 'cost', ext = 'off', page = 0 } = {}) {
+  return ['combo', action, String(cap), kind, String(minSh), sort, ext, String(page)];
 }
 
 test('parseComboFilter: defaults', () => {
   const f = parseComboFilter(parts('wizard'), {});
-  assert.deepEqual(f, { cap: '110', kind: 'all', minSh: 0, sort: 'cost', ext: 'off' });
+  assert.deepEqual(f, { cap: '110', kind: 'all', minSh: 0, sort: 'cost', ext: 'off', page: 0 });
 });
 
 test('parseComboFilter: accepts a custom decimal cap and trims trailing zeros', () => {
@@ -57,6 +57,12 @@ test('parseComboFilter: ext accepts 排除/仅 tokens, junk → off, legacy 6-pa
   assert.equal(parseComboFilter(parts('set', { ext: 'bogus' }), {}).ext, 'off');
   // Legacy pre-ext callback (6 parts) still parses with ext off.
   assert.equal(parseComboFilter(['combo', 'set', '110', 'all', '0', 'cost'], {}).ext, 'off');
+});
+
+test('parseComboFilter: page parses, junk/negative → 0', () => {
+  assert.equal(parseComboFilter(parts('page', { page: 3 }), {}).page, 3);
+  assert.equal(parseComboFilter(parts('page', { page: -2 }), {}).page, 0);
+  assert.equal(parseComboFilter(['combo', 'run', '110', 'all', '0', 'cost', 'off'], {}).page, 0);
 });
 
 test('comboWizardKeyboard: callbacks stay within Telegram 64-byte limit', () => {
@@ -98,7 +104,7 @@ test('comboWizardKeyboard: 停滞时长 sort button present and round-trips', ()
   const kb = comboWizardKeyboard(f);
   assert.ok(buttonTexts(kb).includes('✅ 停滞时长'));
   const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
-  assert.deepEqual(parseComboFilter(run.split(':'), {}), f);
+  assert.deepEqual(parseComboFilter(run.split(':'), {}), { ...f, page: 0 });
 });
 
 test('comboWizardKeyboard: round-trips through parseComboFilter', () => {
@@ -107,5 +113,5 @@ test('comboWizardKeyboard: round-trips through parseComboFilter', () => {
   const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
   assert.ok(run);
   const parsed = parseComboFilter(run.split(':'), {});
-  assert.deepEqual(parsed, f);
+  assert.deepEqual(parsed, { ...f, page: 0 });
 });
