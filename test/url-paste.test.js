@@ -5,21 +5,9 @@ process.env.TELEGRAM_BOT_TOKEN ??= 'x';
 process.env.TELEGRAM_CHAT_ID ??= '1';
 process.env.MARKET_IDS ??= '1';
 
-// Helpers used by the URL paste flow are not exported, but the URL/slug
-// extraction logic is the one that breaks if regex changes; we copy
-// the regex literal here and assert behaviour. The keyboard / action
-// flow is covered by integration in the bot itself.
-
-const PREDICT_URL_RE = /https?:\/\/predict\.fun\/[^\s]+/i;
-
-function extractPredictFunUrl(text) {
-  const m = text?.match?.(PREDICT_URL_RE);
-  return m ? m[0] : null;
-}
-function slugFromPredictUrl(url) {
-  const m = url.match(/\/market\/([^/?#]+)/);
-  return m ? m[1].toLowerCase() : null;
-}
+// Real implementations — exported from commands.js so these tests can't
+// drift from what the bot actually runs.
+const { extractPredictFunUrl, slugFromPredictUrl } = await import('../src/commands.js');
 
 test('extractPredictFunUrl: pulls bare URL from message', () => {
   assert.equal(
@@ -91,4 +79,33 @@ test('extractBareMarketId: rejects too-short numbers (probably not ids)', () => 
 test('extractBareMarketId: rejects mixed text', () => {
   assert.equal(extractBareMarketId('id: 241373'), null);
   assert.equal(extractBareMarketId('241373 watch'), null);
+});
+
+test('extractPredictFunUrl: accepts www. prefix', () => {
+  assert.equal(
+    extractPredictFunUrl('https://www.predict.fun/event/foo-fdv'),
+    'https://www.predict.fun/event/foo-fdv',
+  );
+});
+
+test('slugFromPredictUrl: event pages (multi-outcome ladders)', () => {
+  assert.equal(
+    slugFromPredictUrl('https://predict.fun/event/aligned-fdv-one-day-after-launch'),
+    'aligned-fdv-one-day-after-launch',
+  );
+  assert.equal(
+    slugFromPredictUrl('https://predict.fun/zh-cn/events/foo-bar?tab=orders'),
+    'foo-bar',
+  );
+  assert.equal(
+    slugFromPredictUrl('https://predict.fun/markets/btc-100k'),
+    'btc-100k',
+  );
+});
+
+test('slugFromPredictUrl: decodes percent-encoded slugs', () => {
+  assert.equal(
+    slugFromPredictUrl('https://predict.fun/event/foo%2Dbar'),
+    'foo-bar',
+  );
 });

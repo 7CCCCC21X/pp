@@ -210,16 +210,23 @@ export function alertKeyboard(marketId) {
 //     offers a card-style picker (multi-outcome events) or an action
 //     menu (single market) for /watch / /snapshot / /add. ---
 
-const PREDICT_URL_RE = /https?:\/\/predict\.fun\/[^\s]+/i;
-function extractPredictFunUrl(text) {
+const PREDICT_URL_RE = /https?:\/\/(?:www\.)?predict\.fun\/[^\s]+/i;
+export function extractPredictFunUrl(text) {
   const m = text?.match?.(PREDICT_URL_RE);
   return m ? m[0] : null;
 }
 
-function slugFromPredictUrl(url) {
-  // /<lang>/market/<slug>[?...] or /market/<slug>
-  const m = url.match(/\/market\/([^/?#]+)/);
-  return m ? m[1].toLowerCase() : null;
+// Path segment that carries the slug. predict.fun serves single books at
+// /market/<slug> and multi-outcome event pages at /event/<slug> (the FDV /
+// launch-date ladders users paste are event pages); accept singular/plural
+// and any locale prefix, and decode %xx so CJK slugs survive.
+const PREDICT_SLUG_RE = /\/(?:markets?|events?)\/([^/?#]+)/i;
+export function slugFromPredictUrl(url) {
+  const m = url.match(PREDICT_SLUG_RE);
+  if (!m) return null;
+  let slug = m[1];
+  try { slug = decodeURIComponent(slug); } catch { /* keep raw */ }
+  return slug.toLowerCase();
 }
 
 // Card-style picker: one button per matching market, showing the
@@ -2795,7 +2802,7 @@ function uniq(arr) {
 function parseMarketInput(raw) {
   let s = String(raw ?? '').trim();
   if (!s) return null;
-  const urlMatch = s.match(/\/market\/([^/?#]+)/);
+  const urlMatch = s.match(PREDICT_SLUG_RE);
   if (urlMatch) s = urlMatch[1];
   if (/^\d+$/.test(s)) return { id: s, slug: null, kind: 'id' };
   // basic slug shape
@@ -4909,7 +4916,7 @@ async function handle(text, state, ctx, chatId, fromId) {
         const n = normalizeComboCap(sub);
         if (n == null) {
           // Not a number → treat as a market URL / id / slug and diagnose it.
-          if (/predict\.fun|\/market\/|^[a-z0-9][a-z0-9-]{2,}$/i.test(arg.trim())) {
+          if (/predict\.fun|\/(?:market|event)s?\/|^[a-z0-9][a-z0-9-]{2,}$/i.test(arg.trim())) {
             return await buildComboCheckMessage(arg.trim(), state);
           }
           return `用法：/combo 打开筛选向导（默认上限 ${f.cap}¢） · /combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt; 诊断某市场为何未被识别。向导里点 🚀 才实时重抓订单簿查询。`;
