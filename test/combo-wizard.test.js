@@ -99,6 +99,15 @@ test('parseComboFilter: stale sort accepted', () => {
   assert.equal(parseComboFilter(parts('set', { sort: 'stale' }), {}).sort, 'stale');
 });
 
+test('parseComboFilter + keyboard: 可对冲额度 sort', () => {
+  assert.equal(parseComboFilter(parts('set', { sort: 'hedge' }), {}).sort, 'hedge');
+  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'hedge', ext: 'off' };
+  const kb = comboWizardKeyboard(f);
+  assert.ok(buttonTexts(kb).includes('✅ 可对冲额度'));
+  const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
+  assert.deepEqual(parseComboFilter(run.split(':'), {}), { ...f, page: 0 });
+});
+
 test('comboWizardKeyboard: 停滞时长 sort button present and round-trips', () => {
   const f = { cap: '110', kind: 'all', minSh: 0, sort: 'stale', ext: 'off' };
   const kb = comboWizardKeyboard(f);

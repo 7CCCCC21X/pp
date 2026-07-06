@@ -167,14 +167,52 @@ export function buildComboLadders(entries) {
   return out;
 }
 
+// Depth-aware hedgeable volume: walk BOTH legs' books cheapest-first and
+// match shares while the marginal combined cost stays under `capProb`.
+// easyAsks = the easy rung's YES asks (best/lowest price first);
+// hardBids = the hard rung's YES bids (best/highest first) — buying NO at
+// level j costs (1 − bid_j). Returns { shares, usd } where usd is the total
+// spend across both legs for those shares. This is the "可对冲额度": how much
+// you can actually put on at ≤ the screen's cap, not just top-of-book.
+export function hedgeableWithinCap(easyAsks, hardBids, capProb) {
+  const a = Array.isArray(easyAsks) ? easyAsks : [];
+  const b = Array.isArray(hardBids) ? hardBids : [];
+  let i = 0;
+  let j = 0;
+  let remA = a[0]?.size ?? 0;
+  let remB = b[0]?.size ?? 0;
+  let shares = 0;
+  let usd = 0;
+  while (i < a.length && j < b.length) {
+    const yes = a[i]?.price;
+    const no = Number.isFinite(b[j]?.price) ? 1 - b[j].price : NaN;
+    if (!Number.isFinite(yes) || !Number.isFinite(no)) break;
+    // Strict < cap, matching the hit filter; epsilon absorbs float noise so
+    // an exactly-at-cap level doesn't flicker in and out.
+    if (yes + no >= capProb - 1e-9) break;
+    const q = Math.min(remA, remB);
+    if (!(q > 0)) break;
+    shares += q;
+    usd += q * (yes + no);
+    remA -= q;
+    remB -= q;
+    if (remA <= 1e-9) { i += 1; remA = a[i]?.size ?? 0; }
+    if (remB <= 1e-9) { j += 1; remB = b[j]?.size ?? 0; }
+  }
+  return { shares, usd };
+}
+
 // Compute every adjacent-pair combo in a ladder against fresh books.
-// `books`: Map(id → { bestBid: {price,size}, bestAsk: {price,size} }).
+// `books`: Map(id → { bestBid: {price,size}, bestAsk: {price,size},
+// bids?: [{price,size}...], asks?: [...] }). When multi-level arrays and
+// `opts.capCents` are present, each pair also carries hedgeShares/hedgeUsd —
+// the depth-aware volume executable under the cap (see hedgeableWithinCap).
 //
 // Legs: buy YES on the easier rung at its ask; buy NO on the harder rung,
 // which on a single-book CLOB executes as selling YES to the harder rung's
 // best bid — NO ask = 100 − YES bid. costCents < 100 is a pure arb;
 // 100..maxCents risks (cost−100)¢ for a (200−cost)¢ middle-band payoff.
-export function comboPairs(ladder, books) {
+export function comboPairs(ladder, books, opts = {}) {
   const out = [];
   for (let i = 0; i + 1 < ladder.rungs.length; i++) {
     const a = ladder.rungs[i];      // lower threshold value
@@ -192,6 +230,13 @@ export function comboPairs(ladder, books) {
     const noAsk = 1 - hardBid;
     const costCents = (yesAsk + noAsk) * 100;
     const size = Math.min(easyBook.bestAsk?.size ?? 0, hardBook.bestBid?.size ?? 0);
+    let hedgeShares = null;
+    let hedgeUsd = null;
+    if (Number.isFinite(opts.capCents)) {
+      const h = hedgeableWithinCap(easyBook.asks, hardBook.bids, opts.capCents / 100);
+      hedgeShares = h.shares;
+      hedgeUsd = h.usd;
+    }
     out.push({
       kind: ladder.kind,
       context: ladder.context,
@@ -202,6 +247,8 @@ export function comboPairs(ladder, books) {
       noAskCents: noAsk * 100,
       costCents,
       size,
+      hedgeShares,
+      hedgeUsd,
       bandWinCents: 200 - costCents,
       maxLossCents: costCents - 100,
     });
