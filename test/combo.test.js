@@ -5,6 +5,7 @@ import {
   parseDateThreshold,
   classifyDateDirection,
   buildComboLadders,
+  classifyComboEntry,
   comboPairs,
   hedgeableWithinCap,
 } from '../src/combo.js';
@@ -295,4 +296,17 @@ test('comboPairs: duplicate rung with missing book falls back to the live one', 
   assert.equal(pairs[0].hard.id, 'live50');
   // 22.2 + (100 − 16.0) = 106.2¢ — the combo the venue actually shows.
   approx(pairs[0].costCents, 106.2);
+});
+
+test('classifyComboEntry: exposes what the grouper sees for one market', () => {
+  const money = classifyComboEntry({ id: '1', title: '5000万美元', question: 'Pump.fun FDV?' });
+  assert.equal(money.kind, 'money');
+  assert.equal(money.value, 5e7);
+  assert.equal(money.raw, '5000万');
+  const date = classifyComboEntry({ id: '2', title: '2026年9月30日', question: 'Plasma 什么时候发币？' });
+  assert.equal(date.kind, 'date');
+  assert.equal(date.direction, 'down');
+  // No threshold anywhere → null (the /combo check '门槛识别 ❌' branch).
+  assert.equal(classifyComboEntry({ id: '3', title: 'Yes', question: 'Will it rain tomorrow?' }), null);
+  assert.equal(classifyComboEntry({ id: '4' }), null);
 });
