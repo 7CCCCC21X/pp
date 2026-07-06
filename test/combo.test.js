@@ -245,3 +245,54 @@ test('comboPairs: capCents attaches depth-aware hedge fields', () => {
   assert.equal(bare.hedgeShares, null);
   assert.equal(bare.hedgeUsd, null);
 });
+
+// Regression: a de-listed sibling market sharing a bucket (same question,
+// same threshold) must not shadow the live market. Modeled on the Aligned /
+// 01 screenshots: stale $20M book quoting 87¢ vs the live one at 22.2¢.
+test('comboPairs: duplicate-value rungs pick the best executable leg', () => {
+  const [ladder] = buildComboLadders([
+    { id: 'stale20', title: null, question: 'Aligned FDV above $20M one day after launch?' },
+    { id: 'live20', title: null, question: 'Aligned FDV above $20M one day after launch?' },
+    { id: 'stale50', title: null, question: 'Aligned FDV above $50M one day after launch?' },
+    { id: 'live50', title: null, question: 'Aligned FDV above $50M one day after launch?' },
+  ]);
+  assert.equal(ladder.rungs.length, 4); // two duplicated buckets
+  const books = new Map([
+    // Abandoned books with junk quotes still sitting on the venue.
+    ['stale20', { bestBid: { price: 0.805, size: 818 }, bestAsk: { price: 0.87, size: 818 } }],
+    ['stale50', { bestBid: { price: 0.805, size: 100 }, bestAsk: { price: 0.856, size: 100 } }],
+    // Live books (screenshot quotes).
+    ['live20', { bestBid: { price: 0.213, size: 400 }, bestAsk: { price: 0.222, size: 300 } }],
+    ['live50', { bestBid: { price: 0.16, size: 250 }, bestAsk: { price: 0.169, size: 200 } }],
+  ]);
+  const pairs = comboPairs(ladder, books);
+  assert.equal(pairs.length, 1); // one pair per adjacent VALUE, not per index
+  const p = pairs[0];
+  // Easy leg = cheapest $20M YES ask → the live market, not the stale twin.
+  assert.equal(p.easy.id, 'live20');
+  approx(p.yesAskCents, 22.2);
+  // Hard leg = highest $50M YES bid → 80.5¢ stale bid wins here (it IS the
+  // best executable NO price if that order is real) — but the live pair's
+  // cost is what qualifies either way.
+  assert.equal(p.hard.id, 'stale50');
+  approx(p.noAskCents, 19.5);
+});
+
+test('comboPairs: duplicate rung with missing book falls back to the live one', () => {
+  const [ladder] = buildComboLadders([
+    { id: 'stale20', title: null, question: '01 FDV above $20M one day after launch?' },
+    { id: 'live20', title: null, question: '01 FDV above $20M one day after launch?' },
+    { id: 'live50', title: null, question: '01 FDV above $50M one day after launch?' },
+  ]);
+  const books = new Map([
+    // stale20's book 404s → not in the map at all.
+    ['live20', { bestBid: { price: 0.213, size: 400 }, bestAsk: { price: 0.222, size: 300 } }],
+    ['live50', { bestBid: { price: 0.16, size: 250 }, bestAsk: { price: 0.169, size: 200 } }],
+  ]);
+  const pairs = comboPairs(ladder, books);
+  assert.equal(pairs.length, 1);
+  assert.equal(pairs[0].easy.id, 'live20');
+  assert.equal(pairs[0].hard.id, 'live50');
+  // 22.2 + (100 − 16.0) = 106.2¢ — the combo the venue actually shows.
+  approx(pairs[0].costCents, 106.2);
+});
