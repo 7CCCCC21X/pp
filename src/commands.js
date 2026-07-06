@@ -5763,7 +5763,13 @@ export function startCommandLoop({ getState, persist, ctx }) {
               const url = extractPredictFunUrl(text);
               if (url) {
                 await handleUrlPaste(url, state, fullCtx, { chatId }).catch((err) => {
+                  // Never fail silently — a paste with no reply reads as
+                  // "the bot ignored me".
                   warn('url paste error:', err.message);
+                  return sendTelegramMessage(
+                    `⚠️ 解析链接时出错: <code>${htmlEscape(err.message)}</code>\n可以再试一次，或用 /combo check 该链接查看逐步诊断。`,
+                    { chatId },
+                  ).catch(() => {});
                 });
                 continue;
               }
