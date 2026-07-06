@@ -574,7 +574,7 @@ export async function resolveUrlSlugToMarkets(slug, slugifier) {
       });
     }
   }
-  // Last resort: REST categorySlug map (capped at ~100 markets).
+  // REST categorySlug map (capped at ~100 markets).
   if (matches.length === 0) {
     try {
       const slugMap = await getSlugMapCached();
@@ -592,8 +592,46 @@ export async function resolveUrlSlugToMarkets(slug, slugifier) {
       }
     } catch { /* slug map fetch failed — best-effort */ }
   }
+  // Fuzzy stage — real predict.fun URLs are often event pages whose slug
+  // (a) carries a trailing numeric event id ("...-after-launch-864") and
+  // (b) omits each sub-market's threshold token ("$10M"), so it never
+  // exactly equals any slugified title/question. Strip the id suffix and
+  // match by ordered token subsequence: every URL token must appear, in
+  // order, inside the market's slugified question or title ("huddle fdv
+  // above one day after launch" ⊂ "huddle fdv above 10m one day after
+  // launch"). ≥3 tokens required so a stub slug can't match everything.
+  if (matches.length === 0) {
+    const stripped = slug.replace(/-\d{1,10}$/, '');
+    const needle = stripped.split('-').filter(Boolean);
+    if (needle.length >= 3) {
+      for (const m of all) {
+        if (seen.has(String(m.id))) continue;
+        const hayQ = slugifier(m.question ?? '').split('-');
+        const hayT = slugifier(m.title ?? '').split('-');
+        if (isTokenSubsequence(needle, hayQ) || isTokenSubsequence(needle, hayT)) {
+          seen.add(String(m.id));
+          matches.push({
+            id: String(m.id),
+            title: m.title ?? null,
+            question: m.question ?? null,
+            rate: extractHourlyRate(m),
+            endMs: marketEndMs(m),
+          });
+        }
+      }
+    }
+  }
   matches.sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0));
   return matches;
+}
+
+// Every token of `needle` appears in `hay` in the same order (gaps allowed).
+export function isTokenSubsequence(needle, hay) {
+  let i = 0;
+  for (const t of hay) {
+    if (i < needle.length && t === needle[i]) i += 1;
+  }
+  return i === needle.length;
 }
 
 const CLOSED_STATUSES = new Set([
