@@ -2736,7 +2736,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 排序(组合价/股数/区间盈利额/停滞时长)，上限/股数/极端价都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -3916,7 +3916,7 @@ async function fetchFreshBooks(ids, state) {
 
 // One rendered line-pair per combo hit. `state` supplies slot titles/slugs
 // for the market links.
-function formatComboPair(pair, state, { showStall = false } = {}) {
+function formatComboPair(pair, state, { showStall = false, showHedge = false } = {}) {
   const easySlot = state.markets[pair.easy.id];
   const hardSlot = state.markets[pair.hard.id];
   const linkOf = (rung, slot) => {
@@ -3934,9 +3934,11 @@ function formatComboPair(pair, state, { showStall = false } = {}) {
   const size = pair.size > 0 ? ` · 顶档约可成交 ${Math.floor(pair.size)} 股` : '';
   const stall = showStall && Number.isFinite(pair.stallMs)
     ? ` · 停滞 ${fmtElapsed(pair.stallMs)}` : '';
+  const hedge = showHedge && Number.isFinite(pair.hedgeUsd)
+    ? ` · 上限内可对冲 ≈${Math.floor(pair.hedgeShares)} 股/$${Math.round(pair.hedgeUsd)}` : '';
   const outcome = pure
-    ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}${stall}`
-    : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}${stall}`;
+    ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}${hedge}${stall}`
+    : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}${hedge}${stall}`;
   return `${head}\n   ${legs}\n   ${outcome}`;
 }
 
@@ -3958,6 +3960,7 @@ function formatComboPair(pair, state, { showStall = false } = {}) {
 //   kind  = all | money | date (ladder type filter)
 //   minSh = minimum top-of-book executable shares across both legs (0 = 不限)
 //   sort  = cost (组合价 asc) | size (可成交股数 desc) | usd (区间盈利额 desc)
+//           | hedge (可对冲额度 desc — 两腿多档深度里组合价仍低于上限的可成交金额)
 //           | stale (停滞时长 desc — 两腿盘口都未动的时长，取较短一腿)
 //   ext   = 极端价 filter, same token scheme as /tight & /stale ('off' | '85'
 //           = 排除 either-leg ≥85¢/≤15¢ | 'i85' = 仅 pairs with an extreme leg).
@@ -3980,6 +3983,7 @@ const COMBO_SORTS = [
   ['cost', '组合价(低→高)'],
   ['size', '可成交股数'],
   ['usd', '区间盈利额'],
+  ['hedge', '可对冲额度'],
   ['stale', '停滞时长'],
 ];
 const COMBO_CAP_MIN = 50;
@@ -4046,7 +4050,7 @@ function comboWizardText(f) {
     `📊 排序: <b>${comboSortLabel(f.sort)}</b>`,
     '',
     '<i>组合 = 金额阶梯买「低档 是 + 高档 否」，日期阶梯买「早档 否 + 晚档 是」。两腿合计 &lt;100¢ 为纯套利；100~上限 之间是低风险中间区间打法（命中赚 200−成本，落空亏 成本−100）。</i>',
-    '<i>可成交股数 = 两腿顶档挂单量的较小值，衡量这个价位实际吃得到多少。</i>',
+    '<i>可成交股数 = 两腿顶档挂单量的较小值；可对冲额度 = 沿两腿多档深度撮合、组合价仍低于上限的总可成交量（股数×两腿合计价，$）——按它排序能找到吃得下大仓位的组合。</i>',
     '<i>极端价 = 按刚重抓的盘口判断：排除 ≥85¢ 会剔除任一腿基本已决（一边 ≥85¢ 或 ≤15¢）的组合；仅 ≥85¢ 则只看这类组合。</i>',
     '<i>💵/🔢/📈 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99）。</i>',
     '<i>点 🚀 会实时重抓所有阶梯市场的订单簿再筛选，可能耗时几十秒。</i>',
@@ -4174,7 +4178,8 @@ async function runComboScan(f, state) {
   }
   const ids = [...new Set(ladders.flatMap((l) => l.rungs.map((r) => String(r.id))))];
   const { books, failed } = await fetchFreshBooks(ids, state);
-  let pairs = ladders.flatMap((l) => comboPairs(l, books));
+  // capCents lets comboPairs walk multi-level depth for the 可对冲额度 metric.
+  let pairs = ladders.flatMap((l) => comboPairs(l, books, { capCents: Number(f.cap) }));
   if (f.minSh > 0) pairs = pairs.filter((p) => p.size >= f.minSh);
   if (extFilterActive(f.ext)) pairs = pairs.filter((p) => comboPairPassesExt(p, books, f.ext));
   // Pair stall = the shorter of the two legs' stall durations — how long
@@ -4189,6 +4194,7 @@ async function runComboScan(f, state) {
   const sortVal = (p) => {
     if (f.sort === 'size') return p.size;
     if (f.sort === 'usd') return p.size * p.bandWinCents;
+    if (f.sort === 'hedge') return p.hedgeUsd ?? 0;
     if (f.sort === 'stale') return p.stallMs;
     return -p.costCents;
   };
@@ -4258,7 +4264,8 @@ function renderComboResult(f, state, scan, page = 0) {
     '',
   ];
   const showStall = f.sort === 'stale';
-  for (const p of items) lines.push(formatComboPair(p, state, { showStall }), '');
+  const showHedge = f.sort === 'hedge';
+  for (const p of items) lines.push(formatComboPair(p, state, { showStall, showHedge }), '');
   if (totalPages > 1) lines.push(`<i>第 ${safePage + 1} / ${totalPages} 页 · 翻页用刚重抓的缓存，重新报价请再点 🚀</i>`);
   const navRows = [];
   if (totalPages > 1) {

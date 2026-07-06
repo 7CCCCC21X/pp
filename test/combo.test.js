@@ -6,6 +6,7 @@ import {
   classifyDateDirection,
   buildComboLadders,
   comboPairs,
+  hedgeableWithinCap,
 } from '../src/combo.js';
 
 const approx = (a, b, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} !≈ ${b}`);
@@ -190,4 +191,57 @@ test('comboPairs: three rungs yield two adjacent pairs, pure arb detectable', ()
   approx(pairs[0].costCents, 97);
   // Pair 2-3: YES(2)@66 + NO(3)@80 = 146¢.
   approx(pairs[1].costCents, 146);
+});
+
+test('hedgeableWithinCap: walks depth cheapest-first until marginal cost hits the cap', () => {
+  const easyAsks = [{ price: 0.40, size: 100 }, { price: 0.50, size: 100 }];
+  const hardBids = [{ price: 0.65, size: 50 }, { price: 0.55, size: 200 }]; // NO asks 35¢/45¢
+  // cap 90¢: 40+35=75 → 50 shares, then 40+45=85 → 50 shares, then 50+45=95 stops.
+  const h = hedgeableWithinCap(easyAsks, hardBids, 0.90);
+  assert.equal(h.shares, 100);
+  approx(h.usd, 50 * 0.75 + 50 * 0.85);
+  // Tighter cap 80¢: only the first 50-share match (75¢) qualifies.
+  const h2 = hedgeableWithinCap(easyAsks, hardBids, 0.80);
+  assert.equal(h2.shares, 50);
+  approx(h2.usd, 50 * 0.75);
+  // Cap below best combined price → nothing.
+  assert.equal(hedgeableWithinCap(easyAsks, hardBids, 0.70).shares, 0);
+});
+
+test('hedgeableWithinCap: missing/empty books → zero', () => {
+  assert.equal(hedgeableWithinCap([], [{ price: 0.5, size: 10 }], 1.1).shares, 0);
+  assert.equal(hedgeableWithinCap(null, null, 1.1).shares, 0);
+});
+
+test('comboPairs: capCents attaches depth-aware hedge fields', () => {
+  const [ladder] = buildComboLadders([
+    { id: '1', title: '$200M', question: 'Betmoar FDV?' },
+    { id: '2', title: '$400M', question: 'Betmoar FDV?' },
+  ]);
+  const books = new Map([
+    ['1', {
+      bestBid: { price: 0.073, size: 3324.6 },
+      bestAsk: { price: 0.074, size: 3471.8 },
+      asks: [{ price: 0.074, size: 3471.8 }, { price: 0.075, size: 1310.8 }],
+      bids: [{ price: 0.073, size: 3324.6 }],
+    }],
+    ['2', {
+      bestBid: { price: 0.075, size: 1460 },   // NO ask 92.5¢
+      bestAsk: { price: 0.076, size: 500 },
+      asks: [{ price: 0.076, size: 500 }],
+      bids: [{ price: 0.075, size: 1460 }, { price: 0.074, size: 1812 }],
+    }],
+  ]);
+  const pairs = comboPairs(ladder, books, { capCents: 110 });
+  assert.equal(pairs.length, 1);
+  const p = pairs[0];
+  approx(p.costCents, 99.9); // 7.4 + 92.5
+  // Depth: 1460@(7.4+92.5) + 1812@(7.4+92.6) — then easy level 1 keeps matching
+  // hard level 2 which doesn't exist → stops. 3471.8 covers 1460+1812=3272.
+  assert.equal(p.hedgeShares, 3272);
+  approx(p.hedgeUsd, 1460 * 0.999 + 1812 * 1.0);
+  // Without capCents the fields stay null.
+  const bare = comboPairs(ladder, books)[0];
+  assert.equal(bare.hedgeShares, null);
+  assert.equal(bare.hedgeUsd, null);
 });
