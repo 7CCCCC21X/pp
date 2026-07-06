@@ -119,27 +119,35 @@ const PARSERS = [
 // stay separated per event by their shared question, while per-rung bucket
 // titles ("$50M" vs "$100M") don't split a ladder whose question already
 // carries the threshold.
+// Classification of a single { title, question } entry: which ladder kind it
+// belongs to, its grouping context, threshold value and the raw token — or
+// null when neither a monetary nor a date threshold parses out of either
+// text. Exported for /combo check so a diagnosis can show exactly what the
+// grouper sees for one market.
+export function classifyComboEntry(e) {
+  if (!e) return null;
+  const texts = [];
+  if (e.question) texts.push(String(e.question));
+  if (e.title && String(e.title) !== String(e.question ?? '')) texts.push(String(e.title));
+  if (!texts.length) return null;
+  for (const { kind, parse, directionOf } of PARSERS) {
+    for (const t of texts) {
+      const parsed = parse(t);
+      if (!parsed) continue;
+      let context = ladderContext(t, parsed);
+      const other = texts.find((x) => x !== t);
+      if (other && !parse(other)) context += ` § ${other}`;
+      return { kind, context, direction: directionOf(t), value: parsed.value, raw: parsed.raw };
+    }
+  }
+  return null;
+}
+
 export function buildComboLadders(entries) {
   const groups = new Map();
   for (const e of entries) {
     if (!e || e.id == null) continue;
-    const texts = [];
-    if (e.question) texts.push(String(e.question));
-    if (e.title && String(e.title) !== String(e.question ?? '')) texts.push(String(e.title));
-    if (!texts.length) continue;
-    let placed = null;
-    for (const { kind, parse, directionOf } of PARSERS) {
-      for (const t of texts) {
-        const parsed = parse(t);
-        if (!parsed) continue;
-        let context = ladderContext(t, parsed);
-        const other = texts.find((x) => x !== t);
-        if (other && !parse(other)) context += ` § ${other}`;
-        placed = { kind, context, direction: directionOf(t), value: parsed.value, raw: parsed.raw };
-        break;
-      }
-      if (placed) break;
-    }
+    const placed = classifyComboEntry(e);
     if (!placed) continue;
     const key = `${placed.kind}|${ladderKey(placed.context)}`;
     if (!groups.has(key)) {

@@ -51,7 +51,7 @@ const PRIVATE_MENU = [
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
   { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
   { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
-  { command: 'combo', description: '相邻档组合价筛选（FDV: 低档是+高档否 / 发币日期: 早档否+晚档是 <110¢；先开筛选向导，🚀 实时重抓订单簿查询，结果分页）' },
+  { command: 'combo', description: '相邻档组合价筛选（先开筛选向导，🚀 实时重抓订单簿查询，结果分页；/combo check <URL|id> 诊断市场为何未被识别）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -2736,7 +2736,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt;（或直接 /combo 贴市场链接）诊断某市场：是否在扫描范围、门槛是否解析成功、归入哪个阶梯、邻档是谁、实时组合价是否过线，每步给出 ✅/❌ 和原因',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -4159,31 +4159,45 @@ function comboPairPassesExt(pair, books, ext) {
 // Full combo scan: gather ladder entries from live slots, refetch every rung's
 // orderbook fresh, compute adjacent-pair combos, apply the filter. Shared by
 // the /combo command and the wizard's 🚀.
-async function runComboScan(f, state) {
-  const { buildComboLadders, comboPairs } = await import('./combo.js');
-  const entries = [];
-  // Scan ONLY the live monitored set. state.markets keeps slots for every
-  // market ever seen — de-listed / resolved / expired leftovers included —
-  // and a dead sibling sharing an event's bucket would join the ladder with
-  // its abandoned book, producing combos priced off quotes the venue no
-  // longer shows (and shadowing the real live pair).
-  const now = Date.now();
+// Why a market is NOT part of the combo scan's entry universe — or null when
+// it IS included. Single source of truth shared by the scan gather and the
+// /combo check diagnosis so they can never disagree.
+function comboExclusionReason(state, id) {
+  const key = String(id);
   const activeSet = new Set(activeMarketIds(state));
-  for (const [id, slot] of Object.entries(state.markets)) {
-    if (!slot) continue;
-    if (!activeSet.has(String(id))) continue;
-    if (state.pausedIds?.includes(id) || isSnoozed(state, id)) continue;
-    // Stub slots (resolved / fetch-error markets) have no working book —
-    // don't waste a refetch on them.
-    if (slot.lastError) continue;
-    // Skipped by the monitor for a non-filter reason = resolved / no reward
-    // / about to expire. Alert-filter blocks (过滤器:) stay in — those
-    // markets still trade, the user just muted their alerts.
-    if (slot.lastSkipReason && !slot.lastSkipReason.startsWith('过滤器:')) continue;
-    if (Number.isFinite(slot.endMs) && slot.endMs <= now) continue;
-    if (!slot.title && !slot.question) continue;
+  if (!activeSet.has(key)) return '不在当前监控集（未被自动发现或已 /remove）— 用 /add ' + key + ' 加入后即可参与';
+  const slot = state.markets[key];
+  if (!slot) return '监控中但还没抓到首帧数据（等下一轮轮询，或 /probe ' + key + ' 触发）';
+  if (state.pausedIds?.includes(key)) return '已被 /pause 暂停（/resume ' + key + ' 恢复）';
+  if (isSnoozed(state, key)) return '处于 /snooze 静音期';
+  if (slot.lastError) return `上次抓取出错: ${slot.lastError}`;
+  // Skipped by the monitor for a non-filter reason = resolved / no reward /
+  // about to expire. Alert-filter blocks (过滤器:) stay in — those markets
+  // still trade, the user just muted their alerts.
+  if (slot.lastSkipReason && !slot.lastSkipReason.startsWith('过滤器:')) return `被监控跳过: ${slot.lastSkipReason}`;
+  if (Number.isFinite(slot.endMs) && slot.endMs <= Date.now()) return '截止时间已过';
+  if (!slot.title && !slot.question) return '槽位缺少标题/问题文本';
+  return null;
+}
+
+// Scan ONLY the live monitored set. state.markets keeps slots for every
+// market ever seen — de-listed / resolved / expired leftovers included —
+// and a dead sibling sharing an event's bucket would join the ladder with
+// its abandoned book, producing combos priced off quotes the venue no
+// longer shows (and shadowing the real live pair).
+function gatherComboEntries(state) {
+  const entries = [];
+  for (const id of Object.keys(state.markets)) {
+    if (comboExclusionReason(state, id)) continue;
+    const slot = state.markets[id];
     entries.push({ id, title: slot.title, question: slot.question });
   }
+  return entries;
+}
+
+async function runComboScan(f, state) {
+  const { buildComboLadders, comboPairs } = await import('./combo.js');
+  const entries = gatherComboEntries(state);
   let ladders = buildComboLadders(entries);
   if (f.kind !== 'all') ladders = ladders.filter((l) => l.kind === f.kind);
   if (!ladders.length) {
@@ -4245,6 +4259,132 @@ function getComboScan(chatId, messageId) {
 // Pairs per result page — each hit renders as a 3-line block, so 8 per page
 // stays comfortably inside one Telegram message.
 const COMBO_PAGE_SIZE = 8;
+
+// /combo check <url|id|slug> — step-by-step diagnosis of why a market does
+// or doesn't show up in the combo screen: monitoring status, threshold
+// parsing, ladder grouping, and (when a ladder exists) live pair costs.
+const COMBO_CHECK_MAX_TARGETS = 10;
+
+async function buildComboCheckMessage(rawArg, state) {
+  const { buildComboLadders, comboPairs, classifyComboEntry } = await import('./combo.js');
+  const input = rawArg.trim();
+
+  // Resolve the input to one or more markets. Event URLs fan out to every
+  // sub-market sharing the slug; a bare id/slug resolves to one.
+  let targets = [];
+  const url = extractPredictFunUrl(input);
+  if (url) {
+    const slug = slugFromPredictUrl(url);
+    if (!slug) return `未能从 URL 提取 slug:\n<code>${htmlEscape(url)}</code>`;
+    const { resolveUrlSlugToMarkets } = await import('./predict.js');
+    let matches = [];
+    try {
+      matches = await resolveUrlSlugToMarkets(slug, slugifyMarketTitle);
+    } catch (err) {
+      return `解析 URL 失败: ${htmlEscape(err.message)}`;
+    }
+    if (!matches.length) {
+      return [
+        `🔎 <b>组合识别诊断</b>`,
+        '',
+        `❌ 在 PP 市场缓存里没找到 slug <code>${htmlEscape(slug)}</code> 对应的市场。`,
+        '',
+        '可能：市场太新（缓存未刷新，试 /refresh 后重试）、不奖励 PP、或已 resolve。',
+        '也可以直接用数字 id：/combo check &lt;id&gt;（浏览器 DevTools → Network 里找 /v1/markets/&lt;数字&gt;）。',
+      ].join('\n');
+    }
+    targets = matches.map((m) => ({ id: String(m.id), title: m.title, question: m.question }));
+  } else {
+    const resolved = await resolveMarketInput(input);
+    if (resolved.error) return htmlEscape(resolved.error);
+    targets = [{ id: String(resolved.id) }];
+  }
+  const extraTargets = targets.length - COMBO_CHECK_MAX_TARGETS;
+  targets = targets.slice(0, COMBO_CHECK_MAX_TARGETS);
+
+  // Fill title/question from the freshest source available: slot → API.
+  for (const t of targets) {
+    const slot = state.markets[t.id];
+    t.title = t.title ?? slot?.title ?? null;
+    t.question = t.question ?? slot?.question ?? null;
+    if (!t.title && !t.question) {
+      try {
+        const s = await getMarketRewardSummary(t.id);
+        t.title = s?.market?.title ?? s?.title ?? null;
+        t.question = s?.market?.question ?? null;
+      } catch { /* diagnosis continues with what we have */ }
+    }
+  }
+
+  // Ladder universe = the live scan's entries plus the targets themselves,
+  // so grouping is visible even for markets the scan currently excludes.
+  const entryById = new Map(gatherComboEntries(state).map((e) => [e.id, e]));
+  for (const t of targets) if (!entryById.has(t.id)) entryById.set(t.id, t);
+  const ladders = buildComboLadders([...entryById.values()]);
+  const ladderOf = new Map();
+  for (const l of ladders) for (const r of l.rungs) ladderOf.set(r.id, l);
+
+  const d = comboDefaultFilter(state);
+  const lines = [`🔎 <b>组合识别诊断</b> · ${targets.length} 个市场 · 判定上限 &lt;${d.cap}¢`, ''];
+  const checkLadderKeys = new Set();
+  for (const t of targets) {
+    const label = htmlEscape(shortTitle(t.title || t.question || `Market ${t.id}`, 48));
+    lines.push(`<b>#${htmlEscape(t.id)}</b> <a href="${marketUrl(t.id, t.title, t.question, state.markets[t.id]?.slug)}">${label}</a>`);
+    const reason = comboExclusionReason(state, t.id);
+    lines.push(reason ? `❌ 扫描范围: ${htmlEscape(reason)}` : '✅ 扫描范围: 在监控集内，参与扫描');
+    const cls = classifyComboEntry(t);
+    if (!cls) {
+      lines.push('❌ 门槛识别: 标题/问题里解析不出金额或日期门槛');
+      if (t.question) lines.push(`   问题: <i>${htmlEscape(shortTitle(t.question, 70))}</i>`);
+      if (t.title) lines.push(`   标题: <i>${htmlEscape(shortTitle(t.title, 70))}</i>`);
+      if (!t.title && !t.question) lines.push('   （拿不到市场文本 — id 是否正确？）');
+      lines.push('');
+      continue;
+    }
+    const kindTag = cls.kind === 'date' ? '📅 日期' : '💰 金额';
+    lines.push(`✅ 门槛识别: ${kindTag} <code>${htmlEscape(cls.raw)}</code> · 分组: <i>${htmlEscape(shortTitle(cls.context.replace(/\s+/g, ' ').trim(), 60))}</i>`);
+    const ladder = ladderOf.get(t.id);
+    if (!ladder || ladder.rungs.length < 2) {
+      lines.push('❌ 阶梯: 找不到同事件的其他门槛市场（需 ≥2 档才能配对）。');
+      lines.push('   邻档可能：未被监控（PP=0 不会自动发现，可手动 /add）、或其文本被解析进了别的分组。');
+      lines.push('');
+      continue;
+    }
+    const rungBits = ladder.rungs.map((r) => {
+      const ex = comboExclusionReason(state, r.id);
+      return `${htmlEscape(r.raw)}${ex ? '⛔' : ''}`;
+    });
+    lines.push(`✅ 阶梯: ${ladder.rungs.length} 档 — ${rungBits.join(' · ')}${rungBits.some((b) => b.includes('⛔')) ? '（⛔ = 被扫描排除，详见上方原因）' : ''}`);
+    checkLadderKeys.add(ladder.key);
+    lines.push('');
+  }
+  if (extraTargets > 0) lines.push(`<i>… 事件还有 ${extraTargets} 个子市场未逐个展开</i>`, '');
+
+  // Live pair costs for every ladder a target belongs to.
+  const checkLadders = ladders.filter((l) => checkLadderKeys.has(l.key));
+  if (checkLadders.length) {
+    const ids = [...new Set(checkLadders.flatMap((l) => l.rungs.map((r) => String(r.id))))];
+    const { books, failed } = await fetchFreshBooks(ids, state);
+    lines.push(`<b>实时组合价</b>（已重抓 ${books.size} 个盘口${failed ? `，失败 ${failed}` : ''}）`);
+    const cap = Number(d.cap);
+    let any = false;
+    for (const l of checkLadders) {
+      for (const p of comboPairs(l, books, { capCents: cap })) {
+        any = true;
+        const ok = p.costCents < cap;
+        lines.push(
+          `${ok ? '✅' : '❌'} 买 ${htmlEscape(p.easy.raw)} 是 @${p.yesAskCents.toFixed(1)}¢ ＋ 买 ${htmlEscape(p.hard.raw)} 否 @${p.noAskCents.toFixed(1)}¢ ＝ <b>${p.costCents.toFixed(1)}¢</b>`
+          + (ok ? '（低于上限，会列出）' : `（≥${cap}¢，不列出）`),
+        );
+      }
+    }
+    if (!any) lines.push('（两腿盘口不全，算不出任何相邻组合 — 检查上面的 ⛔ 档位或盘口抓取失败数）');
+    lines.push('', `<i>判定按默认设置：上限 &lt;${d.cap}¢ · 极端价关 · 股数不限。向导里的设置不同时结果会有差异。</i>`);
+  }
+  const reply = { text: lines.join('\n').trim() };
+  if (targets.length === 1) reply.replyMarkup = actionKeyboard(targets[0].id);
+  return reply;
+}
 
 function renderComboResult(f, state, scan, page = 0) {
   const wizardRow = [{ text: '🎚 调整设置', callback_data: comboCb('wizard', f) }];
@@ -4760,10 +4900,19 @@ async function handle(text, state, ctx, chatId, fromId) {
         await ctx.persist();
         return `✅ 组合价上限已保存为 ${n}¢（两腿合计低于此值才列出）。/combo 立即扫描。`;
       }
+      if (sub.startsWith('check')) {
+        const target = arg.trim().replace(/^check/i, '').trim();
+        if (!target) return '用法：/combo check &lt;市场URL | id | slug&gt; — 诊断该市场为什么（没）出现在组合价筛选里。';
+        return await buildComboCheckMessage(target, state);
+      }
       if (sub) {
         const n = normalizeComboCap(sub);
         if (n == null) {
-          return `用法：/combo 打开筛选向导（默认上限 ${f.cap}¢） · /combo 105 预设上限 · /combo set 108 保存默认。向导里点 🚀 才实时重抓订单簿查询。`;
+          // Not a number → treat as a market URL / id / slug and diagnose it.
+          if (/predict\.fun|\/market\/|^[a-z0-9][a-z0-9-]{2,}$/i.test(arg.trim())) {
+            return await buildComboCheckMessage(arg.trim(), state);
+          }
+          return `用法：/combo 打开筛选向导（默认上限 ${f.cap}¢） · /combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt; 诊断某市场为何未被识别。向导里点 🚀 才实时重抓订单簿查询。`;
         }
         f.cap = n;
       }
