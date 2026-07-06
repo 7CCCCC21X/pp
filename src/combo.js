@@ -213,20 +213,48 @@ export function hedgeableWithinCap(easyAsks, hardBids, capProb) {
 // best bid — NO ask = 100 − YES bid. costCents < 100 is a pure arb;
 // 100..maxCents risks (cost−100)¢ for a (200−cost)¢ middle-band payoff.
 export function comboPairs(ladder, books, opts = {}) {
+  // Collapse rungs to distinct threshold VALUES first. Duplicate values
+  // happen when a de-listed / stale sibling market shares a bucket with the
+  // live one — naive index-adjacent pairing would then match a live rung
+  // against the stale twin's abandoned book (and never evaluate the real
+  // live-live pair). Pair adjacent value-groups instead, and within a
+  // duplicated value pick the leg with the best executable price: lowest
+  // YES ask for the easy leg, highest YES bid (= cheapest NO) for the hard.
+  const groups = [];
+  for (const r of ladder.rungs) {
+    const last = groups[groups.length - 1];
+    if (last && last.value === r.value) last.rungs.push(r);
+    else groups.push({ value: r.value, rungs: [r] });
+  }
   const out = [];
-  for (let i = 0; i + 1 < ladder.rungs.length; i++) {
-    const a = ladder.rungs[i];      // lower threshold value
-    const b = ladder.rungs[i + 1];  // higher threshold value
-    if (a.value === b.value) continue;
-    // 'up' (money "above X"): higher value harder → easy = a.
-    // 'down' (date "by X"): higher value (later date) easier → easy = b.
-    const easy = ladder.direction === 'down' ? b : a;
-    const hard = easy === a ? b : a;
-    const easyBook = books.get(String(easy.id));
-    const hardBook = books.get(String(hard.id));
-    const yesAsk = easyBook?.bestAsk?.price;
-    const hardBid = hardBook?.bestBid?.price;
-    if (!Number.isFinite(yesAsk) || !Number.isFinite(hardBid)) continue;
+  for (let i = 0; i + 1 < groups.length; i++) {
+    const ga = groups[i];      // lower threshold value
+    const gb = groups[i + 1];  // higher threshold value
+    // 'up' (money "above X"): higher value harder → easy = ga.
+    // 'down' (date "by X"): higher value (later date) easier → easy = gb.
+    const easyGroup = ladder.direction === 'down' ? gb : ga;
+    const hardGroup = easyGroup === ga ? gb : ga;
+    let easyPick = null;
+    for (const r of easyGroup.rungs) {
+      const bk = books.get(String(r.id));
+      const ask = bk?.bestAsk?.price;
+      if (!Number.isFinite(ask)) continue;
+      if (!easyPick || ask < easyPick.ask) easyPick = { rung: r, book: bk, ask };
+    }
+    let hardPick = null;
+    for (const r of hardGroup.rungs) {
+      const bk = books.get(String(r.id));
+      const bid = bk?.bestBid?.price;
+      if (!Number.isFinite(bid)) continue;
+      if (!hardPick || bid > hardPick.bid) hardPick = { rung: r, book: bk, bid };
+    }
+    if (!easyPick || !hardPick) continue;
+    const easy = easyPick.rung;
+    const hard = hardPick.rung;
+    const easyBook = easyPick.book;
+    const hardBook = hardPick.book;
+    const yesAsk = easyPick.ask;
+    const hardBid = hardPick.bid;
     const noAsk = 1 - hardBid;
     const costCents = (yesAsk + noAsk) * 100;
     const size = Math.min(easyBook.bestAsk?.size ?? 0, hardBook.bestBid?.size ?? 0);

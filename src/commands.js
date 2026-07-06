@@ -4162,12 +4162,25 @@ function comboPairPassesExt(pair, books, ext) {
 async function runComboScan(f, state) {
   const { buildComboLadders, comboPairs } = await import('./combo.js');
   const entries = [];
+  // Scan ONLY the live monitored set. state.markets keeps slots for every
+  // market ever seen — de-listed / resolved / expired leftovers included —
+  // and a dead sibling sharing an event's bucket would join the ladder with
+  // its abandoned book, producing combos priced off quotes the venue no
+  // longer shows (and shadowing the real live pair).
+  const now = Date.now();
+  const activeSet = new Set(activeMarketIds(state));
   for (const [id, slot] of Object.entries(state.markets)) {
     if (!slot) continue;
+    if (!activeSet.has(String(id))) continue;
     if (state.pausedIds?.includes(id) || isSnoozed(state, id)) continue;
     // Stub slots (resolved / fetch-error markets) have no working book —
     // don't waste a refetch on them.
     if (slot.lastError) continue;
+    // Skipped by the monitor for a non-filter reason = resolved / no reward
+    // / about to expire. Alert-filter blocks (过滤器:) stay in — those
+    // markets still trade, the user just muted their alerts.
+    if (slot.lastSkipReason && !slot.lastSkipReason.startsWith('过滤器:')) continue;
+    if (Number.isFinite(slot.endMs) && slot.endMs <= now) continue;
     if (!slot.title && !slot.question) continue;
     entries.push({ id, title: slot.title, question: slot.question });
   }
