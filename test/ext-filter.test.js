@@ -9,6 +9,7 @@ const {
   passesExtFilter,
   extTopOfBook,
   rememberCustomExtPreset,
+  customExtTokenFromInput,
   listWizardKeyboard,
   extPickerKeyboard,
   threshPickerKeyboard,
@@ -71,6 +72,42 @@ test('passesExtFilter: off mode keeps everything', () => {
   assert.equal(passesExtFilter(slot, 'off'), true);
 });
 
+test('passesExtFilter: band tokens only match a side inside the zone', () => {
+  const at = (ask) => ({ baseline: { bidPrice: 0.50, askPrice: ask } });
+  // ask 90¢ sits inside 85-96¢ → 仅 keeps it, 排除 drops it.
+  assert.equal(passesExtFilter(at(0.90), 'i85-96'), true);
+  assert.equal(passesExtFilter(at(0.90), '85-96'), false);
+  // ask 98¢ is ABOVE the band → not "in the zone": 仅 drops, 排除 keeps.
+  assert.equal(passesExtFilter(at(0.98), 'i85-96'), false);
+  assert.equal(passesExtFilter(at(0.98), '85-96'), true);
+  // ask 80¢ is below the band.
+  assert.equal(passesExtFilter(at(0.80), 'i85-96'), false);
+});
+
+test('passesExtFilter: band mirrors onto the bid side (85-96 → bid 4-15¢)', () => {
+  const bidAt = (bid) => ({ baseline: { bidPrice: bid, askPrice: 0.50 } });
+  assert.equal(passesExtFilter(bidAt(0.05), 'i85-96'), true);  // 5¢ ∈ [4,15]
+  assert.equal(passesExtFilter(bidAt(0.02), 'i85-96'), false); // below mirrored band
+  assert.equal(passesExtFilter(bidAt(0.20), 'i85-96'), false); // above mirrored band
+});
+
+test('passesExtFilter: reversed band token still works (96-85 ≡ 85-96)', () => {
+  const slot = { baseline: { bidPrice: 0.50, askPrice: 0.90 } };
+  assert.equal(passesExtFilter(slot, 'i96-85'), true);
+});
+
+test('customExtTokenFromInput: single value, band, junk', () => {
+  assert.equal(customExtTokenFromInput('88', 'ex'), '88');
+  assert.equal(customExtTokenFromInput('88', 'in'), 'i88');
+  assert.equal(customExtTokenFromInput('85-96', 'in'), 'i85-96');
+  assert.equal(customExtTokenFromInput(' 85 - 96 ', 'ex'), '85-96');
+  assert.equal(customExtTokenFromInput('96-85', 'ex'), '85-96'); // reversed → sorted
+  assert.equal(customExtTokenFromInput('85~96', 'ex'), '85-96'); // ~ separator
+  assert.equal(customExtTokenFromInput('0-96', 'ex'), null);     // bound out of range
+  assert.equal(customExtTokenFromInput('abc', 'ex'), null);
+  assert.equal(customExtTokenFromInput('100', 'ex'), null);
+});
+
 test('rememberCustomExtPreset: stores genuinely-custom values, skips presets', () => {
   const state = { customExtPresets: [] };
   rememberCustomExtPreset(state, '80');   // custom exclude
@@ -78,6 +115,13 @@ test('rememberCustomExtPreset: stores genuinely-custom values, skips presets', (
   rememberCustomExtPreset(state, '85');   // preset → ignored
   rememberCustomExtPreset(state, 'off');  // off → ignored
   assert.deepEqual(state.customExtPresets, ['i70', '80']); // most-recent first
+});
+
+test('rememberCustomExtPreset: bands count as custom even on a preset bound', () => {
+  const state = { customExtPresets: [] };
+  rememberCustomExtPreset(state, '94-96');  // 94 is a preset, but the band is custom
+  rememberCustomExtPreset(state, 'i85-96');
+  assert.deepEqual(state.customExtPresets, ['i85-96', '94-96']);
 });
 
 test('rememberCustomExtPreset: dedupes (move-to-front) and caps the list', () => {
@@ -100,6 +144,27 @@ test('listWizardKeyboard: renders retained custom presets + clear button', () =>
   assert.ok(texts.includes('排除≥80¢'), 'custom exclude button shown');
   assert.ok(texts.includes('仅≥70¢'), 'custom include button shown');
   assert.ok(texts.includes('🗑 清空'), 'clear button shown');
+});
+
+test('listWizardKeyboard: band token renders as a selectable 区间 button', () => {
+  const kb = listWizardKeyboard('all', '100100', 'inf', 'p', 'le', 'i85-96', []);
+  const texts = buttonTexts(kb);
+  assert.ok(texts.includes('✅ 仅85-96¢'), 'active band checkmarked');
+  const cbs = callbacks(kb);
+  assert.ok(cbs.includes('all:set:100100:inf:p:le:i85-96:0'), 'band round-trips through callback data');
+});
+
+test('listWizardKeyboard: no row packs more than 4 buttons (mobile truncation)', () => {
+  // Worst case: 4 remembered customs + an active custom band.
+  const kb = listWizardKeyboard('all', '100100', '350', 'p', 'le', 'i85-96', ['80', 'i70', '77', 'i60-75']);
+  for (const row of kb.inline_keyboard) {
+    assert.ok(row.length <= 4, `row too wide: ${row.map((b) => b.text).join(' | ')}`);
+  }
+  // Wide labels (customs, ✏, 🗑) never share a row with 3+ siblings.
+  for (const row of kb.inline_keyboard) {
+    const wide = row.filter((b) => /自定义|清空|-\d+¢/.test(b.text));
+    if (wide.length) assert.ok(row.length <= 3, `wide-label row too dense: ${row.map((b) => b.text).join(' | ')}`);
+  }
 });
 
 test('listWizardKeyboard: active custom value appears as a checkmarked button', () => {
@@ -127,11 +192,20 @@ test('extPickerKeyboard: tap-to-choose values + manual input + back', () => {
   const cbs = callbacks(kb);
   assert.ok(texts.includes('排除≥80¢'), 'exclude preset shown');
   assert.ok(texts.includes('仅≥92¢'), 'include preset shown');
-  assert.ok(texts.includes('✏ 手动输入数字'), 'manual input fallback shown');
+  assert.ok(texts.includes('✏ 手动输入(88 或 85-96)'), 'manual input fallback shown');
   assert.ok(texts.includes('⬅ 返回'), 'back button shown');
   // Value buttons select via 'set'; manual input drops to the reply flow.
   assert.ok(cbs.includes('all:set:100100:inf:p:le:80:0'), 'tapping a value selects it');
   assert.ok(cbs.includes('all:custom-ext:100100:inf:p:le:off:0'), 'manual input → reply flow');
+});
+
+test('extPickerKeyboard: offers 区间 presets that select band tokens', () => {
+  const kb = extPickerKeyboard('all', '100100', 'inf', 'p', 'le', 'off');
+  const texts = buttonTexts(kb);
+  const cbs = callbacks(kb);
+  assert.ok(texts.includes('仅85-96¢'), 'include band preset shown');
+  assert.ok(texts.includes('排除85-96¢'), 'exclude band preset shown');
+  assert.ok(cbs.includes('all:set:100100:inf:p:le:i85-96:0'), 'tapping a band selects it');
 });
 
 test('extPickerKeyboard: marks the active value', () => {
