@@ -759,9 +759,8 @@ const TIGHT_MINSH_PRESETS = [0, 1000, 5000, 10000, 50000]; // shares
 // per-level gap knob above (which measures 买1→买2 steps on one side); this is
 // the distance across the book between best bid and best ask.
 const TIGHT_SPREAD_PRESETS = ['inf', '0.1', '0.2', '0.5', '1', '2'];
-// 极端价 (排除已决市场) presets — same semantics as /stale's ext filter. 'off'
-// = 不过滤; a numeric N excludes markets with best-ask ≥N¢ or best-bid ≤(100-N)¢.
-const TIGHT_EXT_PRESETS = ['off', '94', '90', '85'];
+// 极端价 presets are shared with /stale (LIST_EXT_VALUES + 'off'); the wizard
+// keyboards all render the same section via extSectionRows.
 const TIGHT_WIZ_SORTS = [
   ['shares', '份额深度'],
   ['usd', '金额深度'],
@@ -900,7 +899,7 @@ function tightWizardText(f) {
     `<i>找${denseDesc}，按${tightSortLabel(f.sort)}排名。</i>`,
     '<i>「整格」= 自适应：1为1档(1¢)的市场和 0.1为1档的市场都算密集，无跳档即可。固定 0.1¢ 则只认 0.1¢ 跳档的市场。</i>',
     '<i>买1卖1价差 = 最优买价↔最优卖价的距离上限（顶档松紧）；极端价 = 排除/仅 一边 ≥N¢ 基本已决的市场。</i>',
-    '<i>每项都能自定义：点该行末尾的 ✏ 后，在本 chat 回复一个数字（跳档/价差填 ¢ 可带小数，份额填整数，极端价填 1-99）。</i>',
+    '<i>每项都能自定义：点该行末尾的 ✏ 后，在本 chat 回复一个数字（跳档/价差填 ¢ 可带小数，份额填整数，极端价填 1-99 或区间如 85-96）。</i>',
     '<i>点 🚀 会重抓所有监控市场的多档盘口，可能耗时几十秒。</i>',
   ].join('\n');
 }
@@ -915,43 +914,21 @@ export function tightWizardKeyboard(f, customExtPresets = []) {
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
   const spreadMark = (s) => s === f.spread ? `✅ ${tightSpreadLabel(s)}` : tightSpreadLabel(s);
   const extKey = normalizeExt(f.ext);
-  const extMark = (e, label) => normalizeExt(e) === extKey ? `✅ ${label}` : label;
   // "✏" custom button for a knob. When the active value is a custom (non-preset)
   // one it shows checkmarked with the value so the user can see what's set.
   const custBtn = (active, label, action) => ({
     text: active ? `✅ ✏${label}` : '✏', callback_data: tightCb(action, f),
   });
 
-  // 极端价 section mirrors /stale: an "排除" row, a "仅" row, then any
-  // remembered custom values as their own checkmarked buttons (+ 🗑 清空).
-  const extExcludeRow = [
-    { text: extMark('off', '关'), callback_data: tightCb('set', { ...f, ext: 'off' }) },
-    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
-      text: extMark(e, `排除≥${e}¢`), callback_data: tightCb('set', { ...f, ext: e }),
-    })),
-  ];
-  const extIncludeRow = [
-    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
-      text: extMark(`i${e}`, `仅≥${e}¢`), callback_data: tightCb('set', { ...f, ext: `i${e}` }),
-    })),
-    { text: '✏ 自定义…', callback_data: tightCb('cust-ext', f) },
-  ];
-  // Remembered custom 极端价 values stay available as buttons (union with the
-  // active one so a just-applied value always has a visible checkmarked button).
-  const seenCustom = new Set();
-  const customTokens = [];
-  const pushCustom = (tok) => {
-    const n = normalizeExt(tok);
-    if (n === 'off' || !isCustomExt(n) || seenCustom.has(n)) return;
-    seenCustom.add(n);
-    customTokens.push(n);
-  };
-  if (isCustomExt(extKey)) pushCustom(extKey);
-  for (const t of (customExtPresets ?? [])) pushCustom(t);
-  const extCustomRow = customTokens.slice(0, CUSTOM_EXT_PRESET_CAP).map((tok) => ({
-    text: extMark(tok, extBtnLabel(tok)), callback_data: tightCb('set', { ...f, ext: tok }),
-  }));
-  if (extCustomRow.length) extCustomRow.push({ text: '🗑 清空', callback_data: tightCb('ext-clear', f) });
+  // 极端价 section mirrors /stale (shared layout): 关+排除 row, 仅 row,
+  // remembered custom values (≤3/row), then ✏自定义/区间 (+🗑清空).
+  const extRows = extSectionRows(
+    extKey,
+    customExtPresets,
+    (tok, text) => ({ text, callback_data: tightCb('set', { ...f, ext: tok }) }),
+    { text: '✏ 自定义/区间…', callback_data: tightCb('cust-ext', f) },
+    { text: '🗑 清空', callback_data: tightCb('ext-clear', f) },
+  );
 
   return {
     inline_keyboard: [
@@ -985,9 +962,7 @@ export function tightWizardKeyboard(f, customExtPresets = []) {
         custBtn(isCustomTightSpread(f.spread), tightSpreadLabel(f.spread), 'cust-spread'),
       ],
       [{ text: '— 📈 极端价 (排除/仅 已决市场) —', callback_data: 'page:noop' }],
-      extExcludeRow,
-      extIncludeRow,
-      ...(extCustomRow.length ? [extCustomRow] : []),
+      ...extRows,
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
       TIGHT_WIZ_SORTS.map((pair) => ({
         text: sortMark(pair), callback_data: tightCb('set', { ...f, sort: pair[0] }),
@@ -1182,7 +1157,7 @@ export async function handleTightWizardCallback(data, { chatId, messageId, fromI
       gap: '每档跳档 ¢，可带小数（例 0.3 = 相邻档 ≤0.3¢）',
       minsh: 'N 档合计最低份额，整数（例 2500）',
       spread: '买1卖1价差上限 ¢，可带小数（例 0.3）',
-      ext: `极端价百分位 1-99（例 88 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'} ≥88¢ / ≤12¢；想换模式先点对应的 排除/仅 按钮）`,
+      ext: `极端价百分位 1-99（例 88 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'} ≥88¢ / ≤12¢；也可回复区间如 85-96；想换模式先点对应的 排除/仅 按钮）`,
     };
     const hint = [
       '🤏 <b>紧凑盘口 · 等待自定义…</b>',
@@ -1285,43 +1260,57 @@ const LIST_DIR_OP = { le: '≤', ge: '≥' };
 
 // "极端价" filter — a market is "extreme" iff one side of the binary is
 // already near a boundary (best-ask >= N¢ OR best-bid <= (100-N)¢, so the
-// market is effectively decided). Two modes:
-//   '94'   → 排除 ≥94¢ — drop extreme markets (default mode)
-//   'i94'  → 仅 ≥94¢   — show ONLY extreme markets (the "find decided
-//                        markets I can market-make on" use case)
-//   'off'  → no filter
+// market is effectively decided). Two modes, each open-ended (≥N) or a
+// bounded band (N-M, the "区间" form):
+//   '94'     → 排除 ≥94¢    — drop extreme markets (default mode)
+//   'i94'    → 仅 ≥94¢      — show ONLY extreme markets (the "find decided
+//                             markets I can market-make on" use case)
+//   '85-96'  → 排除 85-96¢  — drop markets with a side in the 85-96¢ band
+//                             (mirrored: or the other side in 4-15¢)
+//   'i85-96' → 仅 85-96¢    — show ONLY markets with a side in that band
+//   'off'    → no filter
 // Single-sided / empty books pass through either way (/empty handles those).
 const LIST_EXT_VALUES = ['94', '90', '85']; // numeric presets, mode-agnostic
 
 function parseExtRaw(e) {
-  if (e == null || e === '' || e === 'off') return { mode: 'off', val: null };
-  const m = String(e).match(/^(i)?(\d{1,2})$/);
-  if (!m) return { mode: 'off', val: null };
-  const val = Number(m[2]);
-  if (!Number.isFinite(val) || val < 1 || val > 99) return { mode: 'off', val: null };
-  return { mode: m[1] ? 'in' : 'ex', val };
+  const off = { mode: 'off', val: null, hi: null };
+  if (e == null || e === '' || e === 'off') return off;
+  const m = String(e).match(/^(i)?(\d{1,2})(?:-(\d{1,2}))?$/);
+  if (!m) return off;
+  let val = Number(m[2]);
+  if (!Number.isFinite(val) || val < 1 || val > 99) return off;
+  let hi = null;
+  if (m[3] != null) {
+    hi = Number(m[3]);
+    if (!Number.isFinite(hi) || hi < 1 || hi > 99) return off;
+    if (hi < val) [val, hi] = [hi, val]; // tolerate reversed bands ("96-85")
+  }
+  return { mode: m[1] ? 'in' : 'ex', val, hi };
 }
 
-function formatExt(mode, val) {
+function formatExt(mode, val, hi = null) {
   if (mode === 'off' || val == null) return 'off';
-  return mode === 'in' ? `i${val}` : String(val);
+  const body = hi != null ? `${val}-${hi}` : String(val);
+  return mode === 'in' ? `i${body}` : body;
 }
 
 function normalizeExt(e) {
   const p = parseExtRaw(e);
-  return p.mode === 'off' ? 'off' : formatExt(p.mode, p.val);
+  return p.mode === 'off' ? 'off' : formatExt(p.mode, p.val, p.hi);
 }
 
 function isCustomExt(e) {
   const p = parseExtRaw(e);
   if (p.mode === 'off') return false;
+  if (p.hi != null) return true; // bands are always custom (presets are open-ended)
   return !LIST_EXT_VALUES.includes(String(p.val));
 }
 
 function extLabel(e) {
   const p = parseExtRaw(e);
   if (p.mode === 'off') return '不限';
-  return p.mode === 'in' ? `仅 ≥${p.val}¢` : `排除 ≥${p.val}¢`;
+  const range = p.hi != null ? `${p.val}-${p.hi}¢` : `≥${p.val}¢`;
+  return p.mode === 'in' ? `仅 ${range}` : `排除 ${range}`;
 }
 
 function extFilterActive(e) {
@@ -1332,7 +1321,33 @@ function extFilterActive(e) {
 function extBtnLabel(e) {
   const p = parseExtRaw(e);
   if (p.mode === 'off') return '关';
-  return p.mode === 'in' ? `仅≥${p.val}¢` : `排除≥${p.val}¢`;
+  const range = p.hi != null ? `${p.val}-${p.hi}¢` : `≥${p.val}¢`;
+  return p.mode === 'in' ? `仅${range}` : `排除${range}`;
+}
+
+// Parse a typed custom 极端价 reply. Accepts a single percentile ("88") or a
+// bounded band ("85-96"; also 85~96 / 85 - 96), each side 1-99. Returns the
+// normalized token in the given mode, or null when the text isn't a value.
+export function customExtTokenFromInput(text, mode) {
+  const m = String(text).trim().match(/^(\d{1,2})(?:\s*[-~～—]\s*(\d{1,2}))?$/);
+  if (!m) return null;
+  const token = m[2] != null ? `${m[1]}-${m[2]}` : m[1];
+  const p = parseExtRaw(token);
+  if (p.mode === 'off') return null; // out-of-range bounds
+  return formatExt(mode === 'in' ? 'in' : 'ex', p.val, p.hi);
+}
+
+// Does one side of a book sit in the extreme zone? For open-ended tokens the
+// zone is ask ≥N¢ (or bid ≤(100-N)¢); for bands it's ask within [N,M]¢ (or
+// bid within the mirrored [100-M,100-N]¢). Missing sides never match.
+function extSideHit(p, bid, ask) {
+  const lo = p.val / 100;
+  const hi = p.hi != null ? p.hi / 100 : null;
+  const askExt = Number.isFinite(ask) && ask >= lo && (hi == null || ask <= hi);
+  const bidLo = (100 - p.val) / 100;
+  const bidHi = p.hi != null ? (100 - p.hi) / 100 : null;
+  const bidExt = Number.isFinite(bid) && bid <= bidLo && (bidHi == null || bid >= bidHi);
+  return askExt || bidExt;
 }
 
 // Max custom 极端价 values kept as buttons (most-recent first).
@@ -1347,6 +1362,41 @@ export function rememberCustomExtPreset(state, ext) {
   const prev = Array.isArray(state.customExtPresets) ? state.customExtPresets : [];
   state.customExtPresets = [token, ...prev.filter((t) => normalizeExt(t) !== token)]
     .slice(0, CUSTOM_EXT_PRESET_CAP);
+}
+
+// 极端价 keyboard section shared by the /stale /all /tight /combo wizards:
+// a 关+排除 presets row, a 仅 presets row, remembered custom values (max 3
+// per row — 4-5 buttons ellipsize labels like "排除≥…" on phones), then a
+// ✏自定义(+🗑清空) row. makeBtn(token, text) builds a wizard-specific button;
+// pickBtn / clearBtn are the wizard's ✏ and 🗑 buttons.
+function extSectionRows(extKey, customPresets, makeBtn, pickBtn, clearBtn) {
+  const markLabel = (e, label) => normalizeExt(e) === extKey ? `✅ ${label}` : label;
+  const rows = [
+    [
+      makeBtn('off', markLabel('off', '关')),
+      ...LIST_EXT_VALUES.map((v) => makeBtn(v, markLabel(v, `排除≥${v}¢`))),
+    ],
+    LIST_EXT_VALUES.map((v) => makeBtn(`i${v}`, markLabel(`i${v}`, `仅≥${v}¢`))),
+  ];
+  // Remembered custom values stay available as buttons (union with the active
+  // one so a just-applied value always has a visible, checkmarked button even
+  // before it's persisted).
+  const seen = new Set();
+  const tokens = [];
+  const push = (tok) => {
+    const n = normalizeExt(tok);
+    if (n === 'off' || !isCustomExt(n) || seen.has(n)) return;
+    seen.add(n);
+    tokens.push(n);
+  };
+  if (isCustomExt(extKey)) push(extKey);
+  for (const t of (customPresets ?? [])) push(t);
+  const kept = tokens.slice(0, CUSTOM_EXT_PRESET_CAP);
+  for (const row of chunk(kept, 3)) {
+    rows.push(row.map((tok) => makeBtn(tok, markLabel(tok, extBtnLabel(tok)))));
+  }
+  rows.push(kept.length ? [pickBtn, clearBtn] : [pickBtn]);
+  return rows;
 }
 
 // Freshest known top-of-book for a slot. The 极端价 filter must agree with
@@ -1369,12 +1419,8 @@ export function extTopOfBook(slot) {
 export function passesExtFilter(slot, ext) {
   const p = parseExtRaw(ext);
   if (p.mode === 'off') return true;
-  const hi = p.val / 100;
-  const lo = (100 - p.val) / 100;
   const { bid, ask } = extTopOfBook(slot);
-  const askExt = Number.isFinite(ask) && ask >= hi;
-  const bidExt = Number.isFinite(bid) && bid <= lo;
-  const isExtreme = askExt || bidExt;
+  const isExtreme = extSideHit(p, bid, ask);
   // 'in' = only show extreme markets; 'ex' = exclude extreme markets.
   return p.mode === 'in' ? isExtreme : !isExtreme;
 }
@@ -1675,8 +1721,8 @@ function listWizardText(kind, bits, thresh, sort, dir, ext = 'off') {
     '',
     '<i>点 🚀 后:有盘口过滤 → 重抓 orderbook 实时数据再筛+排序;</i>',
     '<i>没盘口过滤(默认) → 直接用现有数据排序,瞬间完成。</i>',
-    '<i>极端价: 一边 ≥N¢ 或 ≤(100-N)¢ 的市场基本已决断。"排除" 隐藏 / "仅" 只显示这类。</i>',
-    '<i>自定义: 点 ✏ 后回复数字(总额 USD / 极端价 1-99)。</i>',
+    '<i>极端价: 一边 ≥N¢ 或 ≤(100-N)¢ 的市场基本已决断。"排除" 隐藏 / "仅" 只显示这类;区间(如 85-96)则只按 85-96¢ 这一段判定。</i>',
+    '<i>自定义: 点 ✏ 后回复数字(总额 USD / 极端价 1-99, 也可回复区间如 85-96)。</i>',
   ];
   return lines.join('\n');
 }
@@ -1691,7 +1737,6 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
   const threshMark = (t) => t === thresh ? `✅ ${staleThreshLabel(t, dirKey)}` : staleThreshLabel(t, dirKey);
   const sortMark = (s) => s === sortKey ? `✅ ${LIST_SORT_LABELS[s]}` : LIST_SORT_LABELS[s];
   const dirMark = (d) => d === dirKey ? `✅ ${LIST_DIR_LABELS[d]}` : LIST_DIR_LABELS[d];
-  const extMark = (e, label) => e === extKey ? `✅ ${label}` : label;
   // 8-part callback: kind:action:bits:thresh:sort:dir:ext:page
   const cb = (action, b = bits, t = thresh, s = sortKey, d = dirKey, e = extKey) =>
     `${kind}:${action}:${b}:${t}:${s}:${d}:${e}:0`;
@@ -1705,51 +1750,23 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
     text: isCustomThresh(thresh) ? `✅ ✏自定义 ($${thresh})` : '✏ 自定义…',
     callback_data: cb('thresh-pick'),
   };
-  // Split threshold buttons into two rows so they fit comfortably on mobile.
+  // Split threshold buttons across rows of ≤3-4 so labels don't ellipsize on
+  // mobile ("✏ 自定…"); the ✏ shares the last row where it has room to show
+  // the active custom value.
   const threshRow1 = threshButtons.slice(0, 4);
-  const threshRow2 = [...threshButtons.slice(4), customButton];
-  // Extreme-price filter: two rows, one per mode.
-  // Row 1: off + exclude presets ("排除≥N¢" — hide near-resolved markets).
-  // Row 2: include presets + custom ("仅≥N¢" — show ONLY near-resolved).
-  const extExcludeRow = [
-    { text: extMark('off', '关'), callback_data: cb('set', bits, thresh, sortKey, dirKey, 'off') },
-    ...LIST_EXT_VALUES.map((v) => ({
-      text: extMark(v, `排除≥${v}¢`),
-      callback_data: cb('set', bits, thresh, sortKey, dirKey, v),
-    })),
-  ];
-  const extIncludeRow = [
-    ...LIST_EXT_VALUES.map((v) => ({
-      text: extMark(`i${v}`, `仅≥${v}¢`),
-      callback_data: cb('set', bits, thresh, sortKey, dirKey, `i${v}`),
-    })),
-    {
-      // The "✏ 自定义…" button opens a value-picker card; the active custom
-      // value (if any) shows up as its own checkmarked button in the custom row.
-      text: '✏ 自定义…',
-      callback_data: cb('ext-pick'),
-    },
-  ];
-  // Custom 极端价 values the user added stay as buttons (union with the active
-  // one so a just-applied value always has a visible, checkmarked button even
-  // before it's persisted). Trailing 🗑 clears the whole custom list.
-  const customTokens = [];
-  const seenCustom = new Set();
-  const pushCustom = (tok) => {
-    const n = normalizeExt(tok);
-    if (n === 'off' || !isCustomExt(n) || seenCustom.has(n)) return;
-    seenCustom.add(n);
-    customTokens.push(n);
-  };
-  if (isCustomExt(extKey)) pushCustom(extKey);
-  for (const t of (customPresets ?? [])) pushCustom(t);
-  const extCustomRow = customTokens.slice(0, CUSTOM_EXT_PRESET_CAP).map((tok) => ({
-    text: extMark(tok, extBtnLabel(tok)),
-    callback_data: cb('set', bits, thresh, sortKey, dirKey, tok),
-  }));
-  if (extCustomRow.length) {
-    extCustomRow.push({ text: '🗑 清空', callback_data: cb('ext-clear') });
-  }
+  const threshRow2 = threshButtons.slice(4);
+  const threshRow3 = [customButton];
+  // Extreme-price filter section (shared layout): 关+排除 row, 仅 row,
+  // remembered custom values (≤3/row), then ✏自定义/区间 (+🗑清空). The ✏
+  // button opens a value-picker card; manual input there accepts "88" or a
+  // band like "85-96".
+  const extRows = extSectionRows(
+    extKey,
+    customPresets,
+    (tok, text) => ({ text, callback_data: cb('set', bits, thresh, sortKey, dirKey, tok) }),
+    { text: '✏ 自定义/区间…', callback_data: cb('ext-pick') },
+    { text: '🗑 清空', callback_data: cb('ext-clear') },
+  );
   return {
     inline_keyboard: [
       [
@@ -1764,13 +1781,12 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
       ],
       threshRow1,
       threshRow2,
+      threshRow3,
       LIST_DIRS.map((d) => ({
         text: dirMark(d),
         callback_data: cb('set', bits, thresh, sortKey, d),
       })),
-      extExcludeRow,
-      extIncludeRow,
-      ...(extCustomRow.length ? [extCustomRow] : []),
+      ...extRows,
       LIST_SORTS.map((s) => ({
         text: sortMark(s),
         callback_data: cb('set', bits, thresh, s),
@@ -1790,6 +1806,8 @@ export function listWizardKeyboard(kind, bits, thresh, sort, dir, ext = 'off', c
 // reply-a-number flow for an arbitrary value; "⬅ 返回" goes back to the wizard.
 const EXT_PICK_EXCLUDE = ['98', '96', '92', '88', '80', '75']; // 排除 ≥N¢ presets
 const EXT_PICK_INCLUDE = ['98', '92', '80'];                   // 仅 ≥N¢ presets
+// 区间 presets — a side within [N,M]¢ (or mirrored [100-M,100-N]¢) counts.
+const EXT_PICK_RANGES = ['i85-96', 'i90-97', '85-96'];
 const THRESH_PICK_VALUES = ['150', '300', '750', '1500', '3000', '10000'];
 
 function chunk(arr, n) {
@@ -1807,12 +1825,18 @@ export function extPickerKeyboard(kind, bits, thresh, sort, dir, ext) {
   const includeRow = EXT_PICK_INCLUDE.map((v) => ({
     text: mark(`i${v}`, `仅≥${v}¢`), callback_data: cb('set', `i${v}`),
   }));
+  // 区间 row: bounded bands (e.g. 仅85-96¢ = only markets with a side in
+  // 85-96¢ / mirrored 4-15¢). Manual input also accepts the "85-96" form.
+  const rangeRow = EXT_PICK_RANGES.map((v) => ({
+    text: mark(normalizeExt(v), extBtnLabel(v)), callback_data: cb('set', normalizeExt(v)),
+  }));
   return {
     inline_keyboard: [
       ...excludeRows,
       includeRow,
+      rangeRow,
       [
-        { text: '✏ 手动输入数字', callback_data: cb('custom-ext') },
+        { text: '✏ 手动输入(88 或 85-96)', callback_data: cb('custom-ext') },
         { text: '⬅ 返回', callback_data: cb('wizard') },
       ],
     ],
@@ -1840,7 +1864,7 @@ function pickerCardText(kind, field) {
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const title = field === 'ext' ? '极端价' : '盘口总额阈值';
   const hint = field === 'ext'
-    ? '一边 ≥N¢ (或 ≤(100-N)¢) 的市场基本已决断。点下面任意值直接选,或「手动输入」填 1-99。'
+    ? '一边 ≥N¢ (或 ≤(100-N)¢) 的市场基本已决断。点下面任意值直接选,或「手动输入」填 1-99;也支持区间,如 85-96 = 只看一边在 85-96¢ (或对侧 4-15¢) 的市场。'
     : '盘口总额上/下限 (USD)。点下面任意值直接选,或「手动输入」填任意金额。';
   return [`<b>${meta.title} · 自定义${title}</b>`, '', `<i>${hint}</i>`].join('\n');
 }
@@ -2132,7 +2156,7 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     try {
       const meta2 = LIST_KINDS[kind] ?? LIST_KINDS.stale;
       const promptUnit = field === 'ext'
-        ? '极端价百分位(1-99,例如 94 = 排除 ≥94¢ 或 ≤6¢ 的市场)'
+        ? '极端价百分位(1-99,例如 94 = 排除 ≥94¢ 或 ≤6¢ 的市场;也可回复区间,如 85-96 = 只按一边在 85-96¢ 判定)'
         : 'USD 金额,例如 350';
       const hint = [
         `<b>${meta2.title} · 等待自定义${field === 'ext' ? '极端价' : '阈值'}…</b>`,
@@ -3970,7 +3994,8 @@ function formatComboPair(pair, state, { showStall = false, showHedge = false } =
 //           | hedge (可对冲额度 desc — 两腿多档深度里组合价仍低于上限的可成交金额)
 //           | stale (停滞时长 desc — 两腿盘口都未动的时长，取较短一腿)
 //   ext   = 极端价 filter, same token scheme as /tight & /stale ('off' | '85'
-//           = 排除 either-leg ≥85¢/≤15¢ | 'i85' = 仅 pairs with an extreme leg).
+//           = 排除 either-leg ≥85¢/≤15¢ | 'i85' = 仅 pairs with an extreme leg
+//           | band forms '85-96'/'i85-96' judge a leg by the bounded zone).
 //           Judged on the freshly fetched books, per PAIR: 'ex' drops a pair
 //           when EITHER leg is extreme, 'in' keeps only those pairs.
 //   page  = results page index (only used by action=page)
@@ -4059,7 +4084,7 @@ function comboWizardText(f) {
     '<i>组合 = 金额阶梯买「低档 是 + 高档 否」，日期阶梯买「早档 否 + 晚档 是」。两腿合计 &lt;100¢ 为纯套利；100~上限 之间是低风险中间区间打法（命中赚 200−成本，落空亏 成本−100）。</i>',
     '<i>可成交股数 = 两腿顶档挂单量的较小值；可对冲额度 = 沿两腿多档深度撮合、组合价仍低于上限的总可成交量（股数×两腿合计价，$）——按它排序能找到吃得下大仓位的组合。</i>',
     '<i>极端价 = 按刚重抓的盘口判断：排除 ≥85¢ 会剔除任一腿基本已决（一边 ≥85¢ 或 ≤15¢）的组合；仅 ≥85¢ 则只看这类组合。</i>',
-    '<i>💵/🔢/📈 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99）。</i>',
+    '<i>💵/🔢/📈 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99 或区间如 85-96）。</i>',
     '<i>点 🚀 会实时重抓所有阶梯市场的订单簿再筛选，可能耗时几十秒。</i>',
   ].join('\n');
 }
@@ -4071,39 +4096,19 @@ export function comboWizardKeyboard(f, customExtPresets = []) {
   const shMark = (s) => s === f.minSh ? `✅ ${shLabel(s)}` : shLabel(s);
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
   const extKey = normalizeExt(f.ext);
-  const extMark = (e, label) => normalizeExt(e) === extKey ? `✅ ${label}` : label;
   const custBtn = (active, label, action) => ({
     text: active ? `✅ ✏${label}` : '✏', callback_data: comboCb(action, f),
   });
 
-  // 极端价 section mirrors /tight: an "排除" row, a "仅" row, then any
-  // remembered custom values as their own checkmarked buttons (+ 🗑 清空).
-  const extExcludeRow = [
-    { text: extMark('off', '关'), callback_data: comboCb('set', { ...f, ext: 'off' }) },
-    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
-      text: extMark(e, `排除≥${e}¢`), callback_data: comboCb('set', { ...f, ext: e }),
-    })),
-  ];
-  const extIncludeRow = [
-    ...TIGHT_EXT_PRESETS.filter((e) => e !== 'off').map((e) => ({
-      text: extMark(`i${e}`, `仅≥${e}¢`), callback_data: comboCb('set', { ...f, ext: `i${e}` }),
-    })),
-    { text: '✏ 自定义…', callback_data: comboCb('cust-ext', f) },
-  ];
-  const seenCustom = new Set();
-  const customTokens = [];
-  const pushCustom = (tok) => {
-    const n = normalizeExt(tok);
-    if (n === 'off' || !isCustomExt(n) || seenCustom.has(n)) return;
-    seenCustom.add(n);
-    customTokens.push(n);
-  };
-  if (isCustomExt(extKey)) pushCustom(extKey);
-  for (const t of (customExtPresets ?? [])) pushCustom(t);
-  const extCustomRow = customTokens.slice(0, CUSTOM_EXT_PRESET_CAP).map((tok) => ({
-    text: extMark(tok, extBtnLabel(tok)), callback_data: comboCb('set', { ...f, ext: tok }),
-  }));
-  if (extCustomRow.length) extCustomRow.push({ text: '🗑 清空', callback_data: comboCb('ext-clear', f) });
+  // 极端价 section mirrors /tight (shared layout): 关+排除 row, 仅 row,
+  // remembered custom values (≤3/row), then ✏自定义/区间 (+🗑清空).
+  const extRows = extSectionRows(
+    extKey,
+    customExtPresets,
+    (tok, text) => ({ text, callback_data: comboCb('set', { ...f, ext: tok }) }),
+    { text: '✏ 自定义/区间…', callback_data: comboCb('cust-ext', f) },
+    { text: '🗑 清空', callback_data: comboCb('ext-clear', f) },
+  );
 
   return {
     inline_keyboard: [
@@ -4126,9 +4131,7 @@ export function comboWizardKeyboard(f, customExtPresets = []) {
         custBtn(isCustomComboMinSh(f.minSh), shLabel(f.minSh), 'cust-minsh'),
       ],
       [{ text: '— 📈 极端价 (排除/仅 已决档位) —', callback_data: 'page:noop' }],
-      extExcludeRow,
-      extIncludeRow,
-      ...(extCustomRow.length ? [extCustomRow] : []),
+      ...extRows,
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
       COMBO_SORTS.map((pair) => ({
         text: sortMark(pair), callback_data: comboCb('set', { ...f, sort: pair[0] }),
@@ -4143,14 +4146,11 @@ export function comboWizardKeyboard(f, customExtPresets = []) {
 
 // 极端价 check on a freshly fetched book (not the slot cache — the combo
 // screen's whole premise is live prices). A leg is "extreme" (effectively
-// decided) when best-ask ≥N¢ or best-bid ≤(100−N)¢. Missing sides count as
+// decided) when best-ask ≥N¢ or best-bid ≤(100−N)¢ — or, for a band token,
+// when a side falls inside the [N,M]¢ zone. Missing sides count as
 // not-extreme, matching passesExtFilter's pass-through for one-sided books.
 function comboBookIsExtreme(book, extParsed) {
-  const hi = extParsed.val / 100;
-  const lo = (100 - extParsed.val) / 100;
-  const ask = book?.bestAsk?.price;
-  const bid = book?.bestBid?.price;
-  return (Number.isFinite(ask) && ask >= hi) || (Number.isFinite(bid) && bid <= lo);
+  return extSideHit(extParsed, book?.bestBid?.price, book?.bestAsk?.price);
 }
 
 // Pair-level 极端价 filter: 'ex' drops a pair when EITHER leg is extreme,
@@ -4479,7 +4479,7 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
     const prompts = {
       cap: '组合价上限 ¢，可带小数（例 107.5 = 两腿合计 <107.5¢ 才列出；范围 50-199.9）',
       minsh: '最低可成交股数，整数（例 200；0 = 不限）',
-      ext: `极端价百分位 1-99（例 85 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'}任一腿 ≥85¢ / ≤15¢ 的组合；想换模式先点对应的 排除/仅 按钮）`,
+      ext: `极端价百分位 1-99（例 85 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'}任一腿 ≥85¢ / ≤15¢ 的组合；也可回复区间如 85-96；想换模式先点对应的 排除/仅 按钮）`,
     };
     const hint = [
       '💡 <b>组合价筛选 · 等待自定义…</b>',
@@ -5672,9 +5672,12 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 } else if (pending.field === 'minsh') {
                   f.minSh = (num != null && num > 0) ? num : 0; // shares: integer; 0/junk → 不限
                 } else if (pending.field === 'ext') {
-                  if (num != null && num >= 1 && num <= 99) {
-                    const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
-                    f.ext = formatExt(mode, num);
+                  // Accepts "88" or a band like "85-96"; preserves the current
+                  // mode (排除/仅). Junk → off.
+                  const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+                  const tok = customExtTokenFromInput(trimmed, mode);
+                  if (tok) {
+                    f.ext = tok;
                     rememberCustomExtPreset(state, f.ext);
                   } else {
                     f.ext = 'off';
@@ -5702,10 +5705,12 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 } else if (pending.field === 'minsh') {
                   f.minSh = (num != null && num > 0) ? num : 0; // 0/junk → 不限
                 } else if (pending.field === 'ext') {
-                  // Clamp 1-99, preserve the current mode (排除/仅); junk → off.
-                  if (num != null && num >= 1 && num <= 99) {
-                    const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
-                    f.ext = formatExt(mode, num);
+                  // "88" or a band like "85-96", each side 1-99; preserves the
+                  // current mode (排除/仅). Junk → off.
+                  const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+                  const tok = customExtTokenFromInput(trimmed, mode);
+                  if (tok) {
+                    f.ext = tok;
                     rememberCustomExtPreset(state, f.ext);
                   } else {
                     f.ext = 'off';
@@ -5731,11 +5736,13 @@ export function startCommandLoop({ getState, persist, ctx }) {
                 if (field === 'thresh') {
                   nextThresh = num != null && num > 0 ? String(num) : 'inf';
                 } else {
-                  // ext: clamp 1-99 and preserve the current mode (ex/in),
-                  // so ✏ while in "仅显示" mode stays in "仅显示".
-                  if (num != null && num >= 1 && num <= 99) {
-                    const currentMode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
-                    nextExt = formatExt(currentMode, num);
+                  // ext: "88" or a band like "85-96" (each side 1-99); preserves
+                  // the current mode (ex/in), so ✏ while in "仅显示" mode stays
+                  // in "仅显示". Junk → off.
+                  const currentMode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+                  const tok = customExtTokenFromInput(trimmed, currentMode);
+                  if (tok) {
+                    nextExt = tok;
                     // Keep a genuinely-custom value as a button for next time.
                     rememberCustomExtPreset(state, nextExt);
                   } else {
