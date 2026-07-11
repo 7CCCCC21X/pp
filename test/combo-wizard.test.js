@@ -16,14 +16,15 @@ function callbacks(kb) {
 function buttonTexts(kb) {
   return kb.inline_keyboard.flat().map((b) => b.text);
 }
-// Build the 8-part callback parts array a button would carry.
-function parts(action, { cap = '110', kind = 'all', minSh = 0, sort = 'cost', ext = 'off', page = 0 } = {}) {
-  return ['combo', action, String(cap), kind, String(minSh), sort, ext, String(page)];
+// Build the 9-part callback parts array a button would carry. `terr` is the
+// wire token ('off' or 'e<N>').
+function parts(action, { cap = '110', kind = 'all', minSh = 0, sort = 'cost', ext = 'off', terr = 'off', page = 0 } = {}) {
+  return ['combo', action, String(cap), kind, String(minSh), sort, ext, terr, String(page)];
 }
 
 test('parseComboFilter: defaults', () => {
   const f = parseComboFilter(parts('wizard'), {});
-  assert.deepEqual(f, { cap: '110', kind: 'all', minSh: 0, sort: 'cost', ext: 'off', page: 0 });
+  assert.deepEqual(f, { cap: '110', kind: 'all', minSh: 0, sort: 'cost', ext: 'off', terr: 'off', page: 0 });
 });
 
 test('parseComboFilter: accepts a custom decimal cap and trims trailing zeros', () => {
@@ -65,6 +66,28 @@ test('parseComboFilter: page parses, junk/negative → 0', () => {
   assert.equal(parseComboFilter(['combo', 'run', '110', 'all', '0', 'cost', 'off'], {}).page, 0);
 });
 
+test('parseComboFilter: 时间误差 token parses, junk → off', () => {
+  assert.equal(parseComboFilter(parts('set', { terr: 'e2' }), {}).terr, '2');
+  assert.equal(parseComboFilter(parts('set', { terr: 'e2.5' }), {}).terr, '2.5');
+  assert.equal(parseComboFilter(parts('set', { terr: 'e0' }), {}).terr, 'off');   // below min
+  assert.equal(parseComboFilter(parts('set', { terr: 'e99' }), {}).terr, 'off');  // above max
+  assert.equal(parseComboFilter(parts('set', { terr: 'ejunk' }), {}).terr, 'off');
+});
+
+test('parseComboFilter: legacy pre-terr callback keeps page and defaults terr off', () => {
+  // Old 8-part format carried the page number where terr now sits.
+  const f = parseComboFilter(['combo', 'page', '110', 'date', '0', 'cost', '85', '2'], {});
+  assert.equal(f.terr, 'off');
+  assert.equal(f.page, 2);
+  assert.equal(f.ext, '85');
+});
+
+test('parseComboFilter: terr token + page coexist in the 9-part format', () => {
+  const f = parseComboFilter(parts('page', { terr: 'e3', page: 4 }), {});
+  assert.equal(f.terr, '3');
+  assert.equal(f.page, 4);
+});
+
 test('comboWizardKeyboard: callbacks stay within Telegram 64-byte limit', () => {
   const f = { cap: '107.5', kind: 'money', minSh: 50000, sort: 'usd', ext: 'i88' };
   for (const cb of callbacks(comboWizardKeyboard(f))) {
@@ -101,7 +124,7 @@ test('parseComboFilter: stale sort accepted', () => {
 
 test('parseComboFilter + keyboard: 可对冲额度 sort', () => {
   assert.equal(parseComboFilter(parts('set', { sort: 'hedge' }), {}).sort, 'hedge');
-  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'hedge', ext: 'off' };
+  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'hedge', ext: 'off', terr: 'off' };
   const kb = comboWizardKeyboard(f);
   assert.ok(buttonTexts(kb).includes('✅ 可对冲额度'));
   const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
@@ -109,7 +132,7 @@ test('parseComboFilter + keyboard: 可对冲额度 sort', () => {
 });
 
 test('comboWizardKeyboard: 停滞时长 sort button present and round-trips', () => {
-  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'stale', ext: 'off' };
+  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'stale', ext: 'off', terr: 'off' };
   const kb = comboWizardKeyboard(f);
   assert.ok(buttonTexts(kb).includes('✅ 停滞时长'));
   const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
@@ -117,10 +140,37 @@ test('comboWizardKeyboard: 停滞时长 sort button present and round-trips', ()
 });
 
 test('comboWizardKeyboard: round-trips through parseComboFilter', () => {
-  const f = { cap: '105', kind: 'money', minSh: 100, sort: 'size', ext: '85' };
+  const f = { cap: '105', kind: 'money', minSh: 100, sort: 'size', ext: '85', terr: 'off' };
   const kb = comboWizardKeyboard(f);
   const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
   assert.ok(run);
   const parsed = parseComboFilter(run.split(':'), {});
   assert.deepEqual(parsed, { ...f, page: 0 });
+});
+
+test('comboWizardKeyboard: 时间误差 section — presets, checkmark, round-trip', () => {
+  const f = { cap: '110', kind: 'date', minSh: 0, sort: 'terr', ext: 'off', terr: '2' };
+  const kb = comboWizardKeyboard(f);
+  const texts = buttonTexts(kb);
+  assert.ok(texts.includes('✅ ≥2¢'));       // active preset checkmarked
+  assert.ok(texts.includes('≥1¢'));
+  assert.ok(texts.includes('✅ 时间误差'));   // terr sort button
+  const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
+  assert.deepEqual(parseComboFilter(run.split(':'), {}), { ...f, page: 0 });
+});
+
+test('comboWizardKeyboard: custom 时间误差 value shows checkmarked ✏ and survives round-trip', () => {
+  const f = { cap: '110', kind: 'all', minSh: 0, sort: 'cost', ext: 'off', terr: '2.5' };
+  const kb = comboWizardKeyboard(f);
+  assert.ok(buttonTexts(kb).includes('✅ ✏≥2.5¢'));
+  const run = callbacks(kb).find((cb) => cb.startsWith('combo:run:'));
+  assert.equal(parseComboFilter(run.split(':'), {}).terr, '2.5');
+});
+
+test('comboWizardKeyboard: legacy f without terr field still builds (terr off)', () => {
+  const kb = comboWizardKeyboard({ cap: '110', kind: 'all', minSh: 0, sort: 'cost', ext: 'off' });
+  assert.ok(buttonTexts(kb).includes('✅ 关'));
+  for (const cb of callbacks(kb)) {
+    assert.ok(Buffer.byteLength(cb, 'utf8') <= 64, `${cb} too long`);
+  }
 });

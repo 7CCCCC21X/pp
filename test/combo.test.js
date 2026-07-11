@@ -310,3 +310,74 @@ test('classifyComboEntry: exposes what the grouper sees for one market', () => {
   assert.equal(classifyComboEntry({ id: '3', title: 'Yes', question: 'Will it rain tomorrow?' }), null);
   assert.equal(classifyComboEntry({ id: '4' }), null);
 });
+
+// ===== Time-proportional fair pricing (时间比价) on date pairs =====
+
+// Screenshot scenario: Sep 30 mid 8¢, Dec 31 mid 20¢. With `now` chosen so
+// Sep 30 is exactly half as far away as Dec 31, the fair Sep 30 price is
+// 20 × 0.5 = 10¢ — the actual 8¢ is 2¢ cheap.
+test('comboPairs: date pair carries time-ratio fair price and signed 误差', () => {
+  const [ladder] = buildComboLadders([
+    { id: '10', title: '2026年9月30日', question: 'Titan 会在什么时候之前发行代币吗？' },
+    { id: '11', title: '2026年12月31日', question: 'Titan 会在什么时候之前发行代币吗？' },
+  ]);
+  const sep30 = Date.UTC(2026, 8, 30);
+  const dec31 = Date.UTC(2026, 11, 31);
+  const nowMs = 2 * sep30 - dec31; // (sep30 − now) = 0.5 × (dec31 − now)
+  const books = new Map([
+    ['10', { bestBid: { price: 0.07, size: 100 }, bestAsk: { price: 0.09, size: 100 } }],
+    ['11', { bestBid: { price: 0.19, size: 100 }, bestAsk: { price: 0.21, size: 100 } }],
+  ]);
+  const pairs = comboPairs(ladder, books, { nowMs });
+  assert.equal(pairs.length, 1);
+  const p = pairs[0];
+  approx(p.timeRatio, 0.5);
+  approx(p.hardMidCents, 8);
+  approx(p.easyMidCents, 20);
+  approx(p.fairHardCents, 10);
+  approx(p.timeErrCents, -2); // 早档偏便宜 2¢
+});
+
+test('comboPairs: money pairs have no time-ratio model', () => {
+  const [ladder] = buildComboLadders([
+    { id: '1', title: '$50M', question: 'X FDV?' },
+    { id: '2', title: '$100M', question: 'X FDV?' },
+  ]);
+  const books = new Map([
+    ['1', { bestBid: { price: 0.60, size: 10 }, bestAsk: { price: 0.62, size: 10 } }],
+    ['2', { bestBid: { price: 0.30, size: 10 }, bestAsk: { price: 0.32, size: 10 } }],
+  ]);
+  const [p] = comboPairs(ladder, books, { nowMs: 0 });
+  assert.equal(p.timeErrCents, null);
+  assert.equal(p.timeRatio, null);
+});
+
+test('comboPairs: past earlier deadline → no time model', () => {
+  const [ladder] = buildComboLadders([
+    { id: '10', title: '2026年9月30日', question: 'Titan 发币？' },
+    { id: '11', title: '2026年12月31日', question: 'Titan 发币？' },
+  ]);
+  const books = new Map([
+    ['10', { bestBid: { price: 0.07, size: 100 }, bestAsk: { price: 0.09, size: 100 } }],
+    ['11', { bestBid: { price: 0.19, size: 100 }, bestAsk: { price: 0.21, size: 100 } }],
+  ]);
+  const pairs = comboPairs(ladder, books, { nowMs: Date.UTC(2026, 9, 15) }); // Oct 15 > Sep 30
+  assert.equal(pairs.length, 1);
+  assert.equal(pairs[0].timeErrCents, null);
+});
+
+test('comboPairs: one-sided book on a leg → pair kept but no time model', () => {
+  const [ladder] = buildComboLadders([
+    { id: '10', title: '2026年9月30日', question: 'Titan 发币？' },
+    { id: '11', title: '2026年12月31日', question: 'Titan 发币？' },
+  ]);
+  const books = new Map([
+    // Earlier (hard) leg has a bid but no ask → mid unknown; the combo
+    // itself still prices (NO ask = 100 − bid).
+    ['10', { bestBid: { price: 0.07, size: 100 } }],
+    ['11', { bestBid: { price: 0.19, size: 100 }, bestAsk: { price: 0.21, size: 100 } }],
+  ]);
+  const pairs = comboPairs(ladder, books, { nowMs: Date.UTC(2026, 5, 30) });
+  assert.equal(pairs.length, 1);
+  assert.equal(pairs[0].timeErrCents, null);
+});

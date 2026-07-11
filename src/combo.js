@@ -215,6 +215,9 @@ export function hedgeableWithinCap(easyAsks, hardBids, capProb) {
 // bids?: [{price,size}...], asks?: [...] }). When multi-level arrays and
 // `opts.capCents` are present, each pair also carries hedgeShares/hedgeUsd —
 // the depth-aware volume executable under the cap (see hedgeableWithinCap).
+// Date pairs additionally carry the time-proportional fair-price fields
+// (timeRatio/fairHardCents/timeErrCents, evaluated at opts.nowMs, default
+// Date.now()) — see the block inside the loop.
 //
 // Legs: buy YES on the easier rung at its ask; buy NO on the harder rung,
 // which on a single-book CLOB executes as selling YES to the harder rung's
@@ -273,6 +276,35 @@ export function comboPairs(ladder, books, opts = {}) {
       hedgeShares = h.shares;
       hedgeUsd = h.usd;
     }
+    // Time-proportional fair pricing for cumulative "by <date>" pairs: under
+    // a roughly-uniform arrival assumption P(by 早档) ≈ P(by 晚档) × 剩余时间占比
+    // ((早档 − now) / (晚档 − now)) — e.g. when Sep 30 is half as far away as
+    // Dec 31, the Sep 30 rung "should" trade near half the Dec 31 price.
+    // timeErrCents is the signed deviation of the earlier rung's mid from
+    // that fair value (negative = 早档偏便宜). Only meaningful while both
+    // deadlines are still ahead and both books have a two-sided mid.
+    let timeRatio = null;
+    let fairHardCents = null;
+    let hardMidCents = null;
+    let easyMidCents = null;
+    let timeErrCents = null;
+    if (ladder.kind === 'date' && ladder.direction === 'down') {
+      const now = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+      const midOf = (bk) => {
+        const bid = bk?.bestBid?.price;
+        const ask = bk?.bestAsk?.price;
+        return Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : null;
+      };
+      const hardMid = midOf(hardBook); // 早档 (earlier deadline, harder leg)
+      const easyMid = midOf(easyBook); // 晚档 (later deadline, easier leg)
+      if (hard.value > now && easy.value > hard.value && hardMid != null && easyMid != null) {
+        timeRatio = (hard.value - now) / (easy.value - now);
+        hardMidCents = hardMid * 100;
+        easyMidCents = easyMid * 100;
+        fairHardCents = easyMidCents * timeRatio;
+        timeErrCents = hardMidCents - fairHardCents;
+      }
+    }
     out.push({
       kind: ladder.kind,
       context: ladder.context,
@@ -285,6 +317,11 @@ export function comboPairs(ladder, books, opts = {}) {
       size,
       hedgeShares,
       hedgeUsd,
+      timeRatio,
+      fairHardCents,
+      hardMidCents,
+      easyMidCents,
+      timeErrCents,
       bandWinCents: 200 - costCents,
       maxLossCents: costCents - 100,
     });
