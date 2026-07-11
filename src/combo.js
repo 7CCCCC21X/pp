@@ -280,13 +280,22 @@ export function comboPairs(ladder, books, opts = {}) {
     // a roughly-uniform arrival assumption P(by 早档) ≈ P(by 晚档) × 剩余时间占比
     // ((早档 − now) / (晚档 − now)) — e.g. when Sep 30 is half as far away as
     // Dec 31, the Sep 30 rung "should" trade near half the Dec 31 price.
-    // timeErrCents is the signed deviation of the earlier rung's mid from
-    // that fair value (negative = 早档偏便宜). Only meaningful while both
-    // deadlines are still ahead and both books have a two-sided mid.
+    //
+    // The tradeable vehicle is the pair's hedge combo — 买早档否 + 买晚档是 —
+    // so the deviation is expressed on that SUM: the combo's mid-based cost
+    // ((100 − 早档mid) + 晚档mid) vs its time-fair value (100 + 晚档mid ×
+    // (1 − ratio)). timeErrCents = midCost − fairCost; positive = the combo
+    // is rich vs time-fair (早档 YES trading cheap — the reverse legs 早档是+
+    // 晚档否 are the better side), negative = the combo itself is the bargain.
+    // Mids (not one side's executables) keep wide spreads from reading as
+    // mispricing. Only meaningful while both deadlines are still ahead and
+    // both books have a two-sided mid.
     let timeRatio = null;
     let fairHardCents = null;
     let hardMidCents = null;
     let easyMidCents = null;
+    let midCostCents = null;
+    let fairCostCents = null;
     let timeErrCents = null;
     if (ladder.kind === 'date' && ladder.direction === 'down') {
       const now = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
@@ -302,7 +311,9 @@ export function comboPairs(ladder, books, opts = {}) {
         hardMidCents = hardMid * 100;
         easyMidCents = easyMid * 100;
         fairHardCents = easyMidCents * timeRatio;
-        timeErrCents = hardMidCents - fairHardCents;
+        midCostCents = (100 - hardMidCents) + easyMidCents; // 早档否 + 晚档是, at mids
+        fairCostCents = (100 - fairHardCents) + easyMidCents;
+        timeErrCents = midCostCents - fairCostCents; // = fairHardCents − hardMidCents
       }
     }
     out.push({
@@ -321,6 +332,8 @@ export function comboPairs(ladder, books, opts = {}) {
       fairHardCents,
       hardMidCents,
       easyMidCents,
+      midCostCents,
+      fairCostCents,
       timeErrCents,
       bandWinCents: 200 - costCents,
       maxLossCents: costCents - 100,

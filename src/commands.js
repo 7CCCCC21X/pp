@@ -2772,7 +2772,7 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 时间误差(日期档：早档应≈晚档中间价×剩余时间占比，开启后按偏离 ≥N¢ 判定、不受上限约束，误差大的也能查看) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长/时间误差；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价/时间误差都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt;（或直接 /combo 贴市场链接）诊断某市场：是否在扫描范围、门槛是否解析成功、归入哪个阶梯、邻档是谁、实时组合价是否过线，每步给出 ✅/❌ 和原因',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 时间误差(日期档：按「早档否+晚档是」组合合计价算，早档应≈晚档中间价×剩余时间占比 → 组合估值 = 100+晚档×(1−占比)，开启后按组合中价偏离估值 ≥N¢ 判定、不受上限约束，误差大的也能查看；+偏贵→反向 早是+晚否 占优) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长/时间误差；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价/时间误差都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt;（或直接 /combo 贴市场链接）诊断某市场：是否在扫描范围、门槛是否解析成功、归入哪个阶梯、邻档是谁、实时组合价是否过线，每步给出 ✅/❌ 和原因',
   '/timeerr — 日期档时间误差快捷入口：/combo 向导预设「日期阶梯 + 时间误差 ≥2¢ + 按误差排序」，一键 🚀 就能扫。/timeerr 1 改最低误差',
   '/opportunities — 机会评分（实验）',
   '',
@@ -3976,13 +3976,15 @@ function formatComboPair(pair, state, { showStall = false, showHedge = false } =
   const outcome = pure
     ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}${hedge}${stall}`
     : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}${hedge}${stall}`;
-  // Date pairs carry the time-proportional fair-price model: the earlier
-  // rung "should" trade at 晚档中间价 × 剩余时间占比; show the deviation.
+  // Date pairs carry the time-proportional fair-price model, expressed on
+  // the hedge combo itself (早档否 + 晚档是): the sum's mid-based cost vs its
+  // time-fair value. Positive 误差 = combo rich → the reverse legs are the
+  // better side; negative = the listed combo is the bargain.
   const timeLine = Number.isFinite(pair.timeErrCents)
-    ? `\n   ⏱ 时间比价: 早档 ${pair.hardMidCents.toFixed(1)}¢ vs 估价 ≈${pair.fairHardCents.toFixed(1)}¢`
-      + `（晚档 ${pair.easyMidCents.toFixed(1)}¢ × 剩余时间 ${(pair.timeRatio * 100).toFixed(0)}%）`
+    ? `\n   ⏱ 时间比价: 组合中价 ${pair.midCostCents.toFixed(1)}¢ vs 估值 ≈${pair.fairCostCents.toFixed(1)}¢`
+      + `（剩余时间比 ${(pair.timeRatio * 100).toFixed(0)}% → 早档应 ${pair.fairHardCents.toFixed(1)}¢，实 ${pair.hardMidCents.toFixed(1)}¢）`
       + ` · 误差 <b>${pair.timeErrCents >= 0 ? '+' : ''}${pair.timeErrCents.toFixed(1)}¢</b>`
-      + `（早档偏${pair.timeErrCents >= 0 ? '贵' : '便宜'}）`
+      + (pair.timeErrCents >= 0 ? '（组合偏贵 → 反向「早档是+晚档否」占优）' : '（组合偏便宜）')
     : '';
   return `${head}\n   ${legs}\n   ${outcome}${timeLine}`;
 }
@@ -4133,7 +4135,7 @@ function comboWizardText(f) {
     '<i>组合 = 金额阶梯买「低档 是 + 高档 否」，日期阶梯买「早档 否 + 晚档 是」。两腿合计 &lt;100¢ 为纯套利；100~上限 之间是低风险中间区间打法（命中赚 200−成本，落空亏 成本−100）。</i>',
     '<i>可成交股数 = 两腿顶档挂单量的较小值；可对冲额度 = 沿两腿多档深度撮合、组合价仍低于上限的总可成交量（股数×两腿合计价，$）——按它排序能找到吃得下大仓位的组合。</i>',
     '<i>极端价 = 按刚重抓的盘口判断：排除 ≥85¢ 会剔除任一腿基本已决（一边 ≥85¢ 或 ≤15¢）的组合；仅 ≥85¢ 则只看这类组合。</i>',
-    '<i>时间误差 = 只看日期阶梯：按剩余时间比例估早档合理价（早档 ≈ 晚档价 × 剩余时间占比 — 比如现在离 9/30 的时间是离 12/31 的一半，9/30 就应约为 12/31 的一半价）。开启后列出实际中间价偏离估价 ≥N¢ 的相邻档，且<b>不受组合价上限限制</b>，定价误差大的也能看到。</i>',
+    '<i>时间误差 = 只看日期阶梯，按对冲组合「早档否+晚档是」的合计价算：早档应 ≈ 晚档价 × 剩余时间占比（比如现在离 9/30 的时间是离 12/31 的一半，9/30 就应约为 12/31 的一半价），组合合计估值 = 100 + 晚档价 × (1−占比)。开启后列出组合中间价偏离估值 ≥N¢ 的相邻档，且<b>不受组合价上限限制</b>，定价误差大的也能看到（+偏贵 → 反向 早是+晚否 占优；−偏便宜 → 组合本身划算）。</i>',
     '<i>💵/🔢/📈/⏱ 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99 或区间如 85-96，时间误差填 ¢ 可带小数）。</i>',
     '<i>点 🚀 会实时重抓所有阶梯市场的订单簿再筛选，可能耗时几十秒。</i>',
   ].join('\n');
@@ -4477,7 +4479,7 @@ function renderComboResult(f, state, scan, page = 0) {
   const terr = comboTerrOf(f);
   // 时间误差 mode judges pairs by |实际 − 时间比例估价| instead of the cost cap.
   const terrNote = terr !== 'off'
-    ? `⏱ 时间误差模式：只看日期档，早档偏离「晚档中间价 × 剩余时间占比」≥${terr}¢ 即列出（不受组合价上限约束）`
+    ? `⏱ 时间误差模式：只看日期档，「早档否+晚档是」组合中价偏离时间比例估值 ≥${terr}¢ 即列出（不受组合价上限约束；+偏贵→反向占优，−偏便宜→组合划算）`
     : null;
   if (!scan.hits.length) {
     const header = `💡 <b>组合价筛选</b> <i>· ${htmlEscape(comboLabel(f))}</i>`;
@@ -5031,8 +5033,8 @@ async function handle(text, state, ctx, chatId, fromId) {
         text: [
           '⏱ <b>时间误差筛选（日期阶梯）</b>',
           '',
-          '早档合理价 ≈ 晚档价 × 剩余时间占比（例：现在离 9/30 的时间是离 12/31 的一半 → 9/30 应约为 12/31 的一半价）。',
-          `列出实际中间价偏离估价 ≥${f.terr}¢ 的相邻日期档 — <b>不受组合价上限限制</b>，定价误差大的也能看到。`,
+          '对冲组合 = 买「早档 否」+ 买「晚档 是」。早档应 ≈ 晚档价 × 剩余时间占比（例：现在离 9/30 的时间是离 12/31 的一半 → 9/30 应约为 12/31 的一半价），所以组合合计估值 = 100 + 晚档价 × (1−占比)。',
+          `列出组合中间价偏离估值 ≥${f.terr}¢ 的相邻日期档 — <b>不受组合价上限限制</b>，定价误差大的也能看到（+偏贵 → 反向 早是+晚否 占优；−偏便宜 → 组合本身划算）。`,
           '',
           `当前设置: <i>${htmlEscape(comboLabel(f))}</i>`,
           '',
