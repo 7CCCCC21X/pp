@@ -315,7 +315,10 @@ test('classifyComboEntry: exposes what the grouper sees for one market', () => {
 
 // Screenshot scenario: Sep 30 mid 8¢, Dec 31 mid 20¢. With `now` chosen so
 // Sep 30 is exactly half as far away as Dec 31, the fair Sep 30 price is
-// 20 × 0.5 = 10¢ — the actual 8¢ is 2¢ cheap.
+// 20 × 0.5 = 10¢. The deviation is expressed on the hedge combo — buy
+// Sep 30 NO + buy Dec 31 YES — whose mid cost is (100−8)+20 = 112¢ vs a
+// time-fair (100−10)+20 = 110¢ → 误差 +2¢ (combo rich; the earlier YES
+// trades 2¢ under fair, so the reverse legs are the better side).
 test('comboPairs: date pair carries time-ratio fair price and signed 误差', () => {
   const [ladder] = buildComboLadders([
     { id: '10', title: '2026年9月30日', question: 'Titan 会在什么时候之前发行代币吗？' },
@@ -335,7 +338,9 @@ test('comboPairs: date pair carries time-ratio fair price and signed 误差', ()
   approx(p.hardMidCents, 8);
   approx(p.easyMidCents, 20);
   approx(p.fairHardCents, 10);
-  approx(p.timeErrCents, -2); // 早档偏便宜 2¢
+  approx(p.midCostCents, 112);  // 早档否 92 + 晚档是 20, at mids
+  approx(p.fairCostCents, 110); // (100 − 10) + 20
+  approx(p.timeErrCents, 2);    // 组合偏贵 2¢ ⟺ 早档 YES 低于估价 2¢
 });
 
 test('comboPairs: money pairs have no time-ratio model', () => {
