@@ -52,6 +52,7 @@ const PRIVATE_MENU = [
   { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
   { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
   { command: 'combo', description: '相邻档组合价筛选（筛选向导含日期档时间误差：早档应≈晚档×剩余时间占比，偏离大的也能查看；🚀 实时重抓订单簿，结果分页；/combo check <URL|id> 诊断）' },
+  { command: 'timeerr', description: '日期档时间误差快捷入口（早档应≈晚档价×剩余时间占比，列出偏离 ≥N¢ 的，默认 ≥2¢；/timeerr 1 调阈值）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -104,6 +105,9 @@ function menuKeyboard({ isPrivate = true } = {}) {
           { text: '📈 PP 变动', callback_data: '/movers' },
           { text: '⚠️ 定价异常', callback_data: '/sanity' },
           { text: '💡 组合价', callback_data: '/combo' },
+        ],
+        [
+          { text: '⏱ 时间误差', callback_data: '/timeerr' },
           { text: '⏱ 摘要设置', callback_data: '/hourly' },
         ],
         [
@@ -135,6 +139,7 @@ function menuKeyboard({ isPrivate = true } = {}) {
         { text: '💡 组合价', callback_data: '/combo' },
       ],
       [
+        { text: '⏱ 时间误差', callback_data: '/timeerr' },
         { text: '⏱ 摘要设置', callback_data: '/hourly' },
       ],
       // 👁 监控管理
@@ -169,7 +174,7 @@ function menuText({ isPrivate = true } = {}) {
     return [
       '<b>快捷菜单</b>',
       '',
-      '🔍 <b>找机会</b>: 阔差 / 紧差 / 空簿 / 停滞 / 全部 / 组合价 / 自定义筛',
+      '🔍 <b>找机会</b>: 阔差 / 紧差 / 空簿 / 停滞 / 全部 / 组合价 / 时间误差 / 自定义筛',
       '📡 <b>查看</b>: 状态 / 24h 摘要 / 当前配置',
       '<i>群里按钮只放只读浏览。改阈值/订阅请去私聊。</i>',
     ].join('\n');
@@ -177,7 +182,7 @@ function menuText({ isPrivate = true } = {}) {
   return [
     '<b>快捷菜单</b>',
     '',
-    '🔍 <b>机会找寻</b>: 阔差 / 紧差 / 空簿 / 停滞 / 全部 / 组合价 / 自定义筛',
+    '🔍 <b>机会找寻</b>: 阔差 / 紧差 / 空簿 / 停滞 / 全部 / 组合价 / 时间误差 / 自定义筛',
     '👁 <b>监控管理</b>: 状态 / 刷新 / 自动发现',
     '📸 <b>单市场</b>: 直接粘 URL 或 #id 进来 → 出操作菜单',
     '⚙️ <b>设置</b>: 提醒类型 / 过滤器 / 配置',
@@ -2767,7 +2772,8 @@ const HELP = [
   '/movers — PP/h 变动的市场（默认近 1h；底部按钮切换 30m/1h/3h/6h/12h/1d；显示 旧→新 费率 + 涨跌）',
   '/sanity（/arb）— 定价异常的阈值阶梯（如市值 30亿/40亿/50亿；相邻档差 ≤ PRICE_SANITY_MARGIN 即列出，按锁定套利金额排序，全部展开）。/sanity ext 94 排除已决极端价 · /sanity ext off 关闭 · /sanity unmute all 解除静音',
   '/ladders — 全部识别到的阈值阶梯（含定价正常的，便于核对自动分组是否准确）',
-  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt;（或直接 /combo 贴市场链接）诊断某市场：是否在扫描范围、门槛是否解析成功、归入哪个阶梯、邻档是谁、实时组合价是否过线，每步给出 ✅/❌ 和原因',
+  '/combo — 相邻档组合价筛选：FDV/市值阶梯找「低档 是 + 高档 否」、发币日期阶梯找「早档 否 + 晚档 是」，两腿合计 &lt; 110¢ 即列出（中间区间命中赚 200−成本，落空最多亏 成本−100）。先筛选再查询：/combo 直接打开筛选向导（同 /tight 交互）：组合价上限 × 阶梯类型(全部/金额/日期) × 最低可成交股数 × 极端价(排除/仅 任一腿 ≥85¢ 这类已决档，按实时盘口判断) × 时间误差(日期档：早档应≈晚档中间价×剩余时间占比，开启后按偏离 ≥N¢ 判定、不受上限约束，误差大的也能查看) × 排序(组合价/股数/区间盈利额/可对冲额度/停滞时长/时间误差；可对冲额度=沿两腿多档深度、组合价仍低于上限的可成交金额)，上限/股数/极端价/时间误差都可点 ✏ 回复数字自定义；点 🚀 实时重抓订单簿查询，结果分页（⬅️➡️ 翻页不重抓，重新报价再点 🚀）。/combo 105 预设上限 · /combo set 108 保存默认 · /combo check &lt;URL|id&gt;（或直接 /combo 贴市场链接）诊断某市场：是否在扫描范围、门槛是否解析成功、归入哪个阶梯、邻档是谁、实时组合价是否过线，每步给出 ✅/❌ 和原因',
+  '/timeerr — 日期档时间误差快捷入口：/combo 向导预设「日期阶梯 + 时间误差 ≥2¢ + 按误差排序」，一键 🚀 就能扫。/timeerr 1 改最低误差',
   '/opportunities — 机会评分（实验）',
   '',
   '<b>🎯 单市场操作</b>',
@@ -5005,6 +5011,39 @@ async function handle(text, state, ctx, chatId, fromId) {
       return {
         text: comboWizardText(f),
         replyMarkup: comboWizardKeyboard(f, state.customExtPresets),
+      };
+    }
+
+    case '/timeerr': {
+      // Quick-menu shortcut into the /combo wizard pre-set for the date
+      // time-error screen: date ladders only, 时间误差 filter on, sorted by
+      // deviation. One 🚀 tap away from the scan; optional arg tunes the
+      // minimum error (e.g. /timeerr 1).
+      const f = { ...comboDefaultFilter(state), kind: 'date', sort: 'terr', terr: '2' };
+      if (arg) {
+        const n = normalizeComboTerr(arg.trim());
+        if (n == null || n === 'off') {
+          return `用法：/timeerr 打开时间误差筛选（默认 ≥${f.terr}¢） · /timeerr 1.5 设最低误差（范围 ${COMBO_TERR_MIN}-${COMBO_TERR_MAX}¢）。`;
+        }
+        f.terr = n;
+      }
+      return {
+        text: [
+          '⏱ <b>时间误差筛选（日期阶梯）</b>',
+          '',
+          '早档合理价 ≈ 晚档价 × 剩余时间占比（例：现在离 9/30 的时间是离 12/31 的一半 → 9/30 应约为 12/31 的一半价）。',
+          `列出实际中间价偏离估价 ≥${f.terr}¢ 的相邻日期档 — <b>不受组合价上限限制</b>，定价误差大的也能看到。`,
+          '',
+          `当前设置: <i>${htmlEscape(comboLabel(f))}</i>`,
+          '',
+          '<i>点 🚀 实时重抓订单簿并筛选（可能耗时几十秒）；🎚 可继续调档。/timeerr 1 可改最低误差。</i>',
+        ].join('\n'),
+        replyMarkup: {
+          inline_keyboard: [[
+            { text: '🚀 立即扫描', callback_data: comboCb('run', f) },
+            { text: '🎚 调整设置', callback_data: comboCb('wizard', f) },
+          ]],
+        },
       };
     }
 
