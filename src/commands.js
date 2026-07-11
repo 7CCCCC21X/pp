@@ -51,7 +51,7 @@ const PRIVATE_MENU = [
   { command: 'movers', description: 'PP/h 变动的市场（默认近 1h；底部可调时间窗口）' },
   { command: 'sanity', description: '定价异常的阈值阶梯（门槛越高概率却没更低；按套利金额排序）' },
   { command: 'ladders', description: '全部识别到的阈值阶梯（含定价正常的，便于核对分组）' },
-  { command: 'combo', description: '相邻档组合价筛选（先开筛选向导，🚀 实时重抓订单簿查询，结果分页；/combo check <URL|id> 诊断市场为何未被识别）' },
+  { command: 'combo', description: '相邻档组合价筛选（筛选向导含日期档时间误差：早档应≈晚档×剩余时间占比，偏离大的也能查看；🚀 实时重抓订单簿，结果分页；/combo check <URL|id> 诊断）' },
   { command: 'probe', description: '单个市场快照 (用法: /probe <id>)' },
   { command: 'watch', description: '密集追踪某市场 (用法: /watch <id>)' },
   { command: 'watched', description: '列出当前所有 /watch 追踪的市场' },
@@ -3970,7 +3970,15 @@ function formatComboPair(pair, state, { showStall = false, showHedge = false } =
   const outcome = pure
     ? `纯套利：稳赚 ≥${(100 - pair.costCents).toFixed(1)}¢/股，中间区间赚 ${pair.bandWinCents.toFixed(1)}¢/股${size}${hedge}${stall}`
     : `中间区间命中赚 ${pair.bandWinCents.toFixed(1)}¢/股 · 落空亏 ${pair.maxLossCents.toFixed(1)}¢/股${size}${hedge}${stall}`;
-  return `${head}\n   ${legs}\n   ${outcome}`;
+  // Date pairs carry the time-proportional fair-price model: the earlier
+  // rung "should" trade at 晚档中间价 × 剩余时间占比; show the deviation.
+  const timeLine = Number.isFinite(pair.timeErrCents)
+    ? `\n   ⏱ 时间比价: 早档 ${pair.hardMidCents.toFixed(1)}¢ vs 估价 ≈${pair.fairHardCents.toFixed(1)}¢`
+      + `（晚档 ${pair.easyMidCents.toFixed(1)}¢ × 剩余时间 ${(pair.timeRatio * 100).toFixed(0)}%）`
+      + ` · 误差 <b>${pair.timeErrCents >= 0 ? '+' : ''}${pair.timeErrCents.toFixed(1)}¢</b>`
+      + `（早档偏${pair.timeErrCents >= 0 ? '贵' : '便宜'}）`
+    : '';
+  return `${head}\n   ${legs}\n   ${outcome}${timeLine}`;
 }
 
 // ===================== /combo custom wizard =====================
@@ -4017,9 +4025,17 @@ const COMBO_SORTS = [
   ['usd', '区间盈利额'],
   ['hedge', '可对冲额度'],
   ['stale', '停滞时长'],
+  ['terr', '时间误差'],
 ];
 const COMBO_CAP_MIN = 50;
 const COMBO_CAP_MAX = 199.9;
+// ⏱ 时间误差 (date ladders only): minimum |actual − time-proportional fair
+// price| of the earlier rung, in cents. 'off' = knob disabled. Encoded in
+// callback_data as 'off' / 'e<N>' — the 'e' prefix keeps legacy callbacks
+// (whose page number sat in this slot) unambiguous.
+const COMBO_TERR_PRESETS = ['1', '2', '3', '5'];
+const COMBO_TERR_MIN = 0.1;
+const COMBO_TERR_MAX = 50;
 
 // Canonical cents string for a cap value; junk / out-of-range → null.
 function normalizeComboCap(raw) {
@@ -4034,13 +4050,30 @@ function isCustomComboMinSh(s) {
   return s > 0 && !COMBO_MINSH_PRESETS.includes(s);
 }
 
+// Canonical 时间误差 value ('off' or a cents string like '2' / '2.5') from a
+// stored value or an 'e'-prefixed callback token; junk / out-of-range → null.
+function normalizeComboTerr(raw) {
+  if (raw == null) return null;
+  const s = String(raw);
+  if (s === 'off') return 'off';
+  const v = Number(s.startsWith('e') ? s.slice(1) : s);
+  if (!Number.isFinite(v) || v < COMBO_TERR_MIN || v > COMBO_TERR_MAX) return null;
+  return String(Number(v.toFixed(1)));
+}
+function comboTerrOf(f) {
+  return normalizeComboTerr(f?.terr) ?? 'off';
+}
+function isCustomComboTerr(t) {
+  return t !== 'off' && !COMBO_TERR_PRESETS.includes(String(t));
+}
+
 function comboDefaultFilter(state) {
   const cap = normalizeComboCap(state?.comboMaxCents) ?? '110';
-  return { cap, kind: 'all', minSh: 0, sort: 'cost', ext: 'off' };
+  return { cap, kind: 'all', minSh: 0, sort: 'cost', ext: 'off', terr: 'off' };
 }
 
 export function parseComboFilter(parts, state) {
-  // [ 'combo', action, cap, kind, minSh, sort, ext, page ]
+  // [ 'combo', action, cap, kind, minSh, sort, ext, terr, page ]
   const d = comboDefaultFilter(state);
   const cap = normalizeComboCap(parts[2]) ?? d.cap;
   const kind = COMBO_KIND_OPTS.some(([k]) => k === parts[3]) ? parts[3] : d.kind;
@@ -4048,12 +4081,18 @@ export function parseComboFilter(parts, state) {
     ? Math.floor(Number(parts[4])) : d.minSh;
   const sort = COMBO_SORTS.some(([k]) => k === parts[5]) ? parts[5] : d.sort;
   const ext = normalizeExt(parts[6]);
-  const page = Math.max(0, Number(parts[7]) || 0);
-  return { cap, kind, minSh, sort, ext, page };
+  // Legacy pre-terr callbacks carried the page number at index 7; terr
+  // tokens are 'off' / 'e<N>' so the two can't collide.
+  const hasTerr = parts[7] === 'off' || /^e/.test(parts[7] ?? '');
+  const terr = hasTerr ? (normalizeComboTerr(parts[7]) ?? 'off') : d.terr;
+  const page = Math.max(0, Number(parts[hasTerr ? 8 : 7]) || 0);
+  return { cap, kind, minSh, sort, ext, terr, page };
 }
 
 function comboCb(action, f, page = 0) {
-  return `combo:${action}:${f.cap}:${f.kind}:${f.minSh}:${f.sort}:${normalizeExt(f.ext)}:${page}`;
+  const terr = comboTerrOf(f);
+  return `combo:${action}:${f.cap}:${f.kind}:${f.minSh}:${f.sort}:${normalizeExt(f.ext)}`
+    + `:${terr === 'off' ? 'off' : `e${terr}`}:${page}`;
 }
 
 function comboKindLabel(kind) {
@@ -4064,14 +4103,17 @@ function comboSortLabel(sort) {
 }
 
 function comboLabel(f) {
+  const terr = comboTerrOf(f);
   return `上限 <${f.cap}¢ · ${comboKindLabel(f.kind)}`
     + (f.minSh > 0 ? ` · 可成交 ≥${fmtSharesShort(f.minSh)}股` : '')
     + (extFilterActive(f.ext) ? ` · ${extLabel(f.ext)}` : '')
+    + (terr !== 'off' ? ` · 时间误差 ≥${terr}¢` : '')
     + ` · 排序 ${comboSortLabel(f.sort)}`;
 }
 
 function comboWizardText(f) {
   const tag = (on) => on ? ' <i>(自定义)</i>' : '';
+  const terr = comboTerrOf(f);
   return [
     '💡 <b>组合价筛选 · 自定义</b>',
     '',
@@ -4079,12 +4121,14 @@ function comboWizardText(f) {
     `🪜 阶梯类型: <b>${comboKindLabel(f.kind)}</b>`,
     `🔢 最低可成交股数: <b>${f.minSh > 0 ? fmtSharesShort(f.minSh) : '不限'}</b>${tag(isCustomComboMinSh(f.minSh))}`,
     `📈 极端价: <b>${extLabel(f.ext)}</b>${tag(isCustomExt(f.ext))}`,
+    `⏱ 时间误差(日期档): <b>${terr === 'off' ? '关' : `≥${terr}¢`}</b>${tag(isCustomComboTerr(terr))}`,
     `📊 排序: <b>${comboSortLabel(f.sort)}</b>`,
     '',
     '<i>组合 = 金额阶梯买「低档 是 + 高档 否」，日期阶梯买「早档 否 + 晚档 是」。两腿合计 &lt;100¢ 为纯套利；100~上限 之间是低风险中间区间打法（命中赚 200−成本，落空亏 成本−100）。</i>',
     '<i>可成交股数 = 两腿顶档挂单量的较小值；可对冲额度 = 沿两腿多档深度撮合、组合价仍低于上限的总可成交量（股数×两腿合计价，$）——按它排序能找到吃得下大仓位的组合。</i>',
     '<i>极端价 = 按刚重抓的盘口判断：排除 ≥85¢ 会剔除任一腿基本已决（一边 ≥85¢ 或 ≤15¢）的组合；仅 ≥85¢ 则只看这类组合。</i>',
-    '<i>💵/🔢/📈 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99 或区间如 85-96）。</i>',
+    '<i>时间误差 = 只看日期阶梯：按剩余时间比例估早档合理价（早档 ≈ 晚档价 × 剩余时间占比 — 比如现在离 9/30 的时间是离 12/31 的一半，9/30 就应约为 12/31 的一半价）。开启后列出实际中间价偏离估价 ≥N¢ 的相邻档，且<b>不受组合价上限限制</b>，定价误差大的也能看到。</i>',
+    '<i>💵/🔢/📈/⏱ 可自定义：点该行的 ✏ 后在本 chat 回复一个数字（上限填 ¢ 可带小数，股数填整数，极端价填 1-99 或区间如 85-96，时间误差填 ¢ 可带小数）。</i>',
     '<i>点 🚀 会实时重抓所有阶梯市场的订单簿再筛选，可能耗时几十秒。</i>',
   ].join('\n');
 }
@@ -4096,6 +4140,11 @@ export function comboWizardKeyboard(f, customExtPresets = []) {
   const shMark = (s) => s === f.minSh ? `✅ ${shLabel(s)}` : shLabel(s);
   const sortMark = ([k, label]) => k === f.sort ? `✅ ${label}` : label;
   const extKey = normalizeExt(f.ext);
+  const terrKey = comboTerrOf(f);
+  const terrMark = (t) => {
+    const label = t === 'off' ? '关' : `≥${t}¢`;
+    return t === terrKey ? `✅ ${label}` : label;
+  };
   const custBtn = (active, label, action) => ({
     text: active ? `✅ ✏${label}` : '✏', callback_data: comboCb(action, f),
   });
@@ -4132,10 +4181,18 @@ export function comboWizardKeyboard(f, customExtPresets = []) {
       ],
       [{ text: '— 📈 极端价 (排除/仅 已决档位) —', callback_data: 'page:noop' }],
       ...extRows,
+      [{ text: '— ⏱ 时间误差 (日期档 实际vs按剩余时间估价) —', callback_data: 'page:noop' }],
+      [
+        { text: terrMark('off'), callback_data: comboCb('set', { ...f, terr: 'off' }) },
+        ...COMBO_TERR_PRESETS.map((t) => ({
+          text: terrMark(t), callback_data: comboCb('set', { ...f, terr: t }),
+        })),
+        custBtn(isCustomComboTerr(terrKey), `≥${terrKey}¢`, 'cust-terr'),
+      ],
       [{ text: '— 📊 排序 —', callback_data: 'page:noop' }],
-      COMBO_SORTS.map((pair) => ({
+      ...chunk(COMBO_SORTS, 3).map((row) => row.map((pair) => ({
         text: sortMark(pair), callback_data: comboCb('set', { ...f, sort: pair[0] }),
-      })),
+      }))),
       [
         { text: '🚀 应用(重抓盘口)', callback_data: comboCb('run', f) },
         { text: '✖ 取消', callback_data: comboCb('cancel', f) },
@@ -4212,8 +4269,9 @@ async function runComboScan(f, state) {
   }
   const ids = [...new Set(ladders.flatMap((l) => l.rungs.map((r) => String(r.id))))];
   const { books, failed } = await fetchFreshBooks(ids, state);
-  // capCents lets comboPairs walk multi-level depth for the 可对冲额度 metric.
-  let pairs = ladders.flatMap((l) => comboPairs(l, books, { capCents: Number(f.cap) }));
+  // capCents lets comboPairs walk multi-level depth for the 可对冲额度 metric;
+  // nowMs anchors the date pairs' time-proportional fair-price model.
+  let pairs = ladders.flatMap((l) => comboPairs(l, books, { capCents: Number(f.cap), nowMs: Date.now() }));
   if (f.minSh > 0) pairs = pairs.filter((p) => p.size >= f.minSh);
   if (extFilterActive(f.ext)) pairs = pairs.filter((p) => comboPairPassesExt(p, books, f.ext));
   // Pair stall = the shorter of the two legs' stall durations — how long
@@ -4224,12 +4282,19 @@ async function runComboScan(f, state) {
   }
   pairs.sort((a, b) => a.costCents - b.costCents);
   const cap = Number(f.cap);
-  const hits = pairs.filter((p) => p.costCents < cap);
+  const terr = comboTerrOf(f);
+  // 时间误差 mode replaces the cost-cap gate: a date pair qualifies by its
+  // mispricing vs the time-proportional fair value alone, so pairs whose
+  // combined cost sits above the cap (误差大的) are still listed.
+  const hits = terr !== 'off'
+    ? pairs.filter((p) => Number.isFinite(p.timeErrCents) && Math.abs(p.timeErrCents) >= Number(terr))
+    : pairs.filter((p) => p.costCents < cap);
   const sortVal = (p) => {
     if (f.sort === 'size') return p.size;
     if (f.sort === 'usd') return p.size * p.bandWinCents;
     if (f.sort === 'hedge') return p.hedgeUsd ?? 0;
     if (f.sort === 'stale') return p.stallMs;
+    if (f.sort === 'terr') return Number.isFinite(p.timeErrCents) ? Math.abs(p.timeErrCents) : -1;
     return -p.costCents;
   };
   if (f.sort !== 'cost') hits.sort((a, b) => sortVal(b) - sortVal(a));
@@ -4403,15 +4468,24 @@ function renderComboResult(f, state, scan, page = 0) {
     };
   }
   const freshTag = `已实时重抓 ${scan.booksCount} 个盘口${scan.failed ? `（失败 ${scan.failed}）` : ''}`;
+  const terr = comboTerrOf(f);
+  // 时间误差 mode judges pairs by |实际 − 时间比例估价| instead of the cost cap.
+  const terrNote = terr !== 'off'
+    ? `⏱ 时间误差模式：只看日期档，早档偏离「晚档中间价 × 剩余时间占比」≥${terr}¢ 即列出（不受组合价上限约束）`
+    : null;
   if (!scan.hits.length) {
     const header = `💡 <b>组合价筛选</b> <i>· ${htmlEscape(comboLabel(f))}</i>`;
-    const lines = [header, `${freshTag}`, '', `没有符合条件的相邻档组合。`];
-    const nearest = scan.pairs.slice(0, 3);
+    const lines = [header, `${freshTag}`, ...(terrNote ? [terrNote] : []), '', `没有符合条件的相邻档组合。`];
+    // In 时间误差 mode "closest" means largest deviation, not lowest cost.
+    const nearest = terr !== 'off'
+      ? scan.pairs.filter((p) => Number.isFinite(p.timeErrCents))
+        .sort((a, b) => Math.abs(b.timeErrCents) - Math.abs(a.timeErrCents)).slice(0, 3)
+      : scan.pairs.slice(0, 3);
     if (nearest.length) {
       lines.push('', '<b>最接近的组合（参考）</b>');
       for (const p of nearest) lines.push(formatComboPair(p, state), '');
     } else {
-      lines.push('放宽上限 / 类型 / 最低股数再试。');
+      lines.push(terr !== 'off' ? '没有可估时间比价的日期相邻档（需两档截止都在未来且两腿盘口双边有价）。' : '放宽上限 / 类型 / 最低股数再试。');
     }
     return { text: lines.join('\n').trim(), replyMarkup: { inline_keyboard: [wizardRow] } };
   }
@@ -4421,6 +4495,7 @@ function renderComboResult(f, state, scan, page = 0) {
   const lines = [
     `💡 <b>组合价筛选 (${scan.hits.length})</b> <i>· ${htmlEscape(comboLabel(f))}</i>`,
     `${freshTag} · 💰=金额（低档是+高档否） · 📅=日期（早档否+晚档是） · 🔥=合计&lt;100¢ 纯套利`,
+    ...(terrNote ? [terrNote] : []),
     '',
   ];
   const showStall = f.sort === 'stale';
@@ -4471,15 +4546,17 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
   // ✏ on a knob: stash pending input; the next plain number the user sends
   // in this chat is applied to that field (see the message loop).
   if (action.startsWith('cust-')) {
-    const field = action.slice('cust-'.length); // cap | minsh | ext
+    const field = action.slice('cust-'.length); // cap | minsh | ext | terr
     setPendingFilterInput(chatId, fromId, {
       kind: 'combo', field,
-      cap: f.cap, comboKind: f.kind, minSh: f.minSh, sort: f.sort, ext: f.ext, messageId,
+      cap: f.cap, comboKind: f.kind, minSh: f.minSh, sort: f.sort, ext: f.ext,
+      terr: comboTerrOf(f), messageId,
     });
     const prompts = {
       cap: '组合价上限 ¢，可带小数（例 107.5 = 两腿合计 <107.5¢ 才列出；范围 50-199.9）',
       minsh: '最低可成交股数，整数（例 200；0 = 不限）',
       ext: `极端价百分位 1-99（例 85 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'}任一腿 ≥85¢ / ≤15¢ 的组合；也可回复区间如 85-96；想换模式先点对应的 排除/仅 按钮）`,
+      terr: `时间误差 ¢，可带小数（例 2 = 日期相邻档中，早档实际价偏离「晚档价 × 剩余时间占比」≥2¢ 才列出；范围 ${COMBO_TERR_MIN}-${COMBO_TERR_MAX}，非数字 = 关）`,
     };
     const hint = [
       '💡 <b>组合价筛选 · 等待自定义…</b>',
@@ -5693,17 +5770,20 @@ export function startCommandLoop({ getState, persist, ctx }) {
                   warn(`tight custom-input apply edit failed: ${err.message}`);
                 }
               } else if (pending.kind === 'combo') {
-                // /combo wizard. pending.field = cap | minsh | ext. cap accepts
-                // decimals (e.g. 107.5¢); junk falls back to the default.
+                // /combo wizard. pending.field = cap | minsh | ext | terr. cap
+                // and terr accept decimals; junk falls back to default / off.
                 const f = {
                   cap: pending.cap, kind: pending.comboKind,
                   minSh: pending.minSh, sort: pending.sort, ext: pending.ext,
+                  terr: pending.terr ?? 'off',
                 };
                 const decOk = /^\d+(\.\d+)?$/.test(trimmed);
                 if (pending.field === 'cap') {
                   f.cap = (decOk ? normalizeComboCap(trimmed) : null) ?? comboDefaultFilter(state).cap;
                 } else if (pending.field === 'minsh') {
                   f.minSh = (num != null && num > 0) ? num : 0; // 0/junk → 不限
+                } else if (pending.field === 'terr') {
+                  f.terr = (decOk ? normalizeComboTerr(trimmed) : null) ?? 'off';
                 } else if (pending.field === 'ext') {
                   // "88" or a band like "85-96", each side 1-99; preserves the
                   // current mode (排除/仅). Junk → off.
