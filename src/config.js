@@ -93,6 +93,11 @@ export const config = {
   marketIds: csv('MARKET_IDS'),
 
   pollIntervalMs: num('POLL_INTERVAL_MS', 5 * 60 * 1000),
+  // How many markets checkMarket() polls concurrently per tick. The
+  // on-demand refetch paths already run 3-6 wide; the tick loop uses the
+  // same order of magnitude so a 200-market pool finishes well inside the
+  // poll interval instead of serializing 400+ HTTP round trips.
+  monitorConcurrency: num('MONITOR_CONCURRENCY', 6),
 
   // Stall alert
   alertStall: bool('ALERT_STALL', true),
@@ -274,6 +279,7 @@ export function validateConfig() {
   }
   if (config.staleHours <= 0) errors.push('STALE_HOURS must be > 0');
   if (config.pollIntervalMs < 5_000) errors.push('POLL_INTERVAL_MS must be >= 5000');
+  if (config.monitorConcurrency < 1) errors.push('MONITOR_CONCURRENCY must be >= 1');
   if (config.digestHourUtc < 0 || config.digestHourUtc > 23) {
     errors.push('DAILY_DIGEST_HOUR_UTC must be 0..23');
   }

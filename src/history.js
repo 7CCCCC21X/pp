@@ -3,10 +3,37 @@ import readline from 'node:readline';
 import { createReadStream } from 'node:fs';
 import { config } from './config.js';
 
-export async function appendHistory(record) {
-  if (!config.historyEnabled) return;
-  const line = JSON.stringify({ ts: Date.now(), ...record }) + '\n';
-  await fs.appendFile(config.historyFile, line);
+// Appends are coalesced: every record queued during the same event-loop
+// turn (e.g. the per-market 'rate' events of one tick, now fired
+// concurrently by the polling pool) lands in ONE fs.appendFile call
+// instead of one syscall per record. Writes are chained so batches hit
+// the file strictly in order; each caller's promise resolves/rejects
+// with its own batch's outcome.
+let _pendingLines = [];
+let _flushScheduled = null;
+let _writeChain = Promise.resolve();
+
+function scheduleHistoryFlush() {
+  if (_flushScheduled) return _flushScheduled;
+  _flushScheduled = new Promise((resolve, reject) => {
+    setImmediate(() => {
+      const lines = _pendingLines;
+      _pendingLines = [];
+      _flushScheduled = null;
+      _writeChain = _writeChain
+        .then(() => fs.appendFile(config.historyFile, lines.join('')))
+        .then(resolve, reject);
+      // Keep the chain alive after a failed batch.
+      _writeChain = _writeChain.catch(() => {});
+    });
+  });
+  return _flushScheduled;
+}
+
+export function appendHistory(record) {
+  if (!config.historyEnabled) return Promise.resolve();
+  _pendingLines.push(JSON.stringify({ ts: Date.now(), ...record }) + '\n');
+  return scheduleHistoryFlush();
 }
 
 export async function readHistorySince(sinceMs) {

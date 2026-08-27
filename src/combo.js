@@ -124,23 +124,44 @@ const PARSERS = [
 // null when neither a monetary nor a date threshold parses out of either
 // text. Exported for /combo check so a diagnosis can show exactly what the
 // grouper sees for one market.
+// Market text never changes, so classification is memoized by
+// title+question. The default year feeds date parsing, so it's part of the
+// key (a year rollover naturally invalidates old entries). Bounded so a
+// long-running process over churning markets can't grow it forever.
+const _classifyCache = new Map();
+const CLASSIFY_CACHE_MAX = 4000;
+
 export function classifyComboEntry(e) {
   if (!e) return null;
   const texts = [];
   if (e.question) texts.push(String(e.question));
   if (e.title && String(e.title) !== String(e.question ?? '')) texts.push(String(e.title));
   if (!texts.length) return null;
+  const cacheKey = `${new Date().getUTCFullYear()}|${texts.join('\u0000')}`;
+  if (_classifyCache.has(cacheKey)) return _classifyCache.get(cacheKey);
+  let result = null;
   for (const { kind, parse, directionOf } of PARSERS) {
-    for (const t of texts) {
-      const parsed = parse(t);
+    // Parse each text once per parser — the loop below reuses the result
+    // both as the threshold source and for the "other text has no
+    // same-kind threshold" context test.
+    const parsedByText = texts.map((t) => parse(t));
+    for (let i = 0; i < texts.length; i++) {
+      const parsed = parsedByText[i];
       if (!parsed) continue;
+      const t = texts[i];
       let context = ladderContext(t, parsed);
-      const other = texts.find((x) => x !== t);
-      if (other && !parse(other)) context += ` § ${other}`;
-      return { kind, context, direction: directionOf(t), value: parsed.value, raw: parsed.raw };
+      const otherIdx = i === 0 ? 1 : 0;
+      if (otherIdx < texts.length && !parsedByText[otherIdx]) {
+        context += ` § ${texts[otherIdx]}`;
+      }
+      result = { kind, context, direction: directionOf(t), value: parsed.value, raw: parsed.raw };
+      break;
     }
+    if (result) break;
   }
-  return null;
+  if (_classifyCache.size >= CLASSIFY_CACHE_MAX) _classifyCache.clear();
+  _classifyCache.set(cacheKey, result);
+  return result;
 }
 
 export function buildComboLadders(entries) {

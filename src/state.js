@@ -73,7 +73,18 @@ export async function loadState() {
 
 export async function saveState(state) {
   const tmp = `${config.stateFile}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2));
+  // Compact JSON (no pretty-print) — the file is written every tick and
+  // every command; with hundreds of market slots the indentation roughly
+  // doubles both the stringify cost and the bytes written.
+  // `recentBook` is deliberately dropped: it's the multi-level book from
+  // the most recent wizard refetch, only meaningful for minutes, and at
+  // ORDERBOOK_DEPTH×2 rows per market it dominates the file size. It
+  // stays in memory; a restart just means depth filters wait for the
+  // next 🚀 refetch, which they'd need for fresh prices anyway.
+  const json = JSON.stringify(state, (key, value) => (
+    key === 'recentBook' ? undefined : value
+  ));
+  await fs.writeFile(tmp, json);
   await fs.rename(tmp, config.stateFile);
 }
 
@@ -195,6 +206,18 @@ export function recordMarketFirstSeen(state, markets) {
     };
     if (!bootstrap) added += 1;
   }
+  state.marketFirstSeen = map;
+  const pruned = pruneMarketFirstSeen(state, now);
+  return { added, pruned };
+}
+
+// Drop first-seen entries older than 14d (keeping the ms=0 bootstrap
+// sentinels). Called both from recordMarketFirstSeen and from the tick
+// loop directly — if discovery is disabled or keeps failing, the map
+// must still shrink over time.
+export function pruneMarketFirstSeen(state, now = Date.now()) {
+  const map = state.marketFirstSeen;
+  if (!map) return 0;
   const cutoff = now - 14 * 24 * 3600 * 1000;
   let pruned = 0;
   for (const [id, info] of Object.entries(map)) {
@@ -205,8 +228,7 @@ export function recordMarketFirstSeen(state, markets) {
       pruned += 1;
     }
   }
-  state.marketFirstSeen = map;
-  return { added, pruned };
+  return pruned;
 }
 
 export function activeMarketIds(state) {

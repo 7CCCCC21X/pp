@@ -376,17 +376,17 @@ export async function refreshAllCaches() {
   let markets = [];
   let slugCount = 0;
   let error = null;
-  try {
-    markets = await getAllMarketsCached();
-  } catch (err) {
-    error = err.message;
-  }
-  try {
-    const map = await getSlugMapCached();
-    slugCount = map.size;
-  } catch (err) {
-    if (!error) error = err.message;
-  }
+  // The two caches hit independent endpoints (GraphQL vs REST) — refresh
+  // them in parallel so /refresh's elapsed time is the slower of the two,
+  // not their sum.
+  const [marketsRes, slugRes] = await Promise.allSettled([
+    getAllMarketsCached(),
+    getSlugMapCached(),
+  ]);
+  if (marketsRes.status === 'fulfilled') markets = marketsRes.value;
+  else error = marketsRes.reason?.message ?? String(marketsRes.reason);
+  if (slugRes.status === 'fulfilled') slugCount = slugRes.value.size;
+  else if (!error) error = slugRes.reason?.message ?? String(slugRes.reason);
   // Also clear the per-market REST cache so fresh slug lookups don't
   // serve stale data on next tick.
   _restMarketCache.clear();
@@ -413,11 +413,6 @@ export async function getAllMarketsCached() {
     _cache.inFlight = null;
   });
   return _cache.inFlight;
-}
-
-export async function getMarketById(id) {
-  await getAllMarketsCached();
-  return _cache.byId?.get(String(id)) ?? null;
 }
 
 // Look up a market without triggering a full list scan. Returns the cached
@@ -486,6 +481,22 @@ export async function getSlugMapCached() {
 // can fall back to the bulk slug map / title slugify chain.
 const _restMarketCache = new Map();   // id -> { market, at }
 const _restMarketInflight = new Map(); // id -> Promise
+// Entries were TTL-checked on read but never evicted, so a long-running
+// process accumulated full REST market objects forever. Cap the map and
+// sweep expired entries on insert.
+const REST_MARKET_CACHE_MAX = 500;
+
+function pruneRestMarketCache() {
+  const now = Date.now();
+  const ttl = config.marketsCacheTtlMs;
+  for (const [k, v] of _restMarketCache) {
+    if (now - v.at >= ttl) _restMarketCache.delete(k);
+  }
+  // Still over cap after dropping expired → evict oldest inserts.
+  while (_restMarketCache.size >= REST_MARKET_CACHE_MAX) {
+    _restMarketCache.delete(_restMarketCache.keys().next().value);
+  }
+}
 
 export async function getMarketRestById(id) {
   const key = String(id);
@@ -504,6 +515,7 @@ export async function getMarketRestById(id) {
       const data = json?.data ?? json;
       const market = Array.isArray(data) ? data[0] : data;
       if (market?.id != null) {
+        pruneRestMarketCache();
         _restMarketCache.set(key, { market, at: Date.now() });
         return market;
       }
@@ -544,34 +556,36 @@ export async function resolveUrlSlugToMarkets(slug, slugifier) {
   const all = await getAllMarketsCached();
   const seen = new Set();
   const matches = [];
+  const toMatch = (m) => ({
+    id: String(m.id),
+    title: m.title ?? null,
+    question: m.question ?? null,
+    rate: extractHourlyRate(m),
+    endMs: marketEndMs(m),
+  });
+  // Slugify each market's title/question exactly once — the four match
+  // stages below all read from this instead of re-running the slugifier
+  // per stage over the whole list.
+  const slugged = all.map((m) => ({
+    m,
+    id: String(m.id),
+    titleSlug: slugifier(m.title ?? ''),
+    qSlug: slugifier(m.question ?? ''),
+  }));
   // Title slug — wins for single-market URLs where title ≈ URL.
-  for (const m of all) {
-    const titleSlug = slugifier(m.title ?? '');
-    if (titleSlug === slug && !seen.has(String(m.id))) {
-      seen.add(String(m.id));
-      matches.push({
-        id: String(m.id),
-        title: m.title ?? null,
-        question: m.question ?? null,
-        rate: extractHourlyRate(m),
-        endMs: marketEndMs(m),
-      });
+  for (const s of slugged) {
+    if (s.titleSlug === slug && !seen.has(s.id)) {
+      seen.add(s.id);
+      matches.push(toMatch(s.m));
     }
   }
   // Question slug — event-level URLs whose sub-markets share the question
   // text but have bucket-specific titles ($200M / $400M / …).
-  for (const m of all) {
-    if (seen.has(String(m.id))) continue;
-    const qSlug = slugifier(m.question ?? '');
-    if (qSlug === slug) {
-      seen.add(String(m.id));
-      matches.push({
-        id: String(m.id),
-        title: m.title ?? null,
-        question: m.question ?? null,
-        rate: extractHourlyRate(m),
-        endMs: marketEndMs(m),
-      });
+  for (const s of slugged) {
+    if (seen.has(s.id)) continue;
+    if (s.qSlug === slug) {
+      seen.add(s.id);
+      matches.push(toMatch(s.m));
     }
   }
   // REST categorySlug map (capped at ~100 markets).
@@ -580,7 +594,7 @@ export async function resolveUrlSlugToMarkets(slug, slugifier) {
       const slugMap = await getSlugMapCached();
       for (const [id, mappedSlug] of slugMap.entries()) {
         if (mappedSlug !== slug || seen.has(id)) continue;
-        const m = all.find((x) => String(x.id) === id);
+        const m = _cache.byId?.get(id) ?? null;
         seen.add(id);
         matches.push({
           id,
@@ -604,19 +618,12 @@ export async function resolveUrlSlugToMarkets(slug, slugifier) {
     const stripped = slug.replace(/-\d{1,10}$/, '');
     const needle = stripped.split('-').filter(Boolean);
     if (needle.length >= 3) {
-      for (const m of all) {
-        if (seen.has(String(m.id))) continue;
-        const hayQ = slugifier(m.question ?? '').split('-');
-        const hayT = slugifier(m.title ?? '').split('-');
-        if (isTokenSubsequence(needle, hayQ) || isTokenSubsequence(needle, hayT)) {
-          seen.add(String(m.id));
-          matches.push({
-            id: String(m.id),
-            title: m.title ?? null,
-            question: m.question ?? null,
-            rate: extractHourlyRate(m),
-            endMs: marketEndMs(m),
-          });
+      for (const s of slugged) {
+        if (seen.has(s.id)) continue;
+        if (isTokenSubsequence(needle, s.qSlug.split('-'))
+          || isTokenSubsequence(needle, s.titleSlug.split('-'))) {
+          seen.add(s.id);
+          matches.push(toMatch(s.m));
         }
       }
     }
@@ -870,25 +877,4 @@ export async function getOrderbook(orderbookKey, opts = {}) {
     }
   }
   throw new Error(`Orderbook not found for market ${ctxId} (tried ${dedup.length} combos). Last: ${lastErr}`);
-}
-
-// Compatibility shim used by older code paths (rewards.js).
-export async function listMarketsPage(cursor) {
-  const params = new URLSearchParams({ first: '50' });
-  if (cursor) params.set('after', String(cursor));
-  const url = `${config.restUrl}/markets?${params.toString()}`;
-  const res = await fetch(url, { headers: restHeaders() });
-  if (!res.ok) throw new Error(`listMarkets ${res.status}: ${await res.text()}`);
-  const arr = unwrapList(await res.json());
-  const lastId = arr[arr.length - 1]?.id ?? null;
-  return {
-    markets: arr.map((m) => ({
-      id: String(m.id),
-      title: m.title ?? null,
-      status: m.status ?? m.tradingStatus ?? null,
-      raw: m,
-    })),
-    nextCursor: lastId,
-    hasNext: arr.length === 50 && lastId != null,
-  };
 }

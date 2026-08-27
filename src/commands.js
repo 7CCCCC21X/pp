@@ -22,11 +22,37 @@ import {
 } from './state.js';
 import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
-import { getMarketRewardSummary, getOrderbook, resolveSlugToId, getCacheStats, refreshAllCaches } from './predict.js';
+import {
+  getMarketRewardSummary,
+  getOrderbook,
+  resolveSlugToId,
+  resolveUrlSlugToMarkets,
+  getCacheStats,
+  refreshAllCaches,
+  getAllMarketsCached,
+  getSlugMapCached,
+  extractHourlyRate,
+  isMarketTradeable,
+  marketEndMs,
+} from './predict.js';
 import { slugifyMarketTitle } from './format.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
 const warn = (...args) => console.warn(new Date().toISOString(), '[commands]', ...args);
+
+// Edit-in-place with the boilerplate every wizard/pagination handler needs:
+// Telegram rejects an edit whose content is identical ("message is not
+// modified") — that's routine, not an error — while anything else is worth
+// a log line but should never crash the handler.
+async function safeEdit(chatId, messageId, text, replyMarkup, label = 'edit') {
+  try {
+    await editTelegramMessage(chatId, messageId, text, replyMarkup);
+  } catch (err) {
+    if (!/message is not modified/i.test(err.message ?? '')) {
+      warn(`${label} edit failed:`, err.message);
+    }
+  }
+}
 
 // Telegram's blue "/" menu next to the input box. Two scopes so
 // group members don't see admin-only management commands cluttering
@@ -308,7 +334,6 @@ function extractBareMarketId(text) {
 // Looks up a single market id and shows the action card. Used by both
 // the bare-id paste flow and the singleton URL match path.
 async function showActionCardForId(id, state, ctx, chatId) {
-  const { getMarketRewardSummary, marketEndMs } = await import('./predict.js');
   let summary;
   try {
     summary = await getMarketRewardSummary(id);
@@ -335,7 +360,6 @@ async function handleUrlPaste(url, state, ctx, { chatId }) {
     await sendTelegramMessage(`未能从 URL 提取 slug:\n<code>${htmlEscape(url)}</code>`, { chatId });
     return;
   }
-  const { resolveUrlSlugToMarkets } = await import('./predict.js');
   let matches = [];
   try {
     matches = await resolveUrlSlugToMarkets(slug, slugifyMarketTitle);
@@ -380,7 +404,6 @@ export async function handlePickCallback(data, { chatId, messageId, state, fullC
     const id = data.slice('pick:'.length);
     if (!id) return;
     // Look up market metadata for the action card.
-    const { getMarketRewardSummary } = await import('./predict.js');
     let market = { id };
     try {
       const summary = await getMarketRewardSummary(id);
@@ -390,7 +413,7 @@ export async function handlePickCallback(data, { chatId, messageId, state, fullC
           id,
           title: m.title ?? m.question ?? null,
           rate: summary.totalHourlyRate ?? 0,
-          endMs: (await import('./predict.js')).marketEndMs(m),
+          endMs: marketEndMs(m),
         };
       }
     } catch { /* fall back to id-only display */ }
@@ -573,10 +596,13 @@ function passesAdvanced(row, s) {
 }
 
 function sortRowsBy(rows, sortKey) {
+  // Precompute the sort key once per row (decorate-sort) — comparators run
+  // O(n log n) times, and 'score' in particular is not cheap.
+  const now = Date.now();
   const key = (r) => {
     const rate = Number.isFinite(r.rate) ? r.rate : (r.slot?.lastHourlyRate ?? 0);
-    const remH = (Number.isFinite(r.endMs) && r.endMs > Date.now())
-      ? (r.endMs - Date.now()) / 3600000
+    const remH = (Number.isFinite(r.endMs) && r.endMs > now)
+      ? (r.endMs - now) / 3600000
       : null;
     if (sortKey === 'total')  return remH != null ? rate * remH : rate;
     if (sortKey === 'score')  return opportunityScore(r.slot ?? {});
@@ -584,7 +610,8 @@ function sortRowsBy(rows, sortKey) {
     if (sortKey === 'thin')   return -(Number.isFinite(r.slot?.lastTopUsd) ? r.slot.lastTopUsd : Infinity);
     return rate; // 'rate' default
   };
-  return rows.sort((a, b) => key(b) - key(a));
+  for (const r of rows) r._sortKey = key(r);
+  return rows.sort((a, b) => b._sortKey - a._sortKey);
 }
 
 // Run the actual filter query. Mode controls whether matches replace
@@ -592,8 +619,6 @@ function sortRowsBy(rows, sortKey) {
 // advanced knob, source from state.markets (live monitored set);
 // otherwise fall back to GraphQL discovery for the simple PP/h+rem path.
 async function runFilterQuery(s, mode, state, ctx) {
-  const { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } =
-    await import('./predict.js');
   const advanced = isAdvancedQuery(s);
   const cutoff = s.rem > 0 ? Date.now() + s.rem * 3600000 : null;
 
@@ -702,19 +727,7 @@ export async function handleFindWizardCallback(data, { chatId, messageId, state,
 
   if (action === 'set') {
     // Re-render the wizard with updated highlight
-    try {
-      await editTelegramMessage(
-        chatId,
-        messageId,
-        findWizardText(s),
-        findWizardKeyboard(s),
-      );
-    } catch (err) {
-      // Telegram returns 400 if the new content is identical; safe to ignore.
-      if (!/message is not modified/i.test(err.message ?? '')) {
-        warn('wizard edit failed:', err.message);
-      }
-    }
+    await safeEdit(chatId, messageId, findWizardText(s), findWizardKeyboard(s), 'find wizard');
     return true;
   }
   if (action === 'run' || action === 'scan') {
@@ -1083,7 +1096,8 @@ function renderTightResult(f, page, state) {
     if (f.sort === 'stale') return stallDurationMs(r.slot) ?? 0;
     return r.shares;
   };
-  rows.sort((a, b) => sortVal(b) - sortVal(a));
+  for (const r of rows) r._sortKey = sortVal(r);
+  rows.sort((a, b) => b._sortKey - a._sortKey);
 
   const header = `<b>🤏 紧凑盘口</b> <i>· ${htmlEscape(tightLabel(f))}</i>`;
   const wizardRow = [{ text: `🎚 调整设置`, callback_data: tightCb('wizard', f) }];
@@ -1123,10 +1137,7 @@ function renderTightResult(f, page, state) {
   }
   navRows.push(wizardRow);
   const openUrls = items.map((row) => marketUrl(row.id, row.slot?.title, row.slot?.question, row.slot?.slug));
-  const CHUNK = 5;
-  for (let i = 0; i < openUrls.length; i += CHUNK) {
-    navRows.push(openUrls.slice(i, i + CHUNK).map((u, j) => ({ text: `🌐 ${i + j + 1}`, url: u })));
-  }
+  navRows.push(...openUrlRows(openUrls));
   return { text: lines.join('\n'), replyMarkup: { inline_keyboard: navRows } };
 }
 
@@ -1142,68 +1153,55 @@ export async function handleTightWizardCallback(data, { chatId, messageId, fromI
       rememberCustomExtPreset(state, f.ext);
       if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight ext preset persist failed:', err.message));
     }
-    try {
-      await editTelegramMessage(chatId, messageId, tightWizardText(f), tightWizardKeyboard(f, state.customExtPresets));
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) warn('tight wizard edit failed:', err.message);
-    }
+    await safeEdit(chatId, messageId, tightWizardText(f), tightWizardKeyboard(f, state.customExtPresets), 'tight wizard');
     return true;
   }
   // ✏ on any knob: stash a pending-input entry; the next plain number the
   // user sends in this chat is applied to that field (see the message loop).
   if (action.startsWith('cust-')) {
     const field = action.slice('cust-'.length); // gap | minsh | spread | ext
-    setPendingFilterInput(chatId, fromId, {
-      kind: 'tight', field,
-      levels: f.levels, gap: f.gap, minSh: f.minSh, both: f.both,
-      sort: f.sort, spread: f.spread, ext: f.ext, messageId,
-    });
     const prompts = {
       gap: '每档跳档 ¢，可带小数（例 0.3 = 相邻档 ≤0.3¢）',
       minsh: 'N 档合计最低份额，整数（例 2500）',
       spread: '买1卖1价差上限 ¢，可带小数（例 0.3）',
       ext: `极端价百分位 1-99（例 88 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'} ≥88¢ / ≤12¢；也可回复区间如 85-96；想换模式先点对应的 排除/仅 按钮）`,
     };
-    const hint = [
-      '🤏 <b>紧凑盘口 · 等待自定义…</b>',
-      '',
-      `请直接在本 chat <b>回复一个数字</b>（${prompts[field] ?? ''}）。`,
-      '',
-      `当前: <i>${htmlEscape(tightLabel(f))}</i>`,
-      '',
-      '<i>5 分钟内有效。回复非数字 / 0 即清除该项。</i>',
-    ].join('\n');
-    const cancelKb = { inline_keyboard: [[{ text: '✖ 取消(回到向导)', callback_data: tightCb('wizard', f) }]] };
-    try { await editTelegramMessage(chatId, messageId, hint, cancelKb); } catch {}
+    await promptCustomInput({
+      chatId, messageId, fromId,
+      pending: {
+        kind: 'tight', field,
+        levels: f.levels, gap: f.gap, minSh: f.minSh, both: f.both,
+        sort: f.sort, spread: f.spread, ext: f.ext, messageId,
+      },
+      title: '🤏 <b>紧凑盘口',
+      prompt: prompts[field] ?? '',
+      currentLabel: tightLabel(f),
+      footer: '<i>5 分钟内有效。回复非数字 / 0 即清除该项。</i>',
+      backCb: tightCb('wizard', f),
+    });
     return true;
   }
   if (action === 'ext-clear') {
-    if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
-      state.customExtPresets = [];
-      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight ext-clear persist failed:', err.message));
-    }
-    const f2 = { ...f, ext: isCustomExt(f.ext) ? 'off' : f.ext };
-    try { await editTelegramMessage(chatId, messageId, tightWizardText(f2), tightWizardKeyboard(f2, state.customExtPresets)); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('tight ext-clear edit failed:', err.message); }
+    const f2 = { ...f, ext: clearCustomExtPresets(state, fullCtx, f.ext, 'tight') };
+    await safeEdit(chatId, messageId, tightWizardText(f2), tightWizardKeyboard(f2, state.customExtPresets), 'tight ext-clear');
     return true;
   }
   if (action === 'cancel') {
     const reply = renderListPage('tight', 0, state);
     if (reply) {
-      try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); } catch {}
+      await safeEdit(chatId, messageId, reply.text, reply.replyMarkup);
     }
     return true;
   }
   if (action === 'page') {
     const reply = renderTightResult(f, f.page, state);
-    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('tight page edit failed:', err.message); }
+    await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'tight page');
     return true;
   }
   if (action === 'run') {
     const ids = activeMarketIds(state);
     if (!ids.length) {
-      try { await editTelegramMessage(chatId, messageId, '当前没有监控的市场。', undefined); } catch {}
+      await safeEdit(chatId, messageId, '当前没有监控的市场。', undefined);
       return true;
     }
     // bits/thresh only label the progress bar; '111111' = all 6 levels.
@@ -1212,8 +1210,7 @@ export async function handleTightWizardCallback(data, { chatId, messageId, fromI
     });
     if (fullCtx?.persist) await fullCtx.persist().catch((err) => warn('tight persist failed:', err.message));
     const reply = renderTightResult(f, 0, state);
-    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('tight result edit failed:', err.message); }
+    await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'tight result');
     return true;
   }
   return true;
@@ -1369,6 +1366,20 @@ export function rememberCustomExtPreset(state, ext) {
     .slice(0, CUSTOM_EXT_PRESET_CAP);
 }
 
+// Shared handler body for every wizard's 🗑 ext-clear button: drop all
+// remembered custom 极端价 presets (persisting in the background) and
+// return the ext token the wizard should fall back to — 'off' when the
+// active value was one of the cleared customs.
+function clearCustomExtPresets(state, fullCtx, ext, label) {
+  if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
+    state.customExtPresets = [];
+    if (fullCtx?.persist) {
+      fullCtx.persist().catch((err) => warn(`${label} ext-clear persist failed:`, err.message));
+    }
+  }
+  return isCustomExt(ext) ? 'off' : ext;
+}
+
 // 极端价 keyboard section shared by the /stale /all /tight /combo wizards:
 // a 关+排除 presets row, a 仅 presets row, remembered custom values (max 3
 // per row — 4-5 buttons ellipsize labels like "排除≥…" on phones), then a
@@ -1503,6 +1514,24 @@ function parseNewFilter(parts) {
   return {
     winH: Math.min(720 * 24, Math.max(1, winH)),
     minRate, minRem, bits, thresh, dir, sort, noUpDown,
+  };
+}
+
+// Coerce an arbitrary source object (wizard callback filter, pageKeyboard
+// opts, a renderListPage filter) into a fully-populated /new filter,
+// falling back to NEW_DEFAULT per field. Single source of truth for the
+// per-field validation — this logic used to be copy-pasted four times.
+function normalizeNewFilter(src) {
+  return {
+    winH: Number.isFinite(src?.winH) ? src.winH : NEW_DEFAULT.winH,
+    minRate: Number.isFinite(src?.minRate) ? src.minRate : NEW_DEFAULT.minRate,
+    minRem: Number.isFinite(src?.minRem) ? src.minRem : NEW_DEFAULT.minRem,
+    bits: typeof src?.bits === 'string' && /^[01]{6}$/.test(src.bits) ? src.bits : NEW_DEFAULT.bits,
+    thresh: (LIST_THRESHOLDS.includes(src?.thresh) || isCustomThresh(src?.thresh))
+      ? src.thresh : NEW_DEFAULT.thresh,
+    dir: LIST_DIRS.includes(src?.dir) ? src.dir : NEW_DEFAULT.dir,
+    sort: NEW_SORTS.includes(src?.sort) ? src.sort : NEW_DEFAULT.sort,
+    noUpDown: typeof src?.noUpDown === 'boolean' ? src.noUpDown : NEW_DEFAULT.noUpDown,
   };
 }
 
@@ -1652,13 +1681,6 @@ function newFilterIsActive(f) {
     || f.sort !== NEW_DEFAULT.sort
     || f.noUpDown !== NEW_DEFAULT.noUpDown;
 }
-
-// Back-compat aliases for code that still imports the stale-prefixed names.
-const STALE_THRESHOLDS = LIST_THRESHOLDS;
-const STALE_LEVELS = LIST_LEVELS;
-const STALE_LEVEL_LABELS = LIST_LEVEL_LABELS;
-const STALE_SORTS = LIST_SORTS;
-const STALE_SORT_LABELS = LIST_SORT_LABELS;
 
 function parseStaleBits(bits) {
   const safe = (typeof bits === 'string' && /^[01]{6}$/.test(bits)) ? bits : '100100';
@@ -1821,6 +1843,15 @@ function chunk(arr, n) {
   return out;
 }
 
+// "🌐 N" one-tap open buttons, 5 per row, numbered to match the visible
+// row order in the message text. Shared by every list/keyboard that
+// offers per-market open buttons.
+function openUrlRows(urls) {
+  if (!Array.isArray(urls) || !urls.length) return [];
+  return chunk(urls, 5).map((row, i) =>
+    row.map((u, j) => ({ text: `🌐 ${i * 5 + j + 1}`, url: u })));
+}
+
 export function extPickerKeyboard(kind, bits, thresh, sort, dir, ext) {
   const extKey = normalizeExt(ext);
   const cb = (action, e = extKey) => `${kind}:${action}:${bits}:${thresh}:${sort}:${dir}:${e}:0`;
@@ -1897,18 +1928,86 @@ const STALE_PROGRESS_EDIT_MIN_MS = 4_000;
 const STALE_PER_MARKET_TIMEOUT_MS = 20_000;
 const STALE_REFETCH_DEADLINE_MS = 5 * 60 * 1000;
 
-async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh, cancelCb }) {
-  const { getOrderbook } = await import('./predict.js');
-  const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
-  const total = ids.length;
+// Shared orderbook-refetch worker pool: fixed concurrency, a per-market
+// hard timeout (so one market with no working URL combo can't cascade
+// through every fallback for a minute), an optional global deadline, and
+// slot.recentBook updates on success. Both the wizard progress-bar
+// refetch and the /combo fresh sweep run on this; they differ only in
+// knobs and progress reporting (the optional onDone callback, which
+// receives a { done, timedOut, failed } snapshot after each market).
+async function fetchBooksPool(ids, state, { concurrency, perMarketTimeoutMs, deadlineMs, onDone }) {
   const results = new Map();
   const startedAt = Date.now();
+  let done = 0;
+  let timedOut = 0;
+  let failed = 0;
+  let next = 0;
+  const fetchOne = async (id) => {
+    const slot = state.markets[id];
+    let timer;
+    const timeout = new Promise((_, rej) => {
+      timer = setTimeout(
+        () => rej(new Error(`per-market timeout (${perMarketTimeoutMs / 1000}s)`)),
+        perMarketTimeoutMs,
+      );
+    });
+    try {
+      return await Promise.race([
+        getOrderbook(slot?.orderbookCache?.key ?? id, {
+          contextMarketId: id,
+          cache: slot?.orderbookCache ?? null,
+        }),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const worker = async () => {
+    while (next < ids.length) {
+      if (deadlineMs && Date.now() - startedAt > deadlineMs) break;
+      const id = ids[next++];
+      try {
+        const book = await fetchOne(id);
+        results.set(String(id), book);
+        const slot = state.markets[id];
+        if (slot) {
+          slot.recentBook = {
+            bids: book.bids ?? [],
+            asks: book.asks ?? [],
+            fetchedAt: Date.now(),
+          };
+        }
+      } catch (err) {
+        if (/timeout/i.test(err.message ?? '')) timedOut += 1;
+        else failed += 1;
+        log(`[${id}] book refetch failed: ${err.message}`);
+      }
+      done += 1;
+      if (onDone) await onDone({ done, timedOut, failed });
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, ids.length) }, worker),
+  );
+  return { results, timedOut, failed, done };
+}
+
+async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh, cancelCb }) {
+  const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
+  const total = ids.length;
   let done = 0;
   let timedOut = 0;
   let failed = 0;
   let lastEditAt = 0;
   let lastEditedDone = -1;
   let lastEditText = '';
+  // Static footer bits — bits/thresh don't change during the refetch, so
+  // parse once instead of per progress frame per level.
+  const levelsLabel = (() => {
+    const sel = parseStaleBits(bits);
+    return LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级';
+  })();
 
   const renderProgress = (extraNote = '') => {
     const filled = Math.round((done / Math.max(1, total)) * 20);
@@ -1924,7 +2023,7 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
       `<code>${bar}</code> ${pct}%`,
       `进度 <b>${done}</b> / ${total}${stuckLine}${extraNote ? ` · ${extraNote}` : ''}`,
       '',
-      `📐 ${LIST_LEVELS.filter((k) => parseStaleBits(bits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(thresh)}`,
+      `📐 ${levelsLabel} · 💵 ${staleThreshLabel(thresh)}`,
     ].join('\n');
   };
 
@@ -1966,81 +2065,120 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
     }
   };
 
-  // Wrap getOrderbook in a per-market hard timeout so a single misbehaving
-  // market can't pin the whole batch at 99%.
-  const fetchOne = async (id, slot) => {
-    const orderbookKey = slot?.orderbookCache?.key ?? id;
-    let timer;
-    const timeout = new Promise((_, rej) => {
-      timer = setTimeout(
-        () => rej(new Error(`per-market timeout (${STALE_PER_MARKET_TIMEOUT_MS / 1000}s)`)),
-        STALE_PER_MARKET_TIMEOUT_MS,
-      );
-    });
-    try {
-      return await Promise.race([
-        getOrderbook(orderbookKey, {
-          contextMarketId: id,
-          cache: slot?.orderbookCache ?? null,
-        }),
-        timeout,
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-
-  // Simple "next index" worker pool. Stops feeding new markets once we
-  // hit the global deadline; in-flight ones still finish (capped by the
-  // per-market timeout above), so the worst-case finish is roughly
-  // deadline + per-market timeout.
-  let nextIdx = 0;
-  const worker = async () => {
-    while (nextIdx < total) {
-      if (Date.now() - startedAt > STALE_REFETCH_DEADLINE_MS) break;
-      const i = nextIdx++;
-      const id = ids[i];
-      const slot = state.markets[id];
-      try {
-        const book = await fetchOne(id, slot);
-        results.set(id, book);
-        if (slot) {
-          slot.recentBook = {
-            bids: book.bids ?? [],
-            asks: book.asks ?? [],
-            fetchedAt: Date.now(),
-          };
-        }
-      } catch (err) {
-        if (/timeout/i.test(err.message ?? '')) timedOut += 1;
-        else failed += 1;
-        log(`[${id}] refetch failed: ${err.message}`);
-      }
-      done += 1;
+  // The pool stops feeding new markets once it hits the global deadline;
+  // in-flight ones still finish (capped by the per-market timeout), so
+  // the worst-case finish is roughly deadline + per-market timeout.
+  const pool = await fetchBooksPool(ids, state, {
+    concurrency: STALE_REFETCH_CONCURRENCY,
+    perMarketTimeoutMs: STALE_PER_MARKET_TIMEOUT_MS,
+    deadlineMs: STALE_REFETCH_DEADLINE_MS,
+    onDone: async (stats) => {
+      ({ done, timedOut, failed } = stats);
       await maybeEditProgress();
-    }
-  };
-
-  const workers = [];
-  for (let i = 0; i < Math.min(STALE_REFETCH_CONCURRENCY, total); i++) {
-    workers.push(worker());
-  }
-  await Promise.all(workers);
+    },
+  });
+  ({ timedOut, failed, done } = pool);
   await maybeEditProgress(true);
-  return { results, timedOut, failed, abandoned: total - done };
+  return { results: pool.results, timedOut, failed, abandoned: total - done };
+}
+
+// ✏ prompt card shared by the /tight and /combo wizards: stash the
+// pending-input entry so the user's next plain message applies to the
+// chosen knob, and swap the wizard message for a "reply with a number"
+// hint with a back button.
+async function promptCustomInput({ chatId, messageId, fromId, pending, title, prompt, currentLabel, footer, backCb }) {
+  setPendingFilterInput(chatId, fromId, pending);
+  const hint = [
+    `${title} · 等待自定义…</b>`,
+    '',
+    `请直接在本 chat <b>回复一个数字</b>（${prompt}）。`,
+    '',
+    `当前: <i>${htmlEscape(currentLabel)}</i>`,
+    '',
+    footer,
+  ].join('\n');
+  const cancelKb = { inline_keyboard: [[{ text: '✖ 取消(回到向导)', callback_data: backCb }]] };
+  await safeEdit(chatId, messageId, hint, cancelKb);
+}
+
+// Shared tail of every wizard 🚀 that refetched orderbooks: show the
+// "重抓完成 → 渲染中" notice, background-persist, render, and edit with
+// failure/timeout fallbacks. Was duplicated verbatim (~70 lines) between
+// the /stale//all wizard and the /new wizard, which let the two drift.
+// `render` returns the reply ({ text, replyMarkup }) or null.
+async function finishRefetchAndRender({ refetch, idsCount, title, kindLabel, chatId, messageId, fullCtx, render }) {
+  const tags = [];
+  if (refetch.timedOut) tags.push(`${refetch.timedOut} 超时`);
+  if (refetch.failed) tags.push(`${refetch.failed} 错误`);
+  const tail = tags.length ? ` · ${tags.join(' · ')} 跳过` : '';
+  // Intermediate "refetch done, rendering" state. Without this, if the
+  // render or the final edit hangs, the user sees "重抓中…" forever and
+  // can't tell whether the workers are still going or we're stuck
+  // rendering. Best-effort — the final edit below is what matters.
+  await safeEdit(
+    chatId, messageId,
+    `<b>${title} · 重抓完成</b>\n\n进度 ${refetch.results.size + (refetch.timedOut ?? 0) + (refetch.failed ?? 0)} / ${idsCount}${tail}\n\n<i>正在筛选 + 排序 + 渲染…</i>`,
+    undefined,
+  );
+  // Persist runs in the background — don't block the render path on
+  // disk I/O.
+  if (fullCtx?.persist) {
+    fullCtx.persist().catch((err) => warn(`${kindLabel} persist failed:`, err.message));
+  }
+  let reply;
+  try {
+    reply = render();
+  } catch (err) {
+    warn(`${kindLabel} renderListPage threw:`, err.message);
+    await safeEdit(chatId, messageId, `<b>⚠ 渲染失败</b>\n\n重抓本身完成 (${idsCount} 个市场),但生成列表时报错: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /${kindLabel} 查看(数据已存)。`, undefined);
+    return;
+  }
+  if (!reply) {
+    await safeEdit(chatId, messageId, `重抓完成,但 renderListPage 返回空。请发 /${kindLabel} 重看。`, undefined);
+    return;
+  }
+  const prefix = tags.length
+    ? `<i>⚠ 重抓: ${tags.join(' · ')} 跳过 (这些市场不会出现在筛选结果里)</i>\n\n`
+    : '';
+  // Hard timeout on the final edit itself so a hung Telegram call can't
+  // lock the UI in "渲染中" state forever.
+  let timeoutTimer;
+  const editPromise = editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
+  const timeoutPromise = new Promise((_, rej) => {
+    timeoutTimer = setTimeout(() => rej(new Error('post-refetch edit timeout (30s)')), 30_000);
+  });
+  try {
+    await Promise.race([editPromise, timeoutPromise]);
+  } catch (err) {
+    warn(`${kindLabel} post-refetch render failed:`, err.message);
+    await safeEdit(chatId, messageId, `<b>⚠ 渲染超时</b>\n\n重抓完成 (${idsCount} 个),但 Telegram edit 失败: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /${kindLabel} 查看。`, undefined);
+  } finally {
+    clearTimeout(timeoutTimer);
+  }
 }
 
 // Pending-input map: chatId-userId → { kind, bits, thresh, sort, dir, messageId, expiresAt }
 // When user clicks "✏ 自定义" we stash this and the next plain message in
 // the same chat (within 5 min) gets parsed as the custom threshold.
 const PENDING_FILTER_INPUT_MS = 5 * 60 * 1000;
+const PENDING_FILTER_INPUT_MAX = 100;
 const pendingFilterInput = new Map();
 const pendingKey = (chatId, userId) => `${chatId}-${userId}`;
 
 function setPendingFilterInput(chatId, userId, payload) {
+  // expiresAt is only checked on consume; a user who taps ✏ and never
+  // replies would otherwise leave the entry resident forever. Sweep
+  // expired entries on insert and cap the map as a backstop.
+  const now = Date.now();
+  for (const [k, v] of pendingFilterInput) {
+    if (v.expiresAt < now) pendingFilterInput.delete(k);
+  }
+  while (pendingFilterInput.size >= PENDING_FILTER_INPUT_MAX) {
+    pendingFilterInput.delete(pendingFilterInput.keys().next().value);
+  }
   pendingFilterInput.set(pendingKey(chatId, userId), {
     ...payload,
-    expiresAt: Date.now() + PENDING_FILTER_INPUT_MS,
+    expiresAt: now + PENDING_FILTER_INPUT_MS,
   });
 }
 function consumePendingFilterInput(chatId, userId) {
@@ -2095,41 +2233,13 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
       rememberCustomExtPreset(state, safeExt);
       if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('ext preset persist failed:', err.message));
     }
-    try {
-      await editTelegramMessage(
-        chatId,
-        messageId,
-        listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, safeExt),
-        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt, state.customExtPresets),
-      );
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) {
-        warn(`${kind} wizard edit failed:`, err.message);
-      }
-    }
+    await safeEdit(chatId, messageId, listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, safeExt), listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt, state.customExtPresets), `${kind} wizard`);
     return true;
   }
 
   if (action === 'ext-clear') {
-    // Drop all remembered custom 极端价 values and re-render the wizard.
-    if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
-      state.customExtPresets = [];
-      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('ext-clear persist failed:', err.message));
-    }
-    // If the active filter was one of the cleared customs, fall back to "off".
-    const nextExt = isCustomExt(safeExt) ? 'off' : safeExt;
-    try {
-      await editTelegramMessage(
-        chatId,
-        messageId,
-        listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, nextExt),
-        listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, nextExt, state.customExtPresets),
-      );
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) {
-        warn(`${kind} ext-clear edit failed:`, err.message);
-      }
-    }
+    const nextExt = clearCustomExtPresets(state, fullCtx, safeExt, kind);
+    await safeEdit(chatId, messageId, listWizardText(kind, safeBits, safeThresh, safeSort, safeDir, nextExt), listWizardKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, nextExt, state.customExtPresets), `${kind} ext-clear`);
     return true;
   }
 
@@ -2139,13 +2249,7 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     const kb = field === 'ext'
       ? extPickerKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt)
       : threshPickerKeyboard(kind, safeBits, safeThresh, safeSort, safeDir, safeExt);
-    try {
-      await editTelegramMessage(chatId, messageId, pickerCardText(kind, field), kb);
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) {
-        warn(`${kind} ${field}-pick edit failed:`, err.message);
-      }
-    }
+    await safeEdit(chatId, messageId, pickerCardText(kind, field), kb, `${kind} ${field}-pick`);
     return true;
   }
 
@@ -2158,28 +2262,26 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     setPendingFilterInput(chatId, fromId, {
       kind, field, bits: safeBits, thresh: safeThresh, sort: safeSort, dir: safeDir, ext: safeExt, messageId,
     });
-    try {
-      const meta2 = LIST_KINDS[kind] ?? LIST_KINDS.stale;
-      const promptUnit = field === 'ext'
-        ? '极端价百分位(1-99,例如 94 = 排除 ≥94¢ 或 ≤6¢ 的市场;也可回复区间,如 85-96 = 只按一边在 85-96¢ 判定)'
-        : 'USD 金额,例如 350';
-      const hint = [
-        `<b>${meta2.title} · 等待自定义${field === 'ext' ? '极端价' : '阈值'}…</b>`,
-        '',
-        `请直接在这个 chat <b>回复一个数字</b>(${promptUnit})。`,
-        '',
-        `当前选: 📐 ${LIST_LEVELS.filter((k) => parseStaleBits(safeBits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(safeThresh, safeDir)} · 📈 ${extLabel(safeExt)} · 📊 ${LIST_SORT_LABELS[safeSort]}`,
-        '',
-        '<i>5 分钟内有效。想取消就发任何非数字。</i>',
-      ].join('\n');
-      const cancelKb = {
-        inline_keyboard: [[{
-          text: '✖ 取消(回到向导)',
-          callback_data: `${kind}:wizard:${safeBits}:${safeThresh}:${safeSort}:${safeDir}:${safeExt}:0`,
-        }]],
-      };
-      await editTelegramMessage(chatId, messageId, hint, cancelKb);
-    } catch {}
+    const meta2 = LIST_KINDS[kind] ?? LIST_KINDS.stale;
+    const promptUnit = field === 'ext'
+      ? '极端价百分位(1-99,例如 94 = 排除 ≥94¢ 或 ≤6¢ 的市场;也可回复区间,如 85-96 = 只按一边在 85-96¢ 判定)'
+      : 'USD 金额,例如 350';
+    const hint = [
+      `<b>${meta2.title} · 等待自定义${field === 'ext' ? '极端价' : '阈值'}…</b>`,
+      '',
+      `请直接在这个 chat <b>回复一个数字</b>(${promptUnit})。`,
+      '',
+      `当前选: 📐 ${(() => { const sel = parseStaleBits(safeBits); return LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'; })()} · 💵 ${staleThreshLabel(safeThresh, safeDir)} · 📈 ${extLabel(safeExt)} · 📊 ${LIST_SORT_LABELS[safeSort]}`,
+      '',
+      '<i>5 分钟内有效。想取消就发任何非数字。</i>',
+    ].join('\n');
+    const cancelKb = {
+      inline_keyboard: [[{
+        text: '✖ 取消(回到向导)',
+        callback_data: `${kind}:wizard:${safeBits}:${safeThresh}:${safeSort}:${safeDir}:${safeExt}:0`,
+      }]],
+    };
+    await safeEdit(chatId, messageId, hint, cancelKb);
     return true;
   }
 
@@ -2187,9 +2289,7 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     // Restore the plain leaderboard without filter.
     const reply = renderListPage(kind, 0, state);
     if (reply) {
-      try {
-        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-      } catch {}
+      await safeEdit(chatId, messageId, reply.text, reply.replyMarkup);
     }
     return true;
   }
@@ -2197,13 +2297,7 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
   if (action === 'page') {
     const reply = renderListPage(kind, page, state, filter);
     if (reply) {
-      try {
-        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-      } catch (err) {
-        if (!/message is not modified/i.test(err.message ?? '')) {
-          warn(`${kind} page edit failed:`, err.message);
-        }
-      }
+      await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, `${kind} page`);
     }
     return true;
   }
@@ -2217,100 +2311,27 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
     if (!needsRefetch) {
       const reply = renderListPage(kind, 0, state, filter);
       if (reply) {
-        try {
-          await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-        } catch (err) {
-          if (!/message is not modified/i.test(err.message ?? '')) {
-            warn(`${kind} sort-only render failed:`, err.message);
-          }
-        }
+        await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, `${kind} sort-only render`);
       }
       return true;
     }
     const ids = activeMarketIds(state);
     if (!ids.length) {
-      try {
-        await editTelegramMessage(chatId, messageId, '当前没有监控的市场。', undefined);
-      } catch {}
+      await safeEdit(chatId, messageId, '当前没有监控的市场。', undefined);
       return true;
     }
     const refetch = await refetchOrderbooksWithProgress({
       ids, state, chatId, messageId,
       kind, bits: safeBits, thresh: safeThresh,
     });
-    // Intermediate "refetch done, rendering" state. Without this, if
-    // renderListPage or the final edit hangs, the user sees "重抓中…"
-    // forever and can't tell whether the workers are still going or
-    // we're just stuck rendering. Best-effort — failures here are
-    // ignored, the final edit below is what matters.
-    try {
-      const tagsMid = [];
-      if (refetch.timedOut) tagsMid.push(`${refetch.timedOut} 超时`);
-      if (refetch.failed) tagsMid.push(`${refetch.failed} 错误`);
-      const tail = tagsMid.length ? ` · ${tagsMid.join(' · ')} 跳过` : '';
-      await editTelegramMessage(
-        chatId, messageId,
-        `<b>${(LIST_KINDS[kind] ?? LIST_KINDS.stale).title} · 重抓完成</b>\n\n进度 ${refetch.results.size + (refetch.timedOut ?? 0) + (refetch.failed ?? 0)} / ${ids.length}${tail}\n\n<i>正在筛选 + 排序 + 渲染…</i>`,
-        undefined,
-      );
-    } catch {}
-    // Persist runs in the background — don't block the render path on
-    // disk I/O. If the state file is large (1k+ markets × recentBook
-    // each), JSON.stringify + fs.write can take a while, but it's not
-    // worth pinning the UI on it.
-    if (fullCtx?.persist) {
-      fullCtx.persist().catch((err) => warn(`${kind} persist failed:`, err.message));
-    }
-    let reply;
-    try {
-      reply = renderListPage(kind, 0, state, filter);
-    } catch (err) {
-      warn(`${kind} renderListPage threw:`, err.message);
-      try {
-        await editTelegramMessage(
-          chatId, messageId,
-          `<b>⚠ 渲染失败</b>\n\n重抓本身完成 (${ids.length} 个市场),但生成列表时报错: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /${kind} 查看(数据已存)。`,
-          undefined,
-        );
-      } catch {}
-      return true;
-    }
-    if (reply) {
-      const tags = [];
-      if (refetch.timedOut) tags.push(`${refetch.timedOut} 超时`);
-      if (refetch.failed) tags.push(`${refetch.failed} 错误`);
-      const prefix = tags.length
-        ? `<i>⚠ 重抓: ${tags.join(' · ')} 跳过 (这些市场不会出现在筛选结果里)</i>\n\n`
-        : '';
-      // Hard timeout on the final edit itself so a hung Telegram call
-      // can't lock the UI in "渲染中" state forever.
-      const editPromise = editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
-      const timeoutPromise = new Promise((_, rej) => setTimeout(
-        () => rej(new Error('post-refetch edit timeout (30s)')),
-        30_000,
-      ));
-      try {
-        await Promise.race([editPromise, timeoutPromise]);
-      } catch (err) {
-        warn(`${kind} post-refetch render failed:`, err.message);
-        try {
-          await editTelegramMessage(
-            chatId, messageId,
-            `<b>⚠ 渲染超时</b>\n\n重抓完成 (${ids.length} 个),但 Telegram edit 失败: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /${kind} 查看。`,
-            undefined,
-          );
-        } catch {}
-      }
-    } else {
-      // renderListPage returned null — shouldn't happen for known kinds
-      try {
-        await editTelegramMessage(
-          chatId, messageId,
-          `重抓完成,但 renderListPage 返回空。请发 /${kind} 重看。`,
-          undefined,
-        );
-      } catch {}
-    }
+    await finishRefetchAndRender({
+      refetch,
+      idsCount: ids.length,
+      title: (LIST_KINDS[kind] ?? LIST_KINDS.stale).title,
+      kindLabel: kind,
+      chatId, messageId, fullCtx,
+      render: () => renderListPage(kind, 0, state, filter),
+    });
     return true;
   }
 
@@ -2335,7 +2356,7 @@ function moversWinLabel(min) {
 }
 
 async function buildMoversRows(state, windowMin) {
-  const { readHistorySince, rateMovers } = await import('./history.js');
+  const { readHistorySince, rateMovers } = await import('./history.js'); // no cycle, but keeps history off the startup path
   const since = Date.now() - windowMin * 60_000;
   const records = await readHistorySince(since);
   const movers = rateMovers(records, (id) => state.markets?.[id]?.lastHourlyRate);
@@ -2364,17 +2385,40 @@ function moversKeyboard(windowMin, page, totalPages, openUrls) {
     rows.push(nav);
   }
   // Open-in-browser buttons.
-  if (Array.isArray(openUrls) && openUrls.length) {
-    const CHUNK = 5;
-    for (let i = 0; i < openUrls.length; i += CHUNK) {
-      rows.push(openUrls.slice(i, i + CHUNK).map((u, j) => ({ text: `🌐 ${i + j + 1}`, url: u })));
-    }
-  }
+  rows.push(...openUrlRows(openUrls));
   return { inline_keyboard: rows };
 }
 
-async function renderMoversPage(state, windowMin, page = 0) {
-  const allRows = await buildMoversRows(state, windowMin);
+// Computed movers rows, kept per result message so ⬅️/➡️ page taps don't
+// re-read and re-reduce the whole history file (same pattern as the /combo
+// scan cache). Keyed `${chatId}:${messageId}`; pruned by TTL + size cap.
+const MOVERS_CACHE_TTL_MS = 10 * 60 * 1000;
+const MOVERS_CACHE_MAX = 20;
+const _moversCache = new Map(); // key -> { windowMin, rows, at }
+
+function rememberMoversRows(chatId, messageId, windowMin, rows) {
+  const now = Date.now();
+  for (const [k, v] of _moversCache) {
+    if (now - v.at > MOVERS_CACHE_TTL_MS) _moversCache.delete(k);
+  }
+  while (_moversCache.size >= MOVERS_CACHE_MAX) {
+    _moversCache.delete(_moversCache.keys().next().value);
+  }
+  _moversCache.set(`${chatId}:${messageId}`, { windowMin, rows, at: now });
+}
+
+function getMoversRows(chatId, messageId, windowMin) {
+  const v = _moversCache.get(`${chatId}:${messageId}`);
+  if (!v || v.windowMin !== windowMin) return null;
+  if (Date.now() - v.at > MOVERS_CACHE_TTL_MS) {
+    _moversCache.delete(`${chatId}:${messageId}`);
+    return null;
+  }
+  return v.rows;
+}
+
+async function renderMoversPage(state, windowMin, page = 0, precomputedRows = null) {
+  const allRows = precomputedRows ?? await buildMoversRows(state, windowMin);
   const winLabel = moversWinLabel(windowMin);
   if (!allRows.length) {
     return {
@@ -2447,20 +2491,17 @@ export async function handleMoversCallback(data, { chatId, messageId, state }) {
   } else {
     return true;
   }
-  const reply = await renderMoversPage(state, windowMin, page);
-  try {
-    await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-  } catch (err) {
-    if (!/message is not modified/i.test(err.message ?? '')) {
-      warn('movers callback edit failed:', err.message);
-    }
+  // Page taps reuse the rows computed when this message was last rendered;
+  // window switches (and cache misses) recompute from history.
+  let rows = action === 'page' ? getMoversRows(chatId, messageId, windowMin) : null;
+  if (!rows) {
+    rows = await buildMoversRows(state, windowMin);
+    rememberMoversRows(chatId, messageId, windowMin, rows);
   }
+  const reply = await renderMoversPage(state, windowMin, page, rows);
+  await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'movers callback');
   return true;
 }
-
-// Back-compat export — index.js dispatcher imported handleStaleFilterCallback
-// before /all existed. Keep this alias so the old import keeps working.
-export const handleStaleFilterCallback = handleListFilterCallback;
 
 // Settings panel for the hourly digest — rendered by /hourly (no arg) and
 // edited in place by the hd:only / hd:ext toggles. Button-driven so it works
@@ -2517,25 +2558,13 @@ export async function handleHourlyDigestCallback(data, { chatId, messageId, stat
       state.hourlyDigestExtExclude = Number.isFinite(n) ? n : 0;
     }
     if (fullCtx?.persist) await fullCtx.persist().catch(() => {});
-    try {
-      await editTelegramMessage(chatId, messageId, hourlySettingsText(state), hourlySettingsKeyboard(state));
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) {
-        warn('hourly settings edit failed:', err.message);
-      }
-    }
+    await safeEdit(chatId, messageId, hourlySettingsText(state), hourlySettingsKeyboard(state), 'hourly settings');
     return true;
   }
 
   if (action === 'send') {
     if (typeof fullCtx?.requestHourlyDigest === 'function') fullCtx.requestHourlyDigest();
-    try {
-      await editTelegramMessage(
-        chatId, messageId,
-        `${hourlySettingsText(state)}\n\n<i>已触发,下一 tick 发出整点摘要。</i>`,
-        hourlySettingsKeyboard(state),
-      );
-    } catch {}
+    await safeEdit(chatId, messageId, `${hourlySettingsText(state)}\n\n<i>已触发,下一 tick 发出整点摘要。</i>`, hourlySettingsKeyboard(state));
     return true;
   }
 
@@ -2548,13 +2577,7 @@ export async function handleHourlyDigestCallback(data, { chatId, messageId, stat
   const { buildHourlyDigest } = await import('./digest.js');
   const built = await buildHourlyDigest(state, startMs, endMs, page);
   if (built.text == null) return true;
-  try {
-    await editTelegramMessage(chatId, messageId, built.text, built.replyMarkup);
-  } catch (err) {
-    if (!/message is not modified/i.test(err.message ?? '')) {
-      warn('hourly digest page edit failed:', err.message);
-    }
-  }
+  await safeEdit(chatId, messageId, built.text, built.replyMarkup, 'hourly digest page');
   return true;
 }
 
@@ -2576,13 +2599,7 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
   const page = Math.max(0, Number(parts[parts.length - 1]) || 0);
 
   if (action === 'wizard' || action === 'set') {
-    try {
-      await editTelegramMessage(chatId, messageId, newWizardText(f), newWizardKeyboard(f));
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) {
-        warn('new wizard edit failed:', err.message);
-      }
-    }
+    await safeEdit(chatId, messageId, newWizardText(f), newWizardKeyboard(f), 'new wizard');
     return true;
   }
 
@@ -2600,36 +2617,32 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
     if (field === 'rate') unit = 'PP/h 数值(如 750)';
     else if (field === 'thresh') unit = 'USD 金额(如 350)';
     else unit = '小时(如 36, 最长 720)';
-    try {
-      const dirOp = LIST_DIR_OP[f.dir] ?? '≤';
-      const threshLabel = f.thresh === 'inf' ? '不限' : `${dirOp}$${f.thresh}`;
-      const hint = [
-        '<b>🆕 新上市场 · 等待自定义值…</b>',
-        '',
-        `请在这个 chat <b>回复一个数字</b>(${unit})。`,
-        '',
-        `当前: ⏰ ${fmtHoursLabel(f.winH)} · 💰 ${fmtRateLabel(f.minRate)} · ⌛ ${fmtHoursLabel(f.minRem)} · 💵 ${threshLabel} · 📊 ${NEW_SORT_LABELS[f.sort]}`,
-        '',
-        '<i>5 分钟内有效。想取消就发任何非数字。</i>',
-      ].join('\n');
-      const [w, r, m, b, t, d, s] = newFilterToCbParts(f);
-      const cancelKb = {
-        inline_keyboard: [[{
-          text: '✖ 取消(回到向导)',
-          callback_data: `new:wizard:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
-        }]],
-      };
-      await editTelegramMessage(chatId, messageId, hint, cancelKb);
-    } catch {}
+    const dirOp = LIST_DIR_OP[f.dir] ?? '≤';
+    const threshLabel = f.thresh === 'inf' ? '不限' : `${dirOp}$${f.thresh}`;
+    const hint = [
+      '<b>🆕 新上市场 · 等待自定义值…</b>',
+      '',
+      `请在这个 chat <b>回复一个数字</b>(${unit})。`,
+      '',
+      `当前: ⏰ ${fmtHoursLabel(f.winH)} · 💰 ${fmtRateLabel(f.minRate)} · ⌛ ${fmtHoursLabel(f.minRem)} · 💵 ${threshLabel} · 📊 ${NEW_SORT_LABELS[f.sort]}`,
+      '',
+      '<i>5 分钟内有效。想取消就发任何非数字。</i>',
+    ].join('\n');
+    const [w, r, m, b, t, d, s] = newFilterToCbParts(f);
+    const cancelKb = {
+      inline_keyboard: [[{
+        text: '✖ 取消(回到向导)',
+        callback_data: `new:wizard:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
+      }]],
+    };
+    await safeEdit(chatId, messageId, hint, cancelKb);
     return true;
   }
 
   if (action === 'cancel') {
     const reply = renderListPage('new', 0, state);
     if (reply) {
-      try {
-        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-      } catch {}
+      await safeEdit(chatId, messageId, reply.text, reply.replyMarkup);
     }
     return true;
   }
@@ -2637,13 +2650,7 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
   if (action === 'page') {
     const reply = renderListPage('new', page, state, f);
     if (reply) {
-      try {
-        await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-      } catch (err) {
-        if (!/message is not modified/i.test(err.message ?? '')) {
-          warn('new page edit failed:', err.message);
-        }
-      }
+      await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'new page');
     }
     return true;
   }
@@ -2654,13 +2661,7 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
     if (!newDepthFilterActive(f)) {
       const reply = renderListPage('new', 0, state, f);
       if (reply) {
-        try {
-          await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-        } catch (err) {
-          if (!/message is not modified/i.test(err.message ?? '')) {
-            warn('new sort-only render failed:', err.message);
-          }
-        }
+        await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'new sort-only render');
       }
       return true;
     }
@@ -2677,13 +2678,7 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
       .map(([id]) => id)
       .filter((id) => state.markets[id] != null); // need slot for orderbookCache
     if (!ids.length) {
-      try {
-        await editTelegramMessage(
-          chatId, messageId,
-          `<b>🆕 新上市场</b>\n\n近 ${fmtHoursLabel(f.winH)} 没有可重抓的新市场(可能都还在等首抓)。`,
-          undefined,
-        );
-      } catch {}
+      await safeEdit(chatId, messageId, `<b>🆕 新上市场</b>\n\n近 ${fmtHoursLabel(f.winH)} 没有可重抓的新市场(可能都还在等首抓)。`, undefined);
       return true;
     }
     const [w, r, m, b, t, d, s] = newFilterToCbParts(f);
@@ -2692,59 +2687,14 @@ export async function handleNewWizardCallback(data, { chatId, messageId, fromId,
       kind: 'new', bits: f.bits, thresh: f.thresh,
       cancelCb: `new:cancel:${w}:${r}:${m}:${b}:${t}:${d}:${s}:0`,
     });
-    try {
-      const tagsMid = [];
-      if (refetch.timedOut) tagsMid.push(`${refetch.timedOut} 超时`);
-      if (refetch.failed) tagsMid.push(`${refetch.failed} 错误`);
-      const tail = tagsMid.length ? ` · ${tagsMid.join(' · ')} 跳过` : '';
-      await editTelegramMessage(
-        chatId, messageId,
-        `<b>🆕 新上市场 · 重抓完成</b>\n\n进度 ${refetch.results.size + (refetch.timedOut ?? 0) + (refetch.failed ?? 0)} / ${ids.length}${tail}\n\n<i>正在筛选 + 排序 + 渲染…</i>`,
-        undefined,
-      );
-    } catch {}
-    if (fullCtx?.persist) {
-      fullCtx.persist().catch((err) => warn(`new persist failed:`, err.message));
-    }
-    let reply;
-    try {
-      reply = renderListPage('new', 0, state, f);
-    } catch (err) {
-      warn(`new renderListPage threw:`, err.message);
-      try {
-        await editTelegramMessage(
-          chatId, messageId,
-          `<b>⚠ 渲染失败</b>\n\n重抓本身完成 (${ids.length} 个),但生成列表时报错: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /new 查看(数据已存)。`,
-          undefined,
-        );
-      } catch {}
-      return true;
-    }
-    if (reply) {
-      const tags = [];
-      if (refetch.timedOut) tags.push(`${refetch.timedOut} 超时`);
-      if (refetch.failed) tags.push(`${refetch.failed} 错误`);
-      const prefix = tags.length
-        ? `<i>⚠ 重抓: ${tags.join(' · ')} 跳过 (这些市场不会出现在筛选结果里)</i>\n\n`
-        : '';
-      const editPromise = editTelegramMessage(chatId, messageId, prefix + reply.text, reply.replyMarkup);
-      const timeoutPromise = new Promise((_, rej) => setTimeout(
-        () => rej(new Error('post-refetch edit timeout (30s)')),
-        30_000,
-      ));
-      try {
-        await Promise.race([editPromise, timeoutPromise]);
-      } catch (err) {
-        warn(`new post-refetch render failed:`, err.message);
-        try {
-          await editTelegramMessage(
-            chatId, messageId,
-            `<b>⚠ 渲染超时</b>\n\n重抓完成 (${ids.length} 个),但 Telegram edit 失败: <code>${htmlEscape(err.message)}</code>\n\n请直接发 /new 查看。`,
-            undefined,
-          );
-        } catch {}
-      }
-    }
+    await finishRefetchAndRender({
+      refetch,
+      idsCount: ids.length,
+      title: '🆕 新上市场',
+      kindLabel: 'new',
+      chatId, messageId, fullCtx,
+      render: () => renderListPage('new', 0, state, f),
+    });
     return true;
   }
 
@@ -2877,13 +2827,6 @@ function listMarketsSnapshot(state) {
     .filter((x) => !!x.slot);
 }
 
-function fmtMarketLine(id, slot, extra) {
-  const title = slot.title ? slot.title.slice(0, 50) : `Market ${id}`;
-  const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
-  const e = extra ? ` · ${extra}` : '';
-  return `#${id} ${title} — ${rate}/h${e}`;
-}
-
 // Opportunity score = PP/h × zone-gap-multiplier × spread-friendliness.
 // Higher = better target to make markets on.
 function opportunityScore(slot) {
@@ -2921,7 +2864,6 @@ async function buildProbeMessage(marketId, state) {
   const spread = spreadOf(ob);
   // Match monitor.js precedence so /probe reflects what alerts would use:
   //   /setmarket override > REST market.spreadThreshold > env default.
-  const { effectiveOverride } = await import('./state.js');
   const zone = rewardZoneStatus(
     ob, m,
     { maxDistance: config.rewardZoneMaxDistance, minSize: config.rewardZoneMinSize },
@@ -2934,7 +2876,6 @@ async function buildProbeMessage(marketId, state) {
   // from the same REST cache the monitor uses (best effort).
   let realSlug = null;
   try {
-    const { getSlugMapCached } = await import('./predict.js');
     const slugMap = await getSlugMapCached();
     realSlug = slugMap?.get(String(marketId)) ?? null;
   } catch {}
@@ -2980,16 +2921,6 @@ async function buildProbeMessage(marketId, state) {
   return { text: lines.join('\n'), replyMarkup: actionKeyboard(marketId) };
 }
 
-function zoneTag(slot) {
-  const z = slot?.zoneStatus;
-  if (!z) return '';
-  if (z.bidActivated && z.askActivated) return ' · 区内✓';
-  const sides = [];
-  if (!z.bidActivated) sides.push('买✗');
-  if (!z.askActivated) sides.push('卖✗');
-  return ` · 区外(${sides.join(',')})`;
-}
-
 // Format a number as "1.2k" / "12k" / "3.4M" for compact PP totals.
 function fmtBig(n) {
   if (!Number.isFinite(n)) return '?';
@@ -2997,14 +2928,6 @@ function fmtBig(n) {
   if (n >= 1e4) return `${(n / 1e3).toFixed(0)}k`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
   return n.toFixed(0);
-}
-
-function fmtRemaining(endMs) {
-  if (!endMs) return null;
-  const h = (endMs - Date.now()) / 3600000;
-  if (h <= 0) return '已结束';
-  if (h >= 48) return `${(h / 24).toFixed(1)}d`;
-  return `${h.toFixed(1)}h`;
 }
 
 function fmtAgo(ms) {
@@ -3134,17 +3057,7 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   // sort) so pagination preserves the active filter without per-message
   // state.
   const isNewCmd = cmd === 'new';
-  const newF = {
-    winH: Number.isFinite(opts.winH) ? opts.winH : NEW_DEFAULT.winH,
-    minRate: Number.isFinite(opts.minRate) ? opts.minRate : NEW_DEFAULT.minRate,
-    minRem: Number.isFinite(opts.minRem) ? opts.minRem : NEW_DEFAULT.minRem,
-    bits: /^[01]{6}$/.test(opts.bits) ? opts.bits : NEW_DEFAULT.bits,
-    thresh: (LIST_THRESHOLDS.includes(opts.thresh) || isCustomThresh(opts.thresh))
-      ? opts.thresh : NEW_DEFAULT.thresh,
-    dir: LIST_DIRS.includes(opts.dir) ? opts.dir : NEW_DEFAULT.dir,
-    sort: NEW_SORTS.includes(opts.sort) ? opts.sort : NEW_DEFAULT.sort,
-    noUpDown: typeof opts.noUpDown === 'boolean' ? opts.noUpDown : NEW_DEFAULT.noUpDown,
-  };
+  const newF = normalizeNewFilter(opts);
   const pageCb = (p) => {
     if (isWizardCmd) return `${cmd}:page:${bits}:${thresh}:${sort}:${dir}:${ext}:${p}`;
     if (isNewCmd) {
@@ -3207,16 +3120,7 @@ function pageKeyboard(cmd, page, totalPages, opts = {}) {
   // to hit on mobile, where tapping a small inline <a> is fiddly).
   // Telegram has no multi-URL button, so true "one tap → 10 tabs" isn't
   // possible; this is the next-best approximation.
-  if (Array.isArray(opts.openUrls) && opts.openUrls.length) {
-    const CHUNK = 5;
-    for (let i = 0; i < opts.openUrls.length; i += CHUNK) {
-      const chunk = opts.openUrls.slice(i, i + CHUNK);
-      rows.push(chunk.map((u, j) => ({
-        text: `🌐 ${i + j + 1}`,
-        url: u,
-      })));
-    }
-  }
+  rows.push(...openUrlRows(opts.openUrls));
   return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
@@ -3230,14 +3134,34 @@ export async function handlePageCallback(data, { chatId, messageId, state, fullC
   // Re-run the list command at the requested page and edit the message.
   const reply = await renderListPage(cmd, page, state);
   if (!reply) return true;
-  try {
-    await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
-  } catch (err) {
-    if (!/message is not modified/i.test(err.message ?? '')) {
-      warn(`page edit failed for ${cmd}:`, err.message);
-    }
-  }
+  await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, `page edit failed for ${cmd}:`);
   return true;
+}
+
+// Depth-sum + 极端价 filter machinery shared by the /stale and /all
+// branches of renderListPage: parse the wizard filter once and return
+// the pieces both branches need (predicate inputs + header tag bits).
+function parseListDepthFilter(filter) {
+  const filterBits = filter?.bits ?? null;
+  const filterThresh = filter?.thresh ?? null;
+  const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
+  const filterExt = filter?.ext ?? 'off';
+  const filterOn = !!(filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh));
+  const extOn = extFilterActive(filterExt);
+  const sel = filterBits ? parseStaleBits(filterBits) : null;
+  const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
+  const passesThresh = (sumUsd) => {
+    if (sumUsd == null || threshUsd == null) return false;
+    return filterDir === 'ge' ? sumUsd >= threshUsd : sumUsd <= threshUsd;
+  };
+  const tagBits = [];
+  if (filterOn) {
+    const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
+    const op = LIST_DIR_OP[filterDir] ?? '≤';
+    tagBits.push(`${picked} ${op} $${threshUsd}`);
+  }
+  if (extOn) tagBits.push(extLabel(filterExt));
+  return { filterExt, filterOn, extOn, sel, passesThresh, tagBits };
 }
 
 function paginate(rows, page) {
@@ -3272,18 +3196,7 @@ function renderListPage(cmd, page, state, filter = null) {
       //   bits + thresh + dir        — depth-sum filter; requires recentBook
       //                                (populated by the wizard's refetch)
       //   sort                       — 't' firstSeen desc / 'p' PP/h desc
-      const f = {
-        winH: Number.isFinite(filter?.winH) ? filter.winH : NEW_DEFAULT.winH,
-        minRate: Number.isFinite(filter?.minRate) ? filter.minRate : NEW_DEFAULT.minRate,
-        minRem: Number.isFinite(filter?.minRem) ? filter.minRem : NEW_DEFAULT.minRem,
-        bits: typeof filter?.bits === 'string' && /^[01]{6}$/.test(filter.bits)
-          ? filter.bits : NEW_DEFAULT.bits,
-        thresh: (LIST_THRESHOLDS.includes(filter?.thresh) || isCustomThresh(filter?.thresh))
-          ? filter.thresh : NEW_DEFAULT.thresh,
-        dir: LIST_DIRS.includes(filter?.dir) ? filter.dir : NEW_DEFAULT.dir,
-        sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
-        noUpDown: typeof filter?.noUpDown === 'boolean' ? filter.noUpDown : NEW_DEFAULT.noUpDown,
-      };
+      const f = normalizeNewFilter(filter);
       const cutoff = Date.now() - f.winH * 3600 * 1000;
       const remCutoff = f.minRem > 0 ? Date.now() + f.minRem * 3600 * 1000 : null;
       const depthOn = newDepthFilterActive(f);
@@ -3455,18 +3368,7 @@ function renderListPage(cmd, page, state, filter = null) {
       // Optional filter (from the wizard): keep markets whose sum of
       // selected bid/ask levels (from slot.recentBook, populated by the
       // refetch flow) is ≤ a dollar threshold.
-      const filterBits = filter?.bits ?? null;
-      const filterThresh = filter?.thresh ?? null;
-      const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
-      const filterExt = filter?.ext ?? 'off';
-      const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
-      const extOn = extFilterActive(filterExt);
-      const sel = filterBits ? parseStaleBits(filterBits) : null;
-      const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
-      const passesThresh = (sumUsd) => {
-        if (sumUsd == null || threshUsd == null) return false;
-        return filterDir === 'ge' ? sumUsd >= threshUsd : sumUsd <= threshUsd;
-      };
+      const { filterExt, filterOn, extOn, sel, passesThresh, tagBits } = parseListDepthFilter(filter);
       rows = allRows
         .filter(({ slot }) => isLive(slot) && Number.isFinite(slot.lastChangeAt))
         .map(({ id, slot }) => {
@@ -3483,7 +3385,7 @@ function renderListPage(cmd, page, state, filter = null) {
           if (!r.slot.recentBook) return false;
           return passesThresh(r.sumUsd);
         });
-      const sortKey = STALE_SORTS.includes(filter?.sort) ? filter.sort : 't';
+      const sortKey = LIST_SORTS.includes(filter?.sort) ? filter.sort : 't';
       const rateOf = (r) => Number.isFinite(r.slot?.lastHourlyRate) ? r.slot.lastHourlyRate : 0;
       if (sortKey === 'p') {
         // PP/h descending; stall duration as tiebreaker so equal-rate markets
@@ -3494,13 +3396,6 @@ function renderListPage(cmd, page, state, filter = null) {
       }
       const headerLabel = sortKey === 'p' ? '⏱ 停滞排名 · 按 PP/h' : '⏱ 停滞时长排名';
       const headerParts = [`<b>${headerLabel}</b>`];
-      const tagBits = [];
-      if (filterOn) {
-        const picked = STALE_LEVELS.filter((k) => sel[k]).map((k) => STALE_LEVEL_LABELS[k]).join('+');
-        const op = LIST_DIR_OP[filterDir] ?? '≤';
-        tagBits.push(`${picked} ${op} $${threshUsd}`);
-      }
-      if (extOn) tagBits.push(extLabel(filterExt));
       if (tagBits.length) headerParts.push(`<i>· 过滤: ${tagBits.join(' · ')}</i>`);
       header = headerParts.join(' ');
       extraFn = (slot, row) => {
@@ -3524,18 +3419,7 @@ function renderListPage(cmd, page, state, filter = null) {
       // surface the "what else is in my pool" set so the user can see
       // every id they've subscribed to. Per-market status is appended as
       // a tag via extraFn.
-      const filterBits = filter?.bits ?? null;
-      const filterThresh = filter?.thresh ?? null;
-      const filterDir = LIST_DIRS.includes(filter?.dir) ? filter.dir : 'le';
-      const filterExt = filter?.ext ?? 'off';
-      const filterOn = filterBits && filterThresh && staleFilterIsActive(filterBits, filterThresh);
-      const extOn = extFilterActive(filterExt);
-      const sel = filterBits ? parseStaleBits(filterBits) : null;
-      const threshUsd = filterThresh && filterThresh !== 'inf' ? Number(filterThresh) : null;
-      const passesThresh = (sumUsd) => {
-        if (sumUsd == null || threshUsd == null) return false;
-        return filterDir === 'ge' ? sumUsd >= threshUsd : sumUsd <= threshUsd;
-      };
+      const { filterExt, filterOn, extOn, sel, passesThresh, tagBits } = parseListDepthFilter(filter);
       const pausedSet = new Set(state.pausedIds ?? []);
       rows = allRows
         .map(({ id, slot }) => {
@@ -3571,13 +3455,6 @@ function renderListPage(cmd, page, state, filter = null) {
       }
       const headerLabel = sortKey === 't' ? '📋 全部市场 · 按停滞时长' : '📋 全部市场 · 按 PP/h';
       const headerParts = [`<b>${headerLabel}</b>`];
-      const tagBits = [];
-      if (filterOn) {
-        const picked = LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+');
-        const op = LIST_DIR_OP[filterDir] ?? '≤';
-        tagBits.push(`${picked} ${op} $${threshUsd}`);
-      }
-      if (extOn) tagBits.push(extLabel(filterExt));
       if (tagBits.length) headerParts.push(`<i>· 过滤: ${tagBits.join(' · ')}</i>`);
       header = headerParts.join(' ');
       extraFn = (_slot, row) => {
@@ -3605,17 +3482,7 @@ function renderListPage(cmd, page, state, filter = null) {
       ext: normalizeExt(filter.ext),
     };
   } else if (cmd === 'new') {
-    kbOpts = {
-      winH: Number.isFinite(filter?.winH) ? filter.winH : NEW_DEFAULT.winH,
-      minRate: Number.isFinite(filter?.minRate) ? filter.minRate : NEW_DEFAULT.minRate,
-      minRem: Number.isFinite(filter?.minRem) ? filter.minRem : NEW_DEFAULT.minRem,
-      bits: /^[01]{6}$/.test(filter?.bits) ? filter.bits : NEW_DEFAULT.bits,
-      thresh: (LIST_THRESHOLDS.includes(filter?.thresh) || isCustomThresh(filter?.thresh))
-        ? filter.thresh : NEW_DEFAULT.thresh,
-      dir: LIST_DIRS.includes(filter?.dir) ? filter.dir : NEW_DEFAULT.dir,
-      sort: NEW_SORTS.includes(filter?.sort) ? filter.sort : NEW_DEFAULT.sort,
-      noUpDown: typeof filter?.noUpDown === 'boolean' ? filter.noUpDown : NEW_DEFAULT.noUpDown,
-    };
+    kbOpts = normalizeNewFilter(filter);
   }
   if (!rows.length) {
     const kb = pageKeyboard(cmd, 0, 1, kbOpts);
@@ -3653,62 +3520,71 @@ async function buildStatusDashboard(state) {
   if (!ids.length) {
     return '当前没有监控的市场。用 /add &lt;id&gt; 加一个，或开启 AUTODISCOVER=true。';
   }
-  const rows = ids.map((id) => ({ id, slot: state.markets[id] }));
-  const errors = rows.filter(({ slot }) => slot?.lastError);
-  const filterBlocked = rows.filter(({ slot }) => slot?.lastSkipReason?.startsWith('过滤器:'));
-  const otherSkipped = rows.filter(({ slot }) =>
-    slot?.lastSkipReason && !slot.lastSkipReason.startsWith('过滤器:')
-  );
-  const waiting = rows.filter(({ slot }) => !slot);
-  const paused = rows.filter(({ id }) => state.pausedIds.includes(id));
-  const watched = rows.filter(({ id }) => (state.watchedIds ?? []).includes(id));
-  const gaps = rows.filter(({ slot }) =>
-    slot?.zoneStatus
-    && !slot.lastError
-    && !slot.lastSkipReason
-    && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated)
-  );
-  const ppRows = rows
-    .filter(({ slot }) => slot && !slot.lastError && !slot.lastSkipReason && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
-    .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
+  // Single pass over the pool — /status is the most-run command, and the
+  // buckets/counters below all derive from the same per-slot facts, so one
+  // loop with Sets beats a dozen filter passes (two of which were O(n²)
+  // Array.includes scans).
+  const pausedSet = new Set(state.pausedIds);
+  const watchedSet = new Set(state.watchedIds ?? []);
+  const errors = [];
+  const gaps = [];
+  const ppRows = [];
+  let filterBlockedCount = 0;
+  let otherSkippedCount = 0;
+  let waitingCount = 0;
+  let pausedCount = 0;
+  let watchedCount = 0;
+  let thinCount = 0;
+  let wideCount = 0;
+  let tightCount = 0;
+  let emptyCount = 0;
+  for (const id of ids) {
+    const slot = state.markets[id];
+    if (pausedSet.has(id)) pausedCount += 1;
+    if (watchedSet.has(id)) watchedCount += 1;
+    if (!slot) { waitingCount += 1; continue; }
+    if (slot.lastError) errors.push({ id, slot });
+    if (slot.lastSkipReason) {
+      if (slot.lastSkipReason.startsWith('过滤器:')) filterBlockedCount += 1;
+      else otherSkippedCount += 1;
+    }
+    const live = !slot.lastError && !slot.lastSkipReason;
+    if (!live) continue;
+    if (slot.zoneStatus && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated)) {
+      gaps.push({ id, slot });
+    }
+    if (Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0) ppRows.push({ id, slot });
+    // Live opportunity counts derived from per-tick slot metrics (set in
+    // monitor.js). Same definitions as the /thin /wide /empty list filters.
+    if (Number.isFinite(slot.lastTopUsd) && slot.lastTopUsd > 0
+      && slot.lastTopUsd <= (config.lowDepthThreshold ?? 100)) thinCount += 1;
+    if (Number.isFinite(slot.lastSpread)) {
+      if (slot.lastSpread > config.maxSpread) wideCount += 1;
+      if (slot.lastSpread >= 0 && slot.lastSpread <= config.tightSpreadThreshold) tightCount += 1;
+    }
+    if (slot.baseline && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)) {
+      emptyCount += 1;
+    }
+  }
+  ppRows.sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
   const totalRate = ppRows.reduce((acc, { slot }) => acc + slot.lastHourlyRate, 0);
   const topRate = ppRows[0]?.slot?.lastHourlyRate ?? 0;
-  // Live opportunity counts derived from per-tick slot metrics (set in
-  // monitor.js). Same definitions as the /thin /wide /empty list filters.
-  const thinCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason
-    && Number.isFinite(slot.lastTopUsd) && slot.lastTopUsd > 0
-    && slot.lastTopUsd <= (config.lowDepthThreshold ?? 100)
-  ).length;
-  const wideCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason
-    && Number.isFinite(slot.lastSpread) && slot.lastSpread > config.maxSpread
-  ).length;
-  const tightCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason
-    && Number.isFinite(slot.lastSpread)
-    && slot.lastSpread >= 0 && slot.lastSpread <= config.tightSpreadThreshold
-  ).length;
-  const emptyCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason && slot.baseline
-    && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)
-  ).length;
 
-  // Cross-market ladder-mispricing count (same signal as /sanity).
+  // Cross-market ladder-mispricing count (same signal as /sanity) and the
+  // 24h PP total read independent sources — run them concurrently.
   let sanityCount = 0;
-  try {
-    const { collectPriceSanityIssues } = await import('./monitor.js');
-    sanityCount = collectPriceSanityIssues(state).length;
-  } catch {}
-
   let totalPP24h = null;
-  try {
-    const { readHistorySince, summarize24h } = await import('./history.js');
-    const since = Date.now() - 24 * 3600 * 1000;
-    const records = await readHistorySince(since);
-    const summary = summarize24h(records);
-    totalPP24h = summary.reduce((a, m) => a + (m.ppEarned ?? 0), 0);
-  } catch {}
+  const [sanityRes, historyRes] = await Promise.allSettled([
+    import('./monitor.js').then(({ collectPriceSanityIssues }) =>
+      collectPriceSanityIssues(state).length),
+    import('./history.js').then(async ({ readHistorySince, summarize24h }) => {
+      const since = Date.now() - 24 * 3600 * 1000;
+      const records = await readHistorySince(since);
+      return summarize24h(records).reduce((a, m) => a + (m.ppEarned ?? 0), 0);
+    }),
+  ]);
+  if (sanityRes.status === 'fulfilled') sanityCount = sanityRes.value;
+  if (historyRes.status === 'fulfilled') totalPP24h = historyRes.value;
 
   // Top dashboard panel — at-a-glance "is everything working + what's
   // going on" without scrolling. Three grouped lines: market census,
@@ -3716,10 +3592,10 @@ async function buildStatusDashboard(state) {
   const lines = ['📡 <b>监控看板</b>'];
   const census = [`市场 <b>${ids.length}</b>`, `有效 <b>${ppRows.length}</b>`];
   if (errors.length) census.push(`报错 ${errors.length}`);
-  if (filterBlocked.length) census.push(`过滤 ${filterBlocked.length}`);
-  if (otherSkipped.length) census.push(`跳过 ${otherSkipped.length}`);
-  if (waiting.length) census.push(`等待 ${waiting.length}`);
-  if (paused.length) census.push(`暂停 ${paused.length}`);
+  if (filterBlockedCount) census.push(`过滤 ${filterBlockedCount}`);
+  if (otherSkippedCount) census.push(`跳过 ${otherSkippedCount}`);
+  if (waitingCount) census.push(`等待 ${waitingCount}`);
+  if (pausedCount) census.push(`暂停 ${pausedCount}`);
   lines.push(census.join(' · '));
   lines.push(`💰 总 <b>${totalRate.toFixed(0)}</b> PP/h · 顶 <b>${topRate.toFixed(0)}</b>/h${totalPP24h != null && totalPP24h > 0 ? ` · 24h <b>${totalPP24h.toFixed(0)} PP</b>` : ''}`);
   const oppParts = [`奖励区空缺 <b>${gaps.length}</b>`];
@@ -3728,7 +3604,7 @@ async function buildStatusDashboard(state) {
   if (tightCount > 0) oppParts.push(`紧差 ${tightCount}`);
   if (emptyCount > 0) oppParts.push(`空簿 ${emptyCount}`);
   if (sanityCount > 0) oppParts.push(`⚠️ 定价异常 ${sanityCount}`);
-  if (watched.length) oppParts.push(`👁 追踪 ${watched.length}`);
+  if (watchedCount) oppParts.push(`👁 追踪 ${watchedCount}`);
   lines.push(`🎯 ${oppParts.join(' · ')}`);
   lines.push('');
 
@@ -3772,40 +3648,6 @@ async function buildStatusDashboard(state) {
   lines.push('更多: /top /gaps /thin /wide /empty' + (sanityCount > 0 ? ' /sanity' : ''));
 
   return lines.join('\n');
-}
-
-function statusLine(state, id) {
-  const slot = state.markets[id];
-  const paused = state.pausedIds.includes(id);
-  const watched = (state.watchedIds ?? []).includes(id);
-  const snoozeUntil = state.snoozes?.[id];
-  const isSnoozed = snoozeUntil && snoozeUntil > Date.now();
-  const tags = [
-    paused ? 'paused' : '',
-    isSnoozed ? 'snoozed' : '',
-    watched ? 'watch' : '',
-  ].filter(Boolean);
-  const tag = tags.length ? ` [${tags.join(',')}]` : '';
-  const title = slot?.title ? slot.title.slice(0, 40) : `Market ${id}`;
-  if (!slot) return `#${id}${tag} ${title} — 等待首次抓取`;
-  if (slot.lastError) return `#${id}${tag} ${title} — ⚠ ${slot.lastError}`;
-  if (slot.lastSkipReason) return `#${id}${tag} ${title} — ⏭ ${slot.lastSkipReason}`;
-  if (slot.lastChangeAt == null) return `#${id}${tag} ${title} — 等待首次抓取`;
-  const since = stallDurationMs(slot) ?? 0;
-  const rate = Number.isFinite(slot.lastHourlyRate) ? slot.lastHourlyRate.toFixed(0) : '?';
-
-  // Remaining time + estimated total PP available for the rest of the market.
-  let timeBadge = '';
-  if (slot.endMs && Number.isFinite(slot.lastHourlyRate)) {
-    const rem = fmtRemaining(slot.endMs);
-    const remH = Math.max(0, (slot.endMs - Date.now()) / 3600000);
-    const totalPP = slot.lastHourlyRate * remH;
-    timeBadge = ` · 余${rem}≈${fmtBig(totalPP)}PP`;
-  } else if (slot.endMs) {
-    timeBadge = ` · 余${fmtRemaining(slot.endMs)}`;
-  }
-
-  return `#${id}${tag} ${title} — 停滞 ${fmtElapsed(since)} · ${rate}/h${timeBadge}${zoneTag(slot)}`;
 }
 
 function formatWhitelist(state) {
@@ -3899,56 +3741,18 @@ async function buildConfigDump(state) {
 // pool and a per-market timeout so one dead market can't stall the scan.
 const COMBO_FETCH_CONCURRENCY = 6;
 const COMBO_PER_MARKET_TIMEOUT_MS = 12_000;
+// Global deadline for a whole sweep — same guard the /stale refetch has, so
+// a large ladder set full of dead books can't pin /combo for many minutes.
+const COMBO_FETCH_DEADLINE_MS = 5 * 60 * 1000;
 
 async function fetchFreshBooks(ids, state) {
-  const books = new Map();
-  let failed = 0;
-  let next = 0;
-  const fetchOne = async (id) => {
-    const slot = state.markets[id];
-    let timer;
-    const timeout = new Promise((_, rej) => {
-      timer = setTimeout(
-        () => rej(new Error(`timeout ${COMBO_PER_MARKET_TIMEOUT_MS / 1000}s`)),
-        COMBO_PER_MARKET_TIMEOUT_MS,
-      );
-    });
-    try {
-      return await Promise.race([
-        getOrderbook(slot?.orderbookCache?.key ?? id, {
-          contextMarketId: id,
-          cache: slot?.orderbookCache ?? null,
-        }),
-        timeout,
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  const worker = async () => {
-    while (next < ids.length) {
-      const id = ids[next++];
-      try {
-        const book = await fetchOne(id);
-        books.set(String(id), book);
-        const slot = state.markets[id];
-        if (slot) {
-          slot.recentBook = {
-            bids: book.bids ?? [],
-            asks: book.asks ?? [],
-            fetchedAt: Date.now(),
-          };
-        }
-      } catch (err) {
-        failed += 1;
-        log(`[combo] book refetch failed for ${id}: ${err.message}`);
-      }
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(COMBO_FETCH_CONCURRENCY, ids.length) }, worker),
-  );
-  return { books, failed };
+  const pool = await fetchBooksPool(ids, state, {
+    concurrency: COMBO_FETCH_CONCURRENCY,
+    perMarketTimeoutMs: COMBO_PER_MARKET_TIMEOUT_MS,
+    deadlineMs: COMBO_FETCH_DEADLINE_MS,
+  });
+  // The combo screen reports a single failure count (timeouts included).
+  return { books: pool.results, failed: pool.timedOut + pool.failed };
 }
 
 // One rendered line-pair per combo hit. `state` supplies slot titles/slugs
@@ -4234,13 +4038,23 @@ function comboPairPassesExt(pair, books, ext) {
 // Why a market is NOT part of the combo scan's entry universe — or null when
 // it IS included. Single source of truth shared by the scan gather and the
 // /combo check diagnosis so they can never disagree.
-function comboExclusionReason(state, id) {
+// Precomputed id sets for a batch of comboExclusionReason calls — building
+// them once per scan keeps the per-market check O(1) instead of rebuilding
+// the whole active-id Set for every market in the pool.
+function comboScanCtx(state) {
+  return {
+    activeSet: new Set(activeMarketIds(state)),
+    pausedSet: new Set(state.pausedIds ?? []),
+  };
+}
+
+function comboExclusionReason(state, id, scanCtx = null) {
   const key = String(id);
-  const activeSet = new Set(activeMarketIds(state));
+  const { activeSet, pausedSet } = scanCtx ?? comboScanCtx(state);
   if (!activeSet.has(key)) return '不在当前监控集（未被自动发现或已 /remove）— 用 /add ' + key + ' 加入后即可参与';
   const slot = state.markets[key];
   if (!slot) return '监控中但还没抓到首帧数据（等下一轮轮询，或 /probe ' + key + ' 触发）';
-  if (state.pausedIds?.includes(key)) return '已被 /pause 暂停（/resume ' + key + ' 恢复）';
+  if (pausedSet.has(key)) return '已被 /pause 暂停（/resume ' + key + ' 恢复）';
   if (isSnoozed(state, key)) return '处于 /snooze 静音期';
   if (slot.lastError) return `上次抓取出错: ${slot.lastError}`;
   // Skipped by the monitor for a non-filter reason = resolved / no reward /
@@ -4259,8 +4073,9 @@ function comboExclusionReason(state, id) {
 // longer shows (and shadowing the real live pair).
 function gatherComboEntries(state) {
   const entries = [];
+  const scanCtx = comboScanCtx(state);
   for (const id of Object.keys(state.markets)) {
-    if (comboExclusionReason(state, id)) continue;
+    if (comboExclusionReason(state, id, scanCtx)) continue;
     const slot = state.markets[id];
     entries.push({ id, title: slot.title, question: slot.question });
   }
@@ -4323,7 +4138,11 @@ function rememberComboScan(chatId, messageId, scan) {
   while (_comboScans.size >= COMBO_SCAN_CACHE_MAX) {
     _comboScans.delete(_comboScans.keys().next().value); // oldest insert
   }
-  _comboScans.set(`${chatId}:${messageId}`, { scan, at: now });
+  // Page taps only ever render `hits`; the full `pairs` array (every
+  // adjacent pair across every ladder, needed only for the initial
+  // empty-result "closest combos" hint) would multiply the retained set
+  // for nothing. The empty-hits path never paginates, so drop pairs.
+  _comboScans.set(`${chatId}:${messageId}`, { scan: { ...scan, pairs: [] }, at: now });
 }
 
 function getComboScan(chatId, messageId) {
@@ -4356,7 +4175,6 @@ async function buildComboCheckMessage(rawArg, state) {
   if (url) {
     const slug = slugFromPredictUrl(url);
     if (!slug) return `未能从 URL 提取 slug:\n<code>${htmlEscape(url)}</code>`;
-    const { resolveUrlSlugToMarkets } = await import('./predict.js');
     let matches = [];
     try {
       matches = await resolveUrlSlugToMarkets(slug, slugifyMarketTitle);
@@ -4383,7 +4201,8 @@ async function buildComboCheckMessage(rawArg, state) {
   targets = targets.slice(0, COMBO_CHECK_MAX_TARGETS);
 
   // Fill title/question from the freshest source available: slot → API.
-  for (const t of targets) {
+  // The API fallbacks are independent per target, so run them in parallel.
+  await Promise.all(targets.map(async (t) => {
     const slot = state.markets[t.id];
     t.title = t.title ?? slot?.title ?? null;
     t.question = t.question ?? slot?.question ?? null;
@@ -4394,7 +4213,7 @@ async function buildComboCheckMessage(rawArg, state) {
         t.question = s?.market?.question ?? null;
       } catch { /* diagnosis continues with what we have */ }
     }
-  }
+  }));
 
   // Ladder universe = the live scan's entries plus the targets themselves,
   // so grouping is visible even for markets the scan currently excludes.
@@ -4407,10 +4226,11 @@ async function buildComboCheckMessage(rawArg, state) {
   const d = comboDefaultFilter(state);
   const lines = [`🔎 <b>组合识别诊断</b> · ${targets.length} 个市场 · 判定上限 &lt;${d.cap}¢`, ''];
   const checkLadderKeys = new Set();
+  const scanCtx = comboScanCtx(state);
   for (const t of targets) {
     const label = htmlEscape(shortTitle(t.title || t.question || `Market ${t.id}`, 48));
     lines.push(`<b>#${htmlEscape(t.id)}</b> <a href="${marketUrl(t.id, t.title, t.question, state.markets[t.id]?.slug)}">${label}</a>`);
-    const reason = comboExclusionReason(state, t.id);
+    const reason = comboExclusionReason(state, t.id, scanCtx);
     lines.push(reason ? `❌ 扫描范围: ${htmlEscape(reason)}` : '✅ 扫描范围: 在监控集内，参与扫描');
     const cls = classifyComboEntry(t);
     if (!cls) {
@@ -4431,7 +4251,7 @@ async function buildComboCheckMessage(rawArg, state) {
       continue;
     }
     const rungBits = ladder.rungs.map((r) => {
-      const ex = comboExclusionReason(state, r.id);
+      const ex = comboExclusionReason(state, r.id, scanCtx);
       return `${htmlEscape(r.raw)}${ex ? '⛔' : ''}`;
     });
     lines.push(`✅ 阶梯: ${ladder.rungs.length} 档 — ${rungBits.join(' · ')}${rungBits.some((b) => b.includes('⛔')) ? '（⛔ = 被扫描排除，详见上方原因）' : ''}`);
@@ -4534,49 +4354,37 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
       rememberCustomExtPreset(state, f.ext);
       if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo ext preset persist failed:', err.message));
     }
-    try {
-      await editTelegramMessage(chatId, messageId, comboWizardText(f), comboWizardKeyboard(f, state.customExtPresets));
-    } catch (err) {
-      if (!/message is not modified/i.test(err.message ?? '')) warn('combo wizard edit failed:', err.message);
-    }
+    await safeEdit(chatId, messageId, comboWizardText(f), comboWizardKeyboard(f, state.customExtPresets), 'combo wizard');
     return true;
   }
   if (action === 'ext-clear') {
-    if (Array.isArray(state.customExtPresets) && state.customExtPresets.length) {
-      state.customExtPresets = [];
-      if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo ext-clear persist failed:', err.message));
-    }
-    const f2 = { ...f, ext: isCustomExt(f.ext) ? 'off' : f.ext };
-    try { await editTelegramMessage(chatId, messageId, comboWizardText(f2), comboWizardKeyboard(f2, state.customExtPresets)); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo ext-clear edit failed:', err.message); }
+    const f2 = { ...f, ext: clearCustomExtPresets(state, fullCtx, f.ext, 'combo') };
+    await safeEdit(chatId, messageId, comboWizardText(f2), comboWizardKeyboard(f2, state.customExtPresets), 'combo ext-clear');
     return true;
   }
   // ✏ on a knob: stash pending input; the next plain number the user sends
   // in this chat is applied to that field (see the message loop).
   if (action.startsWith('cust-')) {
     const field = action.slice('cust-'.length); // cap | minsh | ext | terr
-    setPendingFilterInput(chatId, fromId, {
-      kind: 'combo', field,
-      cap: f.cap, comboKind: f.kind, minSh: f.minSh, sort: f.sort, ext: f.ext,
-      terr: comboTerrOf(f), messageId,
-    });
     const prompts = {
       cap: '组合价上限 ¢，可带小数（例 107.5 = 两腿合计 <107.5¢ 才列出；范围 50-199.9）',
       minsh: '最低可成交股数，整数（例 200；0 = 不限）',
       ext: `极端价百分位 1-99（例 85 = ${parseExtRaw(f.ext).mode === 'in' ? '仅' : '排除'}任一腿 ≥85¢ / ≤15¢ 的组合；也可回复区间如 85-96；想换模式先点对应的 排除/仅 按钮）`,
       terr: `时间误差 ¢，可带小数（例 2 = 日期相邻档中，早档实际价偏离「晚档价 × 剩余时间占比」≥2¢ 才列出；范围 ${COMBO_TERR_MIN}-${COMBO_TERR_MAX}，非数字 = 关）`,
     };
-    const hint = [
-      '💡 <b>组合价筛选 · 等待自定义…</b>',
-      '',
-      `请直接在本 chat <b>回复一个数字</b>（${prompts[field] ?? ''}）。`,
-      '',
-      `当前: <i>${htmlEscape(comboLabel(f))}</i>`,
-      '',
-      '<i>5 分钟内有效。回复非数字即恢复默认。</i>',
-    ].join('\n');
-    const cancelKb = { inline_keyboard: [[{ text: '✖ 取消(回到向导)', callback_data: comboCb('wizard', f) }]] };
-    try { await editTelegramMessage(chatId, messageId, hint, cancelKb); } catch {}
+    await promptCustomInput({
+      chatId, messageId, fromId,
+      pending: {
+        kind: 'combo', field,
+        cap: f.cap, comboKind: f.kind, minSh: f.minSh, sort: f.sort, ext: f.ext,
+        terr: comboTerrOf(f), messageId,
+      },
+      title: '💡 <b>组合价筛选',
+      prompt: prompts[field] ?? '',
+      currentLabel: comboLabel(f),
+      footer: '<i>5 分钟内有效。回复非数字即恢复默认。</i>',
+      backCb: comboCb('wizard', f),
+    });
     return true;
   }
   if (action === 'cancel') {
@@ -4593,35 +4401,22 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
         { text: '🎚 调整设置', callback_data: comboCb('wizard', f) },
       ]],
     };
-    try { await editTelegramMessage(chatId, messageId, text, kb); } catch {}
+    await safeEdit(chatId, messageId, text, kb);
     return true;
   }
   if (action === 'run') {
-    try {
-      await editTelegramMessage(
-        chatId, messageId,
-        `⏳ 组合价筛选：正在实时重抓阶梯市场的订单簿…\n\n<i>${htmlEscape(comboLabel(f))}</i>`,
-        undefined,
-      );
-    } catch {}
+    await safeEdit(chatId, messageId, `⏳ 组合价筛选：正在实时重抓阶梯市场的订单簿…\n\n<i>${htmlEscape(comboLabel(f))}</i>`, undefined);
     let scan;
     try {
       scan = await runComboScan(f, state);
     } catch (err) {
       warn('combo run failed:', err.message);
-      try {
-        await editTelegramMessage(
-          chatId, messageId,
-          `⚠ 组合价扫描失败: <code>${htmlEscape(err.message)}</code>\n\n请重试。`,
-          { inline_keyboard: [[{ text: '🎚 调整设置', callback_data: comboCb('wizard', f) }]] },
-        );
-      } catch {}
+      await safeEdit(chatId, messageId, `⚠ 组合价扫描失败: <code>${htmlEscape(err.message)}</code>\n\n请重试。`, { inline_keyboard: [[{ text: '🎚 调整设置', callback_data: comboCb('wizard', f) }]] });
       return true;
     }
     rememberComboScan(chatId, messageId, scan);
     const reply = renderComboResult(f, state, scan, 0);
-    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo result edit failed:', err.message); }
+    await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'combo result');
     return true;
   }
   if (action === 'page') {
@@ -4635,18 +4430,11 @@ export async function handleComboWizardCallback(data, { chatId, messageId, fromI
           { text: '🎚 调整设置', callback_data: comboCb('wizard', f) },
         ]],
       };
-      try {
-        await editTelegramMessage(
-          chatId, messageId,
-          `💡 <b>组合价筛选</b>\n\n这页结果已过期（缓存 ${COMBO_SCAN_TTL_MS / 60000} 分钟）。点 🚀 重新实时扫描。\n\n当前设置: <i>${htmlEscape(comboLabel(f))}</i>`,
-          kb,
-        );
-      } catch {}
+      await safeEdit(chatId, messageId, `💡 <b>组合价筛选</b>\n\n这页结果已过期（缓存 ${COMBO_SCAN_TTL_MS / 60000} 分钟）。点 🚀 重新实时扫描。\n\n当前设置: <i>${htmlEscape(comboLabel(f))}</i>`, kb);
       return true;
     }
     const reply = renderComboResult(f, state, scan, f.page);
-    try { await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup); }
-    catch (err) { if (!/message is not modified/i.test(err.message ?? '')) warn('combo page edit failed:', err.message); }
+    await safeEdit(chatId, messageId, reply.text, reply.replyMarkup, 'combo page');
     return true;
   }
   return true;
@@ -5635,6 +5423,109 @@ function isActivateCommand(text) {
   return cmd === '/activate';
 }
 
+// Apply a typed custom-value reply to whichever wizard stashed the
+// pending-input entry (see setPendingFilterInput / promptCustomInput).
+// Kept at top level so the polling loop stays a thin router. Non-numeric
+// or out-of-range input reverts the field per each wizard's convention
+// (default / off / 不限).
+async function applyPendingFilterInput(pending, text, { chatId, state, fullCtx }) {
+  const trimmed = text.trim();
+  const num = /^\d+$/.test(trimmed) ? Number(trimmed) : null;
+  const decOk = /^\d+(\.\d+)?$/.test(trimmed);
+  if (pending.kind === 'new') {
+    // /new wizard: pending.field tells us which knob to update.
+    // Non-numeric / 0 → revert that field to its default.
+    const next = {
+      winH: pending.winH, minRate: pending.minRate, minRem: pending.minRem,
+      bits: pending.bits ?? NEW_DEFAULT.bits,
+      thresh: pending.thresh ?? NEW_DEFAULT.thresh,
+      dir: pending.dir ?? NEW_DEFAULT.dir,
+      sort: pending.sort,
+    };
+    if (pending.field === 'win') {
+      next.winH = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.winH;
+    } else if (pending.field === 'rate') {
+      next.minRate = (num != null && num > 0) ? num : NEW_DEFAULT.minRate;
+    } else if (pending.field === 'rem') {
+      next.minRem = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.minRem;
+    } else if (pending.field === 'thresh') {
+      next.thresh = (num != null && num > 0) ? String(num) : NEW_DEFAULT.thresh;
+    }
+    await safeEdit(chatId, pending.messageId, newWizardText(next), newWizardKeyboard(next), 'new custom-input apply');
+    return;
+  }
+  // Shared ext parsing: "88" or a band like "85-96", each side 1-99;
+  // preserves the current mode (排除/仅). Junk → off.
+  const extFromInput = () => {
+    const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
+    const tok = customExtTokenFromInput(trimmed, mode);
+    // Keep a genuinely-custom value as a button for next time.
+    if (tok) rememberCustomExtPreset(state, tok);
+    return tok ?? 'off';
+  };
+  if (pending.kind === 'tight') {
+    // /tight wizard. pending.field = gap | minsh | spread | ext.
+    // gap/spread accept decimals (e.g. 0.3¢), so parse the raw string
+    // rather than the integer-only `num` above.
+    const f = {
+      levels: pending.levels, gap: pending.gap, minSh: pending.minSh,
+      both: pending.both, sort: pending.sort, spread: pending.spread, ext: pending.ext,
+    };
+    if (pending.field === 'gap') {
+      // junk / out-of-range → reset to 整格(自适应).
+      f.gap = (decOk ? normalizeCustomCents(trimmed, TIGHT_CUSTOM_GAP_MAX) : null) ?? TIGHT_DEFAULT.gap;
+    } else if (pending.field === 'spread') {
+      f.spread = (decOk ? normalizeCustomCents(trimmed, TIGHT_CUSTOM_SPREAD_MAX) : null) ?? 'inf';
+    } else if (pending.field === 'minsh') {
+      f.minSh = (num != null && num > 0) ? num : 0; // shares: integer; 0/junk → 不限
+    } else if (pending.field === 'ext') {
+      f.ext = extFromInput();
+    }
+    await safeEdit(chatId, pending.messageId, tightWizardText(f), tightWizardKeyboard(f, state.customExtPresets), 'tight custom-input apply');
+    if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight custom persist failed:', err.message));
+    return;
+  }
+  if (pending.kind === 'combo') {
+    // /combo wizard. pending.field = cap | minsh | ext | terr. cap and
+    // terr accept decimals; junk falls back to default / off.
+    const f = {
+      cap: pending.cap, kind: pending.comboKind,
+      minSh: pending.minSh, sort: pending.sort, ext: pending.ext,
+      terr: pending.terr ?? 'off',
+    };
+    if (pending.field === 'cap') {
+      f.cap = (decOk ? normalizeComboCap(trimmed) : null) ?? comboDefaultFilter(state).cap;
+    } else if (pending.field === 'minsh') {
+      f.minSh = (num != null && num > 0) ? num : 0; // 0/junk → 不限
+    } else if (pending.field === 'terr') {
+      f.terr = (decOk ? normalizeComboTerr(trimmed) : null) ?? 'off';
+    } else if (pending.field === 'ext') {
+      f.ext = extFromInput();
+    }
+    await safeEdit(chatId, pending.messageId, comboWizardText(f), comboWizardKeyboard(f, state.customExtPresets), 'combo custom-input apply');
+    if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo custom persist failed:', err.message));
+    return;
+  }
+  // /stale or /all wizard. pending.field tells us which knob — 'thresh'
+  // for the sum threshold ($), 'ext' for 极端价 (1-99). 'thresh' is the
+  // legacy default for callbacks that didn't populate field (the wizard's
+  // only custom input pre-ext).
+  const field = pending.field === 'ext' ? 'ext' : 'thresh';
+  let nextThresh = pending.thresh ?? 'inf';
+  let nextExt = pending.ext ?? 'off';
+  if (field === 'thresh') {
+    nextThresh = num != null && num > 0 ? String(num) : 'inf';
+  } else {
+    nextExt = extFromInput();
+  }
+  await safeEdit(
+    chatId, pending.messageId,
+    listWizardText(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt),
+    listWizardKeyboard(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt, state.customExtPresets),
+    'custom-thresh apply',
+  );
+}
+
 function normalizeReply(reply) {
   if (reply == null) return null;
   if (typeof reply === 'string') return { text: reply };
@@ -5743,144 +5634,7 @@ export function startCommandLoop({ getState, persist, ctx }) {
             // whichever wizard set the pending entry (kind field).
             const pending = consumePendingFilterInput(chatId, fromId);
             if (pending) {
-              const trimmed = text.trim();
-              const num = /^\d+$/.test(trimmed) ? Number(trimmed) : null;
-              if (pending.kind === 'new') {
-                // /new wizard: pending.field tells us which knob to update.
-                // Non-numeric / 0 → revert that field to its default.
-                const next = {
-                  winH: pending.winH, minRate: pending.minRate, minRem: pending.minRem,
-                  bits: pending.bits ?? NEW_DEFAULT.bits,
-                  thresh: pending.thresh ?? NEW_DEFAULT.thresh,
-                  dir: pending.dir ?? NEW_DEFAULT.dir,
-                  sort: pending.sort,
-                };
-                if (pending.field === 'win') {
-                  next.winH = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.winH;
-                } else if (pending.field === 'rate') {
-                  next.minRate = (num != null && num > 0) ? num : NEW_DEFAULT.minRate;
-                } else if (pending.field === 'rem') {
-                  next.minRem = (num != null && num > 0) ? Math.min(720 * 24, num) : NEW_DEFAULT.minRem;
-                } else if (pending.field === 'thresh') {
-                  next.thresh = (num != null && num > 0) ? String(num) : NEW_DEFAULT.thresh;
-                }
-                try {
-                  await editTelegramMessage(
-                    chatId, pending.messageId,
-                    newWizardText(next), newWizardKeyboard(next),
-                  );
-                } catch (err) {
-                  warn(`new custom-input apply edit failed: ${err.message}`);
-                }
-              } else if (pending.kind === 'tight') {
-                // /tight wizard. pending.field = gap | minsh | spread | ext.
-                // gap/spread accept decimals (e.g. 0.3¢), so parse the raw
-                // string here rather than the integer-only `num` above.
-                const f = {
-                  levels: pending.levels, gap: pending.gap, minSh: pending.minSh,
-                  both: pending.both, sort: pending.sort, spread: pending.spread, ext: pending.ext,
-                };
-                const decOk = /^\d+(\.\d+)?$/.test(trimmed);
-                const dec = decOk ? Number(trimmed) : null;
-                if (pending.field === 'gap') {
-                  // junk / out-of-range → reset to 整格(自适应).
-                  f.gap = (dec != null ? normalizeCustomCents(trimmed, TIGHT_CUSTOM_GAP_MAX) : null) ?? TIGHT_DEFAULT.gap;
-                } else if (pending.field === 'spread') {
-                  f.spread = (dec != null ? normalizeCustomCents(trimmed, TIGHT_CUSTOM_SPREAD_MAX) : null) ?? 'inf';
-                } else if (pending.field === 'minsh') {
-                  f.minSh = (num != null && num > 0) ? num : 0; // shares: integer; 0/junk → 不限
-                } else if (pending.field === 'ext') {
-                  // Accepts "88" or a band like "85-96"; preserves the current
-                  // mode (排除/仅). Junk → off.
-                  const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
-                  const tok = customExtTokenFromInput(trimmed, mode);
-                  if (tok) {
-                    f.ext = tok;
-                    rememberCustomExtPreset(state, f.ext);
-                  } else {
-                    f.ext = 'off';
-                  }
-                }
-                try {
-                  await editTelegramMessage(
-                    chatId, pending.messageId,
-                    tightWizardText(f), tightWizardKeyboard(f, state.customExtPresets),
-                  );
-                  if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('tight custom persist failed:', err.message));
-                } catch (err) {
-                  warn(`tight custom-input apply edit failed: ${err.message}`);
-                }
-              } else if (pending.kind === 'combo') {
-                // /combo wizard. pending.field = cap | minsh | ext | terr. cap
-                // and terr accept decimals; junk falls back to default / off.
-                const f = {
-                  cap: pending.cap, kind: pending.comboKind,
-                  minSh: pending.minSh, sort: pending.sort, ext: pending.ext,
-                  terr: pending.terr ?? 'off',
-                };
-                const decOk = /^\d+(\.\d+)?$/.test(trimmed);
-                if (pending.field === 'cap') {
-                  f.cap = (decOk ? normalizeComboCap(trimmed) : null) ?? comboDefaultFilter(state).cap;
-                } else if (pending.field === 'minsh') {
-                  f.minSh = (num != null && num > 0) ? num : 0; // 0/junk → 不限
-                } else if (pending.field === 'terr') {
-                  f.terr = (decOk ? normalizeComboTerr(trimmed) : null) ?? 'off';
-                } else if (pending.field === 'ext') {
-                  // "88" or a band like "85-96", each side 1-99; preserves the
-                  // current mode (排除/仅). Junk → off.
-                  const mode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
-                  const tok = customExtTokenFromInput(trimmed, mode);
-                  if (tok) {
-                    f.ext = tok;
-                    rememberCustomExtPreset(state, f.ext);
-                  } else {
-                    f.ext = 'off';
-                  }
-                }
-                try {
-                  await editTelegramMessage(
-                    chatId, pending.messageId,
-                    comboWizardText(f), comboWizardKeyboard(f, state.customExtPresets),
-                  );
-                  if (fullCtx?.persist) fullCtx.persist().catch((err) => warn('combo custom persist failed:', err.message));
-                } catch (err) {
-                  warn(`combo custom-input apply edit failed: ${err.message}`);
-                }
-              } else {
-                // /stale or /all wizard. pending.field tells us which knob —
-                // 'thresh' for sum threshold ($), 'ext' for 极端价 (1-99).
-                // 'thresh' is the legacy default for callbacks that didn't
-                // populate field (the wizard's only custom input pre-ext).
-                const field = pending.field === 'ext' ? 'ext' : 'thresh';
-                let nextThresh = pending.thresh ?? 'inf';
-                let nextExt = pending.ext ?? 'off';
-                if (field === 'thresh') {
-                  nextThresh = num != null && num > 0 ? String(num) : 'inf';
-                } else {
-                  // ext: "88" or a band like "85-96" (each side 1-99); preserves
-                  // the current mode (ex/in), so ✏ while in "仅显示" mode stays
-                  // in "仅显示". Junk → off.
-                  const currentMode = parseExtRaw(pending.ext).mode === 'in' ? 'in' : 'ex';
-                  const tok = customExtTokenFromInput(trimmed, currentMode);
-                  if (tok) {
-                    nextExt = tok;
-                    // Keep a genuinely-custom value as a button for next time.
-                    rememberCustomExtPreset(state, nextExt);
-                  } else {
-                    nextExt = 'off';
-                  }
-                }
-                try {
-                  await editTelegramMessage(
-                    chatId,
-                    pending.messageId,
-                    listWizardText(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt),
-                    listWizardKeyboard(pending.kind, pending.bits, nextThresh, pending.sort, pending.dir, nextExt, state.customExtPresets),
-                  );
-                } catch (err) {
-                  warn(`custom-thresh apply edit failed: ${err.message}`);
-                }
-              }
+              await applyPendingFilterInput(pending, text, { chatId, state, fullCtx });
               continue;
             }
             // Smart paste shortcut for admin DM: bare URLs / market ids
