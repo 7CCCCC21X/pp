@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
-import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats, recordMarketFirstSeen } from './state.js';
+import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats, recordMarketFirstSeen, pruneMarketFirstSeen } from './state.js';
 import { checkMarket, flushChatDigests, checkPriceSanity } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
@@ -125,6 +125,9 @@ async function maybePruneHistory(state) {
 async function tick(state) {
   await maybePruneHistory(state);
   await maybeDiscover(state);
+  // First-seen map must shrink even when discovery is off or failing —
+  // otherwise /new iterates an ever-growing map on every render.
+  pruneMarketFirstSeen(state);
   const ids = activeMarketIds(state);
   if (!ids.length) {
     log('no markets to monitor (empty MARKET_IDS, no autodiscovered, nothing /add\'d). Idle tick.');

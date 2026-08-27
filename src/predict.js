@@ -486,6 +486,22 @@ export async function getSlugMapCached() {
 // can fall back to the bulk slug map / title slugify chain.
 const _restMarketCache = new Map();   // id -> { market, at }
 const _restMarketInflight = new Map(); // id -> Promise
+// Entries were TTL-checked on read but never evicted, so a long-running
+// process accumulated full REST market objects forever. Cap the map and
+// sweep expired entries on insert.
+const REST_MARKET_CACHE_MAX = 500;
+
+function pruneRestMarketCache() {
+  const now = Date.now();
+  const ttl = config.marketsCacheTtlMs;
+  for (const [k, v] of _restMarketCache) {
+    if (now - v.at >= ttl) _restMarketCache.delete(k);
+  }
+  // Still over cap after dropping expired → evict oldest inserts.
+  while (_restMarketCache.size >= REST_MARKET_CACHE_MAX) {
+    _restMarketCache.delete(_restMarketCache.keys().next().value);
+  }
+}
 
 export async function getMarketRestById(id) {
   const key = String(id);
@@ -504,6 +520,7 @@ export async function getMarketRestById(id) {
       const data = json?.data ?? json;
       const market = Array.isArray(data) ? data[0] : data;
       if (market?.id != null) {
+        pruneRestMarketCache();
         _restMarketCache.set(key, { market, at: Date.now() });
         return market;
       }

@@ -2051,13 +2051,24 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
 // When user clicks "✏ 自定义" we stash this and the next plain message in
 // the same chat (within 5 min) gets parsed as the custom threshold.
 const PENDING_FILTER_INPUT_MS = 5 * 60 * 1000;
+const PENDING_FILTER_INPUT_MAX = 100;
 const pendingFilterInput = new Map();
 const pendingKey = (chatId, userId) => `${chatId}-${userId}`;
 
 function setPendingFilterInput(chatId, userId, payload) {
+  // expiresAt is only checked on consume; a user who taps ✏ and never
+  // replies would otherwise leave the entry resident forever. Sweep
+  // expired entries on insert and cap the map as a backstop.
+  const now = Date.now();
+  for (const [k, v] of pendingFilterInput) {
+    if (v.expiresAt < now) pendingFilterInput.delete(k);
+  }
+  while (pendingFilterInput.size >= PENDING_FILTER_INPUT_MAX) {
+    pendingFilterInput.delete(pendingFilterInput.keys().next().value);
+  }
   pendingFilterInput.set(pendingKey(chatId, userId), {
     ...payload,
-    expiresAt: Date.now() + PENDING_FILTER_INPUT_MS,
+    expiresAt: now + PENDING_FILTER_INPUT_MS,
   });
 }
 function consumePendingFilterInput(chatId, userId) {
@@ -4398,7 +4409,11 @@ function rememberComboScan(chatId, messageId, scan) {
   while (_comboScans.size >= COMBO_SCAN_CACHE_MAX) {
     _comboScans.delete(_comboScans.keys().next().value); // oldest insert
   }
-  _comboScans.set(`${chatId}:${messageId}`, { scan, at: now });
+  // Page taps only ever render `hits`; the full `pairs` array (every
+  // adjacent pair across every ladder, needed only for the initial
+  // empty-result "closest combos" hint) would multiply the retained set
+  // for nothing. The empty-hits path never paginates, so drop pairs.
+  _comboScans.set(`${chatId}:${messageId}`, { scan: { ...scan, pairs: [] }, at: now });
 }
 
 function getComboScan(chatId, messageId) {
