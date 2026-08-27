@@ -131,16 +131,29 @@ async function tick(state) {
     await persist(state);
     return;
   }
-  for (const id of ids) {
-    const isPaused = state.pausedIds.includes(id) || isSnoozed(state, id);
-    try {
-      await checkMarket(id, state, { isPaused });
-    } catch (err) {
-      warn(`[${id}] tick error:`, err.message);
+  // Poll markets with a small worker pool — each checkMarket() is 2+ HTTP
+  // round trips, so a large pool serialized would blow past the poll
+  // interval. Each market only touches its own slot, so concurrent checks
+  // don't contend on state.
+  const pausedSet = new Set(state.pausedIds);
+  let nextIdx = 0;
+  const worker = async () => {
+    while (nextIdx < ids.length) {
+      const id = ids[nextIdx++];
+      const isPaused = pausedSet.has(id) || isSnoozed(state, id);
+      try {
+        await checkMarket(id, state, { isPaused });
+      } catch (err) {
+        warn(`[${id}] tick error:`, err.message);
+      }
     }
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(config.monitorConcurrency, ids.length) }, worker),
+  );
+  const idSet = new Set(ids);
   for (const id of Object.keys(state.markets)) {
-    if (!ids.includes(id)) delete state.markets[id];
+    if (!idSet.has(id)) delete state.markets[id];
   }
   // Cross-market ladder sanity check — needs every slot refreshed first.
   await checkPriceSanity(state).catch((err) => warn('price sanity check failed:', err.message));

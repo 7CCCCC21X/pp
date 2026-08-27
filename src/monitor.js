@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import { getMarketRewardSummary, getOrderbook, marketEndMs, getSlugMapCached, getMarketRestById } from './predict.js';
-import { broadcastTelegramMessage, htmlEscape } from './telegram.js';
+import { broadcastTelegramMessage, sendLongTelegramMessage, htmlEscape } from './telegram.js';
 import { appendHistory } from './history.js';
 import { fmtElapsed, midOf, spreadOf, rewardZoneStatus, scoreSlot, priorityOf, fmtCents, marketUrl } from './format.js';
 import { effectiveFilters, checkFilter } from './filters.js';
@@ -296,7 +296,6 @@ export async function flushChatDigests(state) {
     d.lastFlushAt = now;
     try {
       const text = formatDigestSummary(items);
-      const { sendLongTelegramMessage } = await import('./telegram.js');
       await sendLongTelegramMessage(text, { chatId: cid });
     } catch (err) {
       warn(`digest flush to ${cid} failed:`, err.message);
@@ -683,9 +682,10 @@ function gatherLadderEntries(state) {
   const entries = [];
   const slotById = new Map();
   const extCents = priceSanityExtCents(state);
+  const pausedSet = new Set(state.pausedIds ?? []);
   for (const [id, slot] of Object.entries(state.markets)) {
     if (!slot) continue;
-    if (state.pausedIds?.includes(id) || isSnoozed(state, id)) continue;
+    if (pausedSet.has(id) || isSnoozed(state, id)) continue;
     if (isExtremeSlot(slot, extCents)) continue;
     const text = slot.question || slot.title;
     if (!text) continue;

@@ -22,7 +22,19 @@ import {
 } from './state.js';
 import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
-import { getMarketRewardSummary, getOrderbook, resolveSlugToId, getCacheStats, refreshAllCaches } from './predict.js';
+import {
+  getMarketRewardSummary,
+  getOrderbook,
+  resolveSlugToId,
+  resolveUrlSlugToMarkets,
+  getCacheStats,
+  refreshAllCaches,
+  getAllMarketsCached,
+  getSlugMapCached,
+  extractHourlyRate,
+  isMarketTradeable,
+  marketEndMs,
+} from './predict.js';
 import { slugifyMarketTitle } from './format.js';
 
 const log = (...args) => console.log(new Date().toISOString(), '[commands]', ...args);
@@ -308,7 +320,6 @@ function extractBareMarketId(text) {
 // Looks up a single market id and shows the action card. Used by both
 // the bare-id paste flow and the singleton URL match path.
 async function showActionCardForId(id, state, ctx, chatId) {
-  const { getMarketRewardSummary, marketEndMs } = await import('./predict.js');
   let summary;
   try {
     summary = await getMarketRewardSummary(id);
@@ -335,7 +346,6 @@ async function handleUrlPaste(url, state, ctx, { chatId }) {
     await sendTelegramMessage(`未能从 URL 提取 slug:\n<code>${htmlEscape(url)}</code>`, { chatId });
     return;
   }
-  const { resolveUrlSlugToMarkets } = await import('./predict.js');
   let matches = [];
   try {
     matches = await resolveUrlSlugToMarkets(slug, slugifyMarketTitle);
@@ -380,7 +390,6 @@ export async function handlePickCallback(data, { chatId, messageId, state, fullC
     const id = data.slice('pick:'.length);
     if (!id) return;
     // Look up market metadata for the action card.
-    const { getMarketRewardSummary } = await import('./predict.js');
     let market = { id };
     try {
       const summary = await getMarketRewardSummary(id);
@@ -390,7 +399,7 @@ export async function handlePickCallback(data, { chatId, messageId, state, fullC
           id,
           title: m.title ?? m.question ?? null,
           rate: summary.totalHourlyRate ?? 0,
-          endMs: (await import('./predict.js')).marketEndMs(m),
+          endMs: marketEndMs(m),
         };
       }
     } catch { /* fall back to id-only display */ }
@@ -573,10 +582,13 @@ function passesAdvanced(row, s) {
 }
 
 function sortRowsBy(rows, sortKey) {
+  // Precompute the sort key once per row (decorate-sort) — comparators run
+  // O(n log n) times, and 'score' in particular is not cheap.
+  const now = Date.now();
   const key = (r) => {
     const rate = Number.isFinite(r.rate) ? r.rate : (r.slot?.lastHourlyRate ?? 0);
-    const remH = (Number.isFinite(r.endMs) && r.endMs > Date.now())
-      ? (r.endMs - Date.now()) / 3600000
+    const remH = (Number.isFinite(r.endMs) && r.endMs > now)
+      ? (r.endMs - now) / 3600000
       : null;
     if (sortKey === 'total')  return remH != null ? rate * remH : rate;
     if (sortKey === 'score')  return opportunityScore(r.slot ?? {});
@@ -584,7 +596,8 @@ function sortRowsBy(rows, sortKey) {
     if (sortKey === 'thin')   return -(Number.isFinite(r.slot?.lastTopUsd) ? r.slot.lastTopUsd : Infinity);
     return rate; // 'rate' default
   };
-  return rows.sort((a, b) => key(b) - key(a));
+  for (const r of rows) r._sortKey = key(r);
+  return rows.sort((a, b) => b._sortKey - a._sortKey);
 }
 
 // Run the actual filter query. Mode controls whether matches replace
@@ -592,8 +605,6 @@ function sortRowsBy(rows, sortKey) {
 // advanced knob, source from state.markets (live monitored set);
 // otherwise fall back to GraphQL discovery for the simple PP/h+rem path.
 async function runFilterQuery(s, mode, state, ctx) {
-  const { getAllMarketsCached, extractHourlyRate, isMarketTradeable, marketEndMs } =
-    await import('./predict.js');
   const advanced = isAdvancedQuery(s);
   const cutoff = s.rem > 0 ? Date.now() + s.rem * 3600000 : null;
 
@@ -1083,7 +1094,8 @@ function renderTightResult(f, page, state) {
     if (f.sort === 'stale') return stallDurationMs(r.slot) ?? 0;
     return r.shares;
   };
-  rows.sort((a, b) => sortVal(b) - sortVal(a));
+  for (const r of rows) r._sortKey = sortVal(r);
+  rows.sort((a, b) => b._sortKey - a._sortKey);
 
   const header = `<b>🤏 紧凑盘口</b> <i>· ${htmlEscape(tightLabel(f))}</i>`;
   const wizardRow = [{ text: `🎚 调整设置`, callback_data: tightCb('wizard', f) }];
@@ -1898,7 +1910,6 @@ const STALE_PER_MARKET_TIMEOUT_MS = 20_000;
 const STALE_REFETCH_DEADLINE_MS = 5 * 60 * 1000;
 
 async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, kind = 'stale', bits, thresh, cancelCb }) {
-  const { getOrderbook } = await import('./predict.js');
   const meta = LIST_KINDS[kind] ?? LIST_KINDS.stale;
   const total = ids.length;
   const results = new Map();
@@ -1909,6 +1920,12 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
   let lastEditAt = 0;
   let lastEditedDone = -1;
   let lastEditText = '';
+  // Static footer bits — bits/thresh don't change during the refetch, so
+  // parse once instead of per progress frame per level.
+  const levelsLabel = (() => {
+    const sel = parseStaleBits(bits);
+    return LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级';
+  })();
 
   const renderProgress = (extraNote = '') => {
     const filled = Math.round((done / Math.max(1, total)) * 20);
@@ -1924,7 +1941,7 @@ async function refetchOrderbooksWithProgress({ ids, state, chatId, messageId, ki
       `<code>${bar}</code> ${pct}%`,
       `进度 <b>${done}</b> / ${total}${stuckLine}${extraNote ? ` · ${extraNote}` : ''}`,
       '',
-      `📐 ${LIST_LEVELS.filter((k) => parseStaleBits(bits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(thresh)}`,
+      `📐 ${levelsLabel} · 💵 ${staleThreshLabel(thresh)}`,
     ].join('\n');
   };
 
@@ -2168,7 +2185,7 @@ export async function handleListFilterCallback(data, { chatId, messageId, fromId
         '',
         `请直接在这个 chat <b>回复一个数字</b>(${promptUnit})。`,
         '',
-        `当前选: 📐 ${LIST_LEVELS.filter((k) => parseStaleBits(safeBits)[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'} · 💵 ${staleThreshLabel(safeThresh, safeDir)} · 📈 ${extLabel(safeExt)} · 📊 ${LIST_SORT_LABELS[safeSort]}`,
+        `当前选: 📐 ${(() => { const sel = parseStaleBits(safeBits); return LIST_LEVELS.filter((k) => sel[k]).map((k) => LIST_LEVEL_LABELS[k]).join('+') || '未选层级'; })()} · 💵 ${staleThreshLabel(safeThresh, safeDir)} · 📈 ${extLabel(safeExt)} · 📊 ${LIST_SORT_LABELS[safeSort]}`,
         '',
         '<i>5 分钟内有效。想取消就发任何非数字。</i>',
       ].join('\n');
@@ -2335,7 +2352,7 @@ function moversWinLabel(min) {
 }
 
 async function buildMoversRows(state, windowMin) {
-  const { readHistorySince, rateMovers } = await import('./history.js');
+  const { readHistorySince, rateMovers } = await import('./history.js'); // no cycle, but keeps history off the startup path
   const since = Date.now() - windowMin * 60_000;
   const records = await readHistorySince(since);
   const movers = rateMovers(records, (id) => state.markets?.[id]?.lastHourlyRate);
@@ -2373,8 +2390,36 @@ function moversKeyboard(windowMin, page, totalPages, openUrls) {
   return { inline_keyboard: rows };
 }
 
-async function renderMoversPage(state, windowMin, page = 0) {
-  const allRows = await buildMoversRows(state, windowMin);
+// Computed movers rows, kept per result message so ⬅️/➡️ page taps don't
+// re-read and re-reduce the whole history file (same pattern as the /combo
+// scan cache). Keyed `${chatId}:${messageId}`; pruned by TTL + size cap.
+const MOVERS_CACHE_TTL_MS = 10 * 60 * 1000;
+const MOVERS_CACHE_MAX = 20;
+const _moversCache = new Map(); // key -> { windowMin, rows, at }
+
+function rememberMoversRows(chatId, messageId, windowMin, rows) {
+  const now = Date.now();
+  for (const [k, v] of _moversCache) {
+    if (now - v.at > MOVERS_CACHE_TTL_MS) _moversCache.delete(k);
+  }
+  while (_moversCache.size >= MOVERS_CACHE_MAX) {
+    _moversCache.delete(_moversCache.keys().next().value);
+  }
+  _moversCache.set(`${chatId}:${messageId}`, { windowMin, rows, at: now });
+}
+
+function getMoversRows(chatId, messageId, windowMin) {
+  const v = _moversCache.get(`${chatId}:${messageId}`);
+  if (!v || v.windowMin !== windowMin) return null;
+  if (Date.now() - v.at > MOVERS_CACHE_TTL_MS) {
+    _moversCache.delete(`${chatId}:${messageId}`);
+    return null;
+  }
+  return v.rows;
+}
+
+async function renderMoversPage(state, windowMin, page = 0, precomputedRows = null) {
+  const allRows = precomputedRows ?? await buildMoversRows(state, windowMin);
   const winLabel = moversWinLabel(windowMin);
   if (!allRows.length) {
     return {
@@ -2447,7 +2492,14 @@ export async function handleMoversCallback(data, { chatId, messageId, state }) {
   } else {
     return true;
   }
-  const reply = await renderMoversPage(state, windowMin, page);
+  // Page taps reuse the rows computed when this message was last rendered;
+  // window switches (and cache misses) recompute from history.
+  let rows = action === 'page' ? getMoversRows(chatId, messageId, windowMin) : null;
+  if (!rows) {
+    rows = await buildMoversRows(state, windowMin);
+    rememberMoversRows(chatId, messageId, windowMin, rows);
+  }
+  const reply = await renderMoversPage(state, windowMin, page, rows);
   try {
     await editTelegramMessage(chatId, messageId, reply.text, reply.replyMarkup);
   } catch (err) {
@@ -2921,7 +2973,6 @@ async function buildProbeMessage(marketId, state) {
   const spread = spreadOf(ob);
   // Match monitor.js precedence so /probe reflects what alerts would use:
   //   /setmarket override > REST market.spreadThreshold > env default.
-  const { effectiveOverride } = await import('./state.js');
   const zone = rewardZoneStatus(
     ob, m,
     { maxDistance: config.rewardZoneMaxDistance, minSize: config.rewardZoneMinSize },
@@ -2934,7 +2985,6 @@ async function buildProbeMessage(marketId, state) {
   // from the same REST cache the monitor uses (best effort).
   let realSlug = null;
   try {
-    const { getSlugMapCached } = await import('./predict.js');
     const slugMap = await getSlugMapCached();
     realSlug = slugMap?.get(String(marketId)) ?? null;
   } catch {}
@@ -3653,62 +3703,71 @@ async function buildStatusDashboard(state) {
   if (!ids.length) {
     return '当前没有监控的市场。用 /add &lt;id&gt; 加一个，或开启 AUTODISCOVER=true。';
   }
-  const rows = ids.map((id) => ({ id, slot: state.markets[id] }));
-  const errors = rows.filter(({ slot }) => slot?.lastError);
-  const filterBlocked = rows.filter(({ slot }) => slot?.lastSkipReason?.startsWith('过滤器:'));
-  const otherSkipped = rows.filter(({ slot }) =>
-    slot?.lastSkipReason && !slot.lastSkipReason.startsWith('过滤器:')
-  );
-  const waiting = rows.filter(({ slot }) => !slot);
-  const paused = rows.filter(({ id }) => state.pausedIds.includes(id));
-  const watched = rows.filter(({ id }) => (state.watchedIds ?? []).includes(id));
-  const gaps = rows.filter(({ slot }) =>
-    slot?.zoneStatus
-    && !slot.lastError
-    && !slot.lastSkipReason
-    && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated)
-  );
-  const ppRows = rows
-    .filter(({ slot }) => slot && !slot.lastError && !slot.lastSkipReason && Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0)
-    .sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
+  // Single pass over the pool — /status is the most-run command, and the
+  // buckets/counters below all derive from the same per-slot facts, so one
+  // loop with Sets beats a dozen filter passes (two of which were O(n²)
+  // Array.includes scans).
+  const pausedSet = new Set(state.pausedIds);
+  const watchedSet = new Set(state.watchedIds ?? []);
+  const errors = [];
+  const gaps = [];
+  const ppRows = [];
+  let filterBlockedCount = 0;
+  let otherSkippedCount = 0;
+  let waitingCount = 0;
+  let pausedCount = 0;
+  let watchedCount = 0;
+  let thinCount = 0;
+  let wideCount = 0;
+  let tightCount = 0;
+  let emptyCount = 0;
+  for (const id of ids) {
+    const slot = state.markets[id];
+    if (pausedSet.has(id)) pausedCount += 1;
+    if (watchedSet.has(id)) watchedCount += 1;
+    if (!slot) { waitingCount += 1; continue; }
+    if (slot.lastError) errors.push({ id, slot });
+    if (slot.lastSkipReason) {
+      if (slot.lastSkipReason.startsWith('过滤器:')) filterBlockedCount += 1;
+      else otherSkippedCount += 1;
+    }
+    const live = !slot.lastError && !slot.lastSkipReason;
+    if (!live) continue;
+    if (slot.zoneStatus && (!slot.zoneStatus.bidActivated || !slot.zoneStatus.askActivated)) {
+      gaps.push({ id, slot });
+    }
+    if (Number.isFinite(slot.lastHourlyRate) && slot.lastHourlyRate > 0) ppRows.push({ id, slot });
+    // Live opportunity counts derived from per-tick slot metrics (set in
+    // monitor.js). Same definitions as the /thin /wide /empty list filters.
+    if (Number.isFinite(slot.lastTopUsd) && slot.lastTopUsd > 0
+      && slot.lastTopUsd <= (config.lowDepthThreshold ?? 100)) thinCount += 1;
+    if (Number.isFinite(slot.lastSpread)) {
+      if (slot.lastSpread > config.maxSpread) wideCount += 1;
+      if (slot.lastSpread >= 0 && slot.lastSpread <= config.tightSpreadThreshold) tightCount += 1;
+    }
+    if (slot.baseline && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)) {
+      emptyCount += 1;
+    }
+  }
+  ppRows.sort((a, b) => b.slot.lastHourlyRate - a.slot.lastHourlyRate);
   const totalRate = ppRows.reduce((acc, { slot }) => acc + slot.lastHourlyRate, 0);
   const topRate = ppRows[0]?.slot?.lastHourlyRate ?? 0;
-  // Live opportunity counts derived from per-tick slot metrics (set in
-  // monitor.js). Same definitions as the /thin /wide /empty list filters.
-  const thinCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason
-    && Number.isFinite(slot.lastTopUsd) && slot.lastTopUsd > 0
-    && slot.lastTopUsd <= (config.lowDepthThreshold ?? 100)
-  ).length;
-  const wideCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason
-    && Number.isFinite(slot.lastSpread) && slot.lastSpread > config.maxSpread
-  ).length;
-  const tightCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason
-    && Number.isFinite(slot.lastSpread)
-    && slot.lastSpread >= 0 && slot.lastSpread <= config.tightSpreadThreshold
-  ).length;
-  const emptyCount = rows.filter(({ slot }) =>
-    slot && !slot.lastError && !slot.lastSkipReason && slot.baseline
-    && (slot.baseline.bidPrice == null || slot.baseline.askPrice == null)
-  ).length;
 
-  // Cross-market ladder-mispricing count (same signal as /sanity).
+  // Cross-market ladder-mispricing count (same signal as /sanity) and the
+  // 24h PP total read independent sources — run them concurrently.
   let sanityCount = 0;
-  try {
-    const { collectPriceSanityIssues } = await import('./monitor.js');
-    sanityCount = collectPriceSanityIssues(state).length;
-  } catch {}
-
   let totalPP24h = null;
-  try {
-    const { readHistorySince, summarize24h } = await import('./history.js');
-    const since = Date.now() - 24 * 3600 * 1000;
-    const records = await readHistorySince(since);
-    const summary = summarize24h(records);
-    totalPP24h = summary.reduce((a, m) => a + (m.ppEarned ?? 0), 0);
-  } catch {}
+  const [sanityRes, historyRes] = await Promise.allSettled([
+    import('./monitor.js').then(({ collectPriceSanityIssues }) =>
+      collectPriceSanityIssues(state).length),
+    import('./history.js').then(async ({ readHistorySince, summarize24h }) => {
+      const since = Date.now() - 24 * 3600 * 1000;
+      const records = await readHistorySince(since);
+      return summarize24h(records).reduce((a, m) => a + (m.ppEarned ?? 0), 0);
+    }),
+  ]);
+  if (sanityRes.status === 'fulfilled') sanityCount = sanityRes.value;
+  if (historyRes.status === 'fulfilled') totalPP24h = historyRes.value;
 
   // Top dashboard panel — at-a-glance "is everything working + what's
   // going on" without scrolling. Three grouped lines: market census,
@@ -3716,10 +3775,10 @@ async function buildStatusDashboard(state) {
   const lines = ['📡 <b>监控看板</b>'];
   const census = [`市场 <b>${ids.length}</b>`, `有效 <b>${ppRows.length}</b>`];
   if (errors.length) census.push(`报错 ${errors.length}`);
-  if (filterBlocked.length) census.push(`过滤 ${filterBlocked.length}`);
-  if (otherSkipped.length) census.push(`跳过 ${otherSkipped.length}`);
-  if (waiting.length) census.push(`等待 ${waiting.length}`);
-  if (paused.length) census.push(`暂停 ${paused.length}`);
+  if (filterBlockedCount) census.push(`过滤 ${filterBlockedCount}`);
+  if (otherSkippedCount) census.push(`跳过 ${otherSkippedCount}`);
+  if (waitingCount) census.push(`等待 ${waitingCount}`);
+  if (pausedCount) census.push(`暂停 ${pausedCount}`);
   lines.push(census.join(' · '));
   lines.push(`💰 总 <b>${totalRate.toFixed(0)}</b> PP/h · 顶 <b>${topRate.toFixed(0)}</b>/h${totalPP24h != null && totalPP24h > 0 ? ` · 24h <b>${totalPP24h.toFixed(0)} PP</b>` : ''}`);
   const oppParts = [`奖励区空缺 <b>${gaps.length}</b>`];
@@ -3728,7 +3787,7 @@ async function buildStatusDashboard(state) {
   if (tightCount > 0) oppParts.push(`紧差 ${tightCount}`);
   if (emptyCount > 0) oppParts.push(`空簿 ${emptyCount}`);
   if (sanityCount > 0) oppParts.push(`⚠️ 定价异常 ${sanityCount}`);
-  if (watched.length) oppParts.push(`👁 追踪 ${watched.length}`);
+  if (watchedCount) oppParts.push(`👁 追踪 ${watchedCount}`);
   lines.push(`🎯 ${oppParts.join(' · ')}`);
   lines.push('');
 
@@ -3899,9 +3958,13 @@ async function buildConfigDump(state) {
 // pool and a per-market timeout so one dead market can't stall the scan.
 const COMBO_FETCH_CONCURRENCY = 6;
 const COMBO_PER_MARKET_TIMEOUT_MS = 12_000;
+// Global deadline for a whole sweep — same guard the /stale refetch has, so
+// a large ladder set full of dead books can't pin /combo for many minutes.
+const COMBO_FETCH_DEADLINE_MS = 5 * 60 * 1000;
 
 async function fetchFreshBooks(ids, state) {
   const books = new Map();
+  const startedAt = Date.now();
   let failed = 0;
   let next = 0;
   const fetchOne = async (id) => {
@@ -3927,6 +3990,7 @@ async function fetchFreshBooks(ids, state) {
   };
   const worker = async () => {
     while (next < ids.length) {
+      if (Date.now() - startedAt > COMBO_FETCH_DEADLINE_MS) break;
       const id = ids[next++];
       try {
         const book = await fetchOne(id);
@@ -4234,13 +4298,23 @@ function comboPairPassesExt(pair, books, ext) {
 // Why a market is NOT part of the combo scan's entry universe — or null when
 // it IS included. Single source of truth shared by the scan gather and the
 // /combo check diagnosis so they can never disagree.
-function comboExclusionReason(state, id) {
+// Precomputed id sets for a batch of comboExclusionReason calls — building
+// them once per scan keeps the per-market check O(1) instead of rebuilding
+// the whole active-id Set for every market in the pool.
+function comboScanCtx(state) {
+  return {
+    activeSet: new Set(activeMarketIds(state)),
+    pausedSet: new Set(state.pausedIds ?? []),
+  };
+}
+
+function comboExclusionReason(state, id, scanCtx = null) {
   const key = String(id);
-  const activeSet = new Set(activeMarketIds(state));
+  const { activeSet, pausedSet } = scanCtx ?? comboScanCtx(state);
   if (!activeSet.has(key)) return '不在当前监控集（未被自动发现或已 /remove）— 用 /add ' + key + ' 加入后即可参与';
   const slot = state.markets[key];
   if (!slot) return '监控中但还没抓到首帧数据（等下一轮轮询，或 /probe ' + key + ' 触发）';
-  if (state.pausedIds?.includes(key)) return '已被 /pause 暂停（/resume ' + key + ' 恢复）';
+  if (pausedSet.has(key)) return '已被 /pause 暂停（/resume ' + key + ' 恢复）';
   if (isSnoozed(state, key)) return '处于 /snooze 静音期';
   if (slot.lastError) return `上次抓取出错: ${slot.lastError}`;
   // Skipped by the monitor for a non-filter reason = resolved / no reward /
@@ -4259,8 +4333,9 @@ function comboExclusionReason(state, id) {
 // longer shows (and shadowing the real live pair).
 function gatherComboEntries(state) {
   const entries = [];
+  const scanCtx = comboScanCtx(state);
   for (const id of Object.keys(state.markets)) {
-    if (comboExclusionReason(state, id)) continue;
+    if (comboExclusionReason(state, id, scanCtx)) continue;
     const slot = state.markets[id];
     entries.push({ id, title: slot.title, question: slot.question });
   }
@@ -4356,7 +4431,6 @@ async function buildComboCheckMessage(rawArg, state) {
   if (url) {
     const slug = slugFromPredictUrl(url);
     if (!slug) return `未能从 URL 提取 slug:\n<code>${htmlEscape(url)}</code>`;
-    const { resolveUrlSlugToMarkets } = await import('./predict.js');
     let matches = [];
     try {
       matches = await resolveUrlSlugToMarkets(slug, slugifyMarketTitle);
@@ -4383,7 +4457,8 @@ async function buildComboCheckMessage(rawArg, state) {
   targets = targets.slice(0, COMBO_CHECK_MAX_TARGETS);
 
   // Fill title/question from the freshest source available: slot → API.
-  for (const t of targets) {
+  // The API fallbacks are independent per target, so run them in parallel.
+  await Promise.all(targets.map(async (t) => {
     const slot = state.markets[t.id];
     t.title = t.title ?? slot?.title ?? null;
     t.question = t.question ?? slot?.question ?? null;
@@ -4394,7 +4469,7 @@ async function buildComboCheckMessage(rawArg, state) {
         t.question = s?.market?.question ?? null;
       } catch { /* diagnosis continues with what we have */ }
     }
-  }
+  }));
 
   // Ladder universe = the live scan's entries plus the targets themselves,
   // so grouping is visible even for markets the scan currently excludes.
@@ -4407,10 +4482,11 @@ async function buildComboCheckMessage(rawArg, state) {
   const d = comboDefaultFilter(state);
   const lines = [`🔎 <b>组合识别诊断</b> · ${targets.length} 个市场 · 判定上限 &lt;${d.cap}¢`, ''];
   const checkLadderKeys = new Set();
+  const scanCtx = comboScanCtx(state);
   for (const t of targets) {
     const label = htmlEscape(shortTitle(t.title || t.question || `Market ${t.id}`, 48));
     lines.push(`<b>#${htmlEscape(t.id)}</b> <a href="${marketUrl(t.id, t.title, t.question, state.markets[t.id]?.slug)}">${label}</a>`);
-    const reason = comboExclusionReason(state, t.id);
+    const reason = comboExclusionReason(state, t.id, scanCtx);
     lines.push(reason ? `❌ 扫描范围: ${htmlEscape(reason)}` : '✅ 扫描范围: 在监控集内，参与扫描');
     const cls = classifyComboEntry(t);
     if (!cls) {
@@ -4431,7 +4507,7 @@ async function buildComboCheckMessage(rawArg, state) {
       continue;
     }
     const rungBits = ladder.rungs.map((r) => {
-      const ex = comboExclusionReason(state, r.id);
+      const ex = comboExclusionReason(state, r.id, scanCtx);
       return `${htmlEscape(r.raw)}${ex ? '⛔' : ''}`;
     });
     lines.push(`✅ 阶梯: ${ladder.rungs.length} 档 — ${rungBits.join(' · ')}${rungBits.some((b) => b.includes('⛔')) ? '（⛔ = 被扫描排除，详见上方原因）' : ''}`);
