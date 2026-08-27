@@ -415,11 +415,6 @@ export async function getAllMarketsCached() {
   return _cache.inFlight;
 }
 
-export async function getMarketById(id) {
-  await getAllMarketsCached();
-  return _cache.byId?.get(String(id)) ?? null;
-}
-
 // Look up a market without triggering a full list scan. Returns the cached
 // entry if the cache is already populated, otherwise falls back to a
 // direct GraphQL market(id:) call. Used by getMarketRewardSummary and the
@@ -882,25 +877,4 @@ export async function getOrderbook(orderbookKey, opts = {}) {
     }
   }
   throw new Error(`Orderbook not found for market ${ctxId} (tried ${dedup.length} combos). Last: ${lastErr}`);
-}
-
-// Compatibility shim used by older code paths (rewards.js).
-export async function listMarketsPage(cursor) {
-  const params = new URLSearchParams({ first: '50' });
-  if (cursor) params.set('after', String(cursor));
-  const url = `${config.restUrl}/markets?${params.toString()}`;
-  const res = await fetch(url, { headers: restHeaders() });
-  if (!res.ok) throw new Error(`listMarkets ${res.status}: ${await res.text()}`);
-  const arr = unwrapList(await res.json());
-  const lastId = arr[arr.length - 1]?.id ?? null;
-  return {
-    markets: arr.map((m) => ({
-      id: String(m.id),
-      title: m.title ?? null,
-      status: m.status ?? m.tradingStatus ?? null,
-      raw: m,
-    })),
-    nextCursor: lastId,
-    hasNext: arr.length === 50 && lastId != null,
-  };
 }
