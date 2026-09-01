@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { config, validateConfig } from './config.js';
-import { loadState, saveState, activeMarketIds, isSnoozed, broadcastChats, recordMarketFirstSeen, pruneMarketFirstSeen } from './state.js';
+import { loadState, saveState, activeMarketIds, isSnoozed, isBotPaused, broadcastChats, recordMarketFirstSeen, pruneMarketFirstSeen } from './state.js';
 import { checkMarket, flushChatDigests, checkPriceSanity } from './monitor.js';
 import { startCommandLoop } from './commands.js';
 import { discoverRewardedMarkets, shouldRunDiscovery } from './discovery.js';
@@ -123,6 +123,15 @@ async function maybePruneHistory(state) {
 }
 
 async function tick(state) {
+  // Global pause (/pausebot): skip the whole tick — no market polls, no
+  // discovery, no digests, zero upstream API calls. Persist so a timed
+  // pause that just auto-expired inside isBotPaused() is saved cleared.
+  if (isBotPaused(state)) {
+    const until = state.botPausedUntil;
+    log(`bot paused (${until === -1 ? 'indefinite' : `until ${new Date(until).toISOString()}`}); idle tick, no API calls`);
+    await persist(state);
+    return;
+  }
   await maybePruneHistory(state);
   await maybeDiscover(state);
   // First-seen map must shrink even when discovery is off or failing —
