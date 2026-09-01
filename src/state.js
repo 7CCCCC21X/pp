@@ -13,6 +13,7 @@ function emptyState() {
     overrides: {},        // marketId -> partial config override
     allowedChats: [],     // runtime-managed whitelist (private chats / groups)
     quietUntil: 0,        // global silence until this unix ms (0 = off)
+    botPausedUntil: 0,    // global bot pause: 0 = off, -1 = indefinite, >0 = until unix ms; while paused the tick loop makes no API calls
     alertKinds: {},       // per-kind on/off override; missing = use config default
     priceSanity: {},      // ladderKey -> { alertedAt } cooldown for cross-market定价异常 alerts
     priceSanityMuted: {}, // ladderToken -> { key, context, mutedAt } muted ladders (via alert button)
@@ -53,6 +54,7 @@ export async function loadState() {
       overrides: json.overrides ?? {},
       allowedChats: json.allowedChats ?? [],
       quietUntil: json.quietUntil ?? 0,
+      botPausedUntil: Number.isFinite(json.botPausedUntil) ? json.botPausedUntil : 0,
       alertKinds: json.alertKinds ?? {},
       priceSanity: json.priceSanity ?? {},
       priceSanityMuted: json.priceSanityMuted ?? {},
@@ -95,6 +97,22 @@ export function isSnoozed(state, marketId) {
   if (!until) return false;
   if (Date.now() >= until) {
     delete state.snoozes[marketId];
+    return false;
+  }
+  return true;
+}
+
+// Global bot pause (/pausebot). Unlike /quiet — which still polls and just
+// suppresses alert delivery — a paused bot skips the whole tick: no market
+// polls, no discovery, no digests, zero upstream API calls. The command
+// loop keeps running so /resumebot can un-pause. Auto-clears an expired
+// timed pause (mirrors isSnoozed).
+export function isBotPaused(state, now = Date.now()) {
+  const until = state?.botPausedUntil ?? 0;
+  if (!until) return false;
+  if (until === -1) return true;
+  if (now >= until) {
+    state.botPausedUntil = 0;
     return false;
   }
   return true;

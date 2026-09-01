@@ -205,3 +205,27 @@ test('recordMarketFirstSeen: prunes entries older than 14d', () => {
   assert.ok(state.marketFirstSeen.BOOTSTRAP);
   assert.ok(state.marketFirstSeen.NEW);
 });
+
+const { isBotPaused } = await import('../src/state.js');
+
+test('isBotPaused: 0 = not paused', () => {
+  assert.equal(isBotPaused({ botPausedUntil: 0 }), false);
+  assert.equal(isBotPaused({}), false);
+});
+
+test('isBotPaused: -1 = indefinite pause', () => {
+  const state = { botPausedUntil: -1 };
+  assert.equal(isBotPaused(state), true);
+  assert.equal(state.botPausedUntil, -1); // stays paused
+});
+
+test('isBotPaused: timed pause active until deadline', () => {
+  const state = { botPausedUntil: Date.now() + 60_000 };
+  assert.equal(isBotPaused(state), true);
+});
+
+test('isBotPaused: expired timed pause auto-clears', () => {
+  const state = { botPausedUntil: Date.now() - 1000 };
+  assert.equal(isBotPaused(state), false);
+  assert.equal(state.botPausedUntil, 0); // cleared so it persists as off
+});

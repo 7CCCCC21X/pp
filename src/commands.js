@@ -19,6 +19,7 @@ import {
   effectiveOverride,
   stallDurationMs,
   isSnoozed,
+  isBotPaused,
 } from './state.js';
 import { fmtElapsed, fmtCents, rewardZoneStatus, midOf, spreadOf, shortTitle, marketLink, marketUrl } from './format.js';
 import { effectiveFilters, formatFilters, FILTER_KEYS, FILTER_LABELS } from './filters.js';
@@ -90,6 +91,8 @@ const PRIVATE_MENU = [
   { command: 'snooze', description: '临时静音单市场 (用法: /snooze <id> 1h)' },
   { command: 'snapshot', description: '定时盘口快照（admin 私聊，用法: /snapshot <id> 5m）' },
   { command: 'quiet', description: '全局静音所有提醒 (用法: /quiet 2h | /quiet off)' },
+  { command: 'pausebot', description: '暂停机器人：停止轮询、不调 API (用法: /pausebot [2h]，仅 admin)' },
+  { command: 'resumebot', description: '恢复机器人轮询 (仅 admin)' },
   { command: 'alerts', description: '按类型开关提醒（停滞/跳变/阔差/奖励区/空簿）' },
   { command: 'route', description: '当前 chat 的路由（每个 chat 独立排除某些 kind）' },
   { command: 'discover', description: '立即触发自动发现' },
@@ -103,7 +106,9 @@ const PRIVATE_MENU = [
   { command: 'help', description: '显示帮助（含进阶命令）' },
 ];
 
-const GROUP_MENU = PRIVATE_MENU.filter((c) => c.command !== 'whitelist');
+const GROUP_MENU = PRIVATE_MENU.filter(
+  (c) => !['whitelist', 'pausebot', 'resumebot'].includes(c.command),
+);
 
 // Inline keyboard for /menu. Two layouts:
 //   - private: full grouped layout (机会找寻 / 监控管理 / 单市场 / 设置)
@@ -2739,7 +2744,9 @@ const HELP = [
   '<b>🔇 静音 / 降噪</b>',
   '/snooze &lt;id&gt; &lt;30m|2h|1d&gt; — 单市场临时静',
   '/pause &lt;id&gt; · /resume &lt;id&gt; — 单市场静音 / 恢复',
-  '/quiet [duration | off] — 全局临时静音（默认 2h）',
+  '/quiet [duration | off] — 全局临时静音（默认 2h；仍会轮询，只是不发提醒）',
+  '/pausebot [duration] — 暂停整个机器人：停止轮询/自动发现/摘要，完全不调用 API（不带时长=无限期；仅 admin）',
+  '/resumebot — 恢复机器人轮询（仅 admin）',
   '/alerts [on|off|only &lt;kind&gt;|reset] — 全局类型开关（only = 只看这一种）',
   '/route [on|off|only &lt;kind&gt;|reset] — 当前 chat 独立路由',
   '/digest-mode [interval | off] — 当前 chat 改批量摘要',
@@ -3590,6 +3597,12 @@ async function buildStatusDashboard(state) {
   // going on" without scrolling. Three grouped lines: market census,
   // PP throughput, opportunity census.
   const lines = ['📡 <b>监控看板</b>'];
+  if (isBotPaused(state)) {
+    const until = state.botPausedUntil;
+    lines.push(until === -1
+      ? '⏸ <b>机器人已暂停</b>（无限期，不调用 API）· /resumebot 恢复'
+      : `⏸ <b>机器人已暂停</b>（剩 ${fmtElapsed(until - Date.now())}，不调用 API）· /resumebot 恢复`);
+  }
   const census = [`市场 <b>${ids.length}</b>`, `有效 <b>${ppRows.length}</b>`];
   if (errors.length) census.push(`报错 ${errors.length}`);
   if (filterBlockedCount) census.push(`过滤 ${filterBlockedCount}`);
@@ -4496,6 +4509,44 @@ async function handle(text, state, ctx, chatId, fromId) {
       return `已恢复 #${htmlEscape(arg)}`;
     }
 
+    // Global bot pause — unlike /quiet (which keeps polling and only
+    // suppresses alert delivery), this makes the tick loop skip entirely:
+    // no market polls, no discovery, no digests, zero upstream API calls.
+    // The Telegram command loop keeps running so /resumebot works.
+    //   /pausebot        → pause indefinitely
+    //   /pausebot 2h|1d  → pause for a duration, auto-resumes after
+    //   /pausebot off    → same as /resumebot
+    case '/pausebot': {
+      if (!isAdminUser(fromId)) return '仅 admin 可以暂停机器人。';
+      if (arg === 'off' || arg === '0' || arg === 'cancel') {
+        state.botPausedUntil = 0;
+        await ctx.persist();
+        return '▶️ 机器人已恢复，下个 tick 开始轮询。';
+      }
+      let until = -1;
+      if (arg) {
+        const ms = parseDuration(arg);
+        if (!ms) return '用法：/pausebot [duration]\n例：/pausebot（无限期暂停）/ /pausebot 2h / /pausebot 1d\n恢复：/resumebot';
+        until = Date.now() + ms;
+      }
+      state.botPausedUntil = until;
+      await ctx.persist();
+      const scope = '已停止：市场轮询 / 自动发现 / 摘要，后台不再调用 API。\n（命令仍可用；/probe 等手动查询命令仍会实时调 API）';
+      return until === -1
+        ? `⏸ <b>机器人已暂停</b>（无限期）\n${scope}\n恢复：/resumebot`
+        : `⏸ <b>机器人已暂停</b> ${htmlEscape(arg)}\n${scope}\n自动恢复时间: ${new Date(until).toISOString()}\n提前恢复：/resumebot`;
+    }
+
+    case '/resumebot': {
+      if (!isAdminUser(fromId)) return '仅 admin 可以恢复机器人。';
+      const wasPaused = isBotPaused(state);
+      state.botPausedUntil = 0;
+      await ctx.persist();
+      return wasPaused
+        ? '▶️ 机器人已恢复，下个 tick 开始轮询。'
+        : '机器人当前没有暂停，无需恢复。';
+    }
+
     case '/discover': {
       ctx.requestDiscovery();
       return '已触发自动发现，几分钟内完成。';
@@ -5131,6 +5182,7 @@ async function handle(text, state, ctx, chatId, fromId) {
           ? Math.round((state.quietUntil - Date.now()) / 60000)
           : 0;
         if (quietLeft > 0) lines.push(`\n⏸ 全局静音剩余 ${quietLeft} 分钟（/quiet off 取消）`);
+        if (isBotPaused(state)) lines.push('\n⏸ 机器人已暂停轮询（不调用 API；/resumebot 恢复）');
         lines.push('\n用法: /alerts [on|off] &lt;kind&gt; / /alerts reset');
         return lines.join('\n');
       }
